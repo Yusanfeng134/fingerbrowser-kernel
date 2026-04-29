@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "baseChromiumRevision": "stable",
+  "patchsetVersion": "2026.04.29.1",
+  "platform": "darwin",
+  "arch": "arm64",
+  "artifactUrl": "manual://fingerbrowser-kernel-v0.1.0-mac-arm64.zip",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "executableRelativePath": "FingerBrowser Kernel.app/Contents/MacOS/Chromium",
+  "policySchemaVersion": 1
+}

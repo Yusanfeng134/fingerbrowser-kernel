@@ -1,0 +1,9 @@
+chromium/
+out/
+dist/
+*.zip
+*.dSYM/
+*.log
+.DS_Store
+depot_tools/
+
