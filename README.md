@@ -30,3 +30,21 @@ The package step emits:
 - `dist/fingerbrowser-kernel-v<PATCHSET_VERSION>-mac-arm64.manifest.json`
 - `dist/checksums.txt`
 
+## Desktop App Handoff
+
+Point the desktop app to the generated manifest before launching:
+
+```bash
+FINGERBROWSER_KERNEL_MANIFEST=/path/to/fingerbrowser-kernel-v0.1.0-mac-arm64.manifest.json npm run dev
+```
+
+For packaged builds, set the same environment variable when starting the app. The desktop app verifies the zip checksum before extracting a `file://` artifact and refuses to silently fall back when the custom kernel is missing or invalid.
+
+## Repository Setup
+
+Create an empty GitHub repository, then push this local repo:
+
+```bash
+git remote add origin git@github.com-yusanfeng134:Yusanfeng134/fingerbrowser-kernel.git
+git push -u origin main
+```
