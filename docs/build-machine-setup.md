@@ -32,6 +32,7 @@ bash -n scripts/*.sh
 scripts/apply-patches.sh
 scripts/build-mac-arm64.sh
 scripts/package-runtime.sh
+scripts/verify-runtime-manifest.sh dist/fingerbrowser-kernel-v<version>-mac-arm64.manifest.json
 shasum -a 256 -c dist/checksums.txt
 ```
 
