@@ -1,0 +1,50 @@
+diff --git a/third_party/libc++/src/include/cstddef b/third_party/libc++/src/include/cstddef
+index 1f6b95d24f542..f071165fba76 100644
+--- a/third_party/libc++/src/include/cstddef
++++ b/third_party/libc++/src/include/cstddef
+@@ -52,6 +52,21 @@ Types:
+ #  pragma GCC system_header
+ #endif
+ 
++#ifndef offsetof
++#  define offsetof(t, d) __builtin_offsetof(t, d)
++#endif
++
++#if !defined(_LIBCPP_CXX03_LANG) && defined(__APPLE__) && \
++    !defined(__CLANG_MAX_ALIGN_T_DEFINED)
++// Xcode 26 SDK headers can be pulled in by Objective-C frameworks before this
++// libc++ header asks for max_align_t. In that include order the SDK stddef
++// guard is already closed and libc++'s using_if_exists declaration remains
++// unresolved. Match Clang's Darwin max_align_t typedef so older Chromium
++// branches can still build with the current macOS SDK.
++#define __CLANG_MAX_ALIGN_T_DEFINED
++typedef long double max_align_t;
++#endif
++
+ _LIBCPP_BEGIN_NAMESPACE_STD
+ 
+ using ::nullptr_t;
+diff --git a/third_party/libc++/src/include/stddef.h b/third_party/libc++/src/include/stddef.h
+index 887776b150000..e6e8a64023000 100644
+--- a/third_party/libc++/src/include/stddef.h
++++ b/third_party/libc++/src/include/stddef.h
+@@ -46,6 +46,19 @@ Types:
+ #    include_next <stddef.h>
+ #  endif
+ 
++#  ifndef offsetof
++#    define offsetof(t, d) __builtin_offsetof(t, d)
++#  endif
++
++#  if !defined(_LIBCPP_CXX03_LANG) && defined(__APPLE__) && \
++      !defined(__CLANG_MAX_ALIGN_T_DEFINED)
++// Xcode 26 SDK headers can be pulled in through Objective-C frameworks before
++// this libc++ header has provided the C++ stddef surface expected by older
++// Chromium branches.
++#    define __CLANG_MAX_ALIGN_T_DEFINED
++typedef long double max_align_t;
++#  endif
++
+ #  ifdef __cplusplus
+ typedef decltype(nullptr) nullptr_t;
+ #  endif

@@ -1,0 +1,113 @@
+diff --git a/ui/accessibility/platform/ax_platform_node_cocoa.mm b/ui/accessibility/platform/ax_platform_node_cocoa.mm
+index 8b5753dfe9..2c3af717ec 100644
+--- a/ui/accessibility/platform/ax_platform_node_cocoa.mm
++++ b/ui/accessibility/platform/ax_platform_node_cocoa.mm
+@@ -628,7 +628,7 @@ + (NSString*)nativeRoleFromAXRole:(ax::mojom::Role)role {
+     case ax::mojom::Role::kRadioGroup:
+       return NSAccessibilityRadioGroupRole;
+     case ax::mojom::Role::kRootWebArea:
+-      return NSAccessibilityWebAreaRole;
++      return ChromiumAccessibilityWebAreaRole;
+     case ax::mojom::Role::kRow:
+       return NSAccessibilityRowRole;
+     case ax::mojom::Role::kRowHeader:
+@@ -1098,7 +1098,7 @@ - (NSArray*)accessibilityAttributeNames {
+ 
+   // These attributes are required on all accessibility objects.
+   NSArray* const kAllRoleAttributes = @[
+-    NSAccessibilityBlockQuoteLevelAttribute, NSAccessibilityChildrenAttribute,
++    ChromiumAccessibilityBlockQuoteLevelAttribute, NSAccessibilityChildrenAttribute,
+     NSAccessibilityDOMClassList, NSAccessibilityDOMIdentifierAttribute,
+     NSAccessibilityDescriptionAttribute, NSAccessibilityElementBusyAttribute,
+     NSAccessibilityParentAttribute, NSAccessibilityPositionAttribute,
+@@ -1111,7 +1111,7 @@ - (NSArray*)accessibilityAttributeNames {
+     // Attributes which are not required, but are general to all roles.
+     NSAccessibilityRoleDescriptionAttribute, NSAccessibilityEnabledAttribute,
+     NSAccessibilityFocusedAttribute, NSAccessibilityHelpAttribute,
+-    NSAccessibilityTopLevelUIElementAttribute, NSAccessibilityVisitedAttribute,
++    NSAccessibilityTopLevelUIElementAttribute, ChromiumAccessibilityVisitedAttribute,
+     NSAccessibilityWindowAttribute, NSAccessibilityChromeAXNodeIdAttribute
+   ];
+   // Attributes required for user-editable controls.
+@@ -1216,7 +1216,7 @@ - (NSArray*)accessibilityAttributeNames {
+   if (ui::IsSetLike(role))
+     [axAttributes addObject:@"AXARIASetSize"];
+ 
+-  if ([[self accessibilityRole] isEqualToString:NSAccessibilityWebAreaRole]) {
++  if ([[self accessibilityRole] isEqualToString:ChromiumAccessibilityWebAreaRole]) {
+     [axAttributes addObjectsFromArray:@[
+       NSAccessibilityLoadedAttribute, NSAccessibilityLoadingProgressAttribute
+     ]];
+@@ -2382,7 +2382,7 @@ - (NSString*)accessibilityRoleDescription {
+     case ax::mojom::Role::kHeader:  // Default: IDS_AX_ROLE_HEADER
+       return l10n_util::GetNSString(IDS_AX_ROLE_BANNER);
+     case ax::mojom::Role::kRootWebArea: {
+-      if ([role isEqualToString:NSAccessibilityWebAreaRole]) {
++      if ([role isEqualToString:ChromiumAccessibilityWebAreaRole]) {
+         return l10n_util::GetNSString(IDS_AX_ROLE_WEB_AREA);
+       }
+       // Preserve platform default of "group" in the case of the child
+@@ -2631,7 +2631,7 @@ - (NSURL*)accessibilityURL {
+     return nil;
+ 
+   std::string url;
+-  if ([[self accessibilityRole] isEqualToString:NSAccessibilityWebAreaRole])
++  if ([[self accessibilityRole] isEqualToString:ChromiumAccessibilityWebAreaRole])
+     url = _node->GetDelegate()->GetTreeData().url;
+   else
+     url = _node->GetStringAttribute(ax::mojom::StringAttribute::kUrl);
+diff --git a/ui/accessibility/platform/ax_private_attributes_mac.h b/ui/accessibility/platform/ax_private_attributes_mac.h
+index 9e5049f31a..3fe9b09a06 100644
+--- a/ui/accessibility/platform/ax_private_attributes_mac.h
++++ b/ui/accessibility/platform/ax_private_attributes_mac.h
+@@ -57,7 +57,7 @@ constexpr NSString* const NSAccessibilityBrailleRoleDescription =
+     @"AXBrailleRoleDescription";
+ 
+ COMPONENT_EXPORT(AX_PLATFORM)
+-constexpr NSString* const NSAccessibilityBlockQuoteLevelAttribute =
++constexpr NSString* const ChromiumAccessibilityBlockQuoteLevelAttribute =
+     @"AXBlockQuoteLevel";
+ COMPONENT_EXPORT(AX_PLATFORM)
+ constexpr NSString* const NSAccessibilityChromeAXNodeIdAttribute =
+@@ -140,6 +140,6 @@ constexpr NSString* const NSAccessibilityOwnsAttribute = @"AXOwns";
+ COMPONENT_EXPORT(AX_PLATFORM)
+ constexpr NSString* const NSAccessibilityPopupValueAttribute = @"AXPopupValue";
+ COMPONENT_EXPORT(AX_PLATFORM)
+-constexpr NSString* const NSAccessibilityVisitedAttribute = @"AXVisited";
++constexpr NSString* const ChromiumAccessibilityVisitedAttribute = @"AXVisited";
+ 
+ #endif  // UI_ACCESSIBILITY_PLATFORM_AX_PRIVATE_ATTRIBUTES_MAC_H_
+diff --git a/ui/accessibility/platform/ax_private_roles_mac.h b/ui/accessibility/platform/ax_private_roles_mac.h
+index c2ae276e8c..f4b84ffa61 100644
+--- a/ui/accessibility/platform/ax_private_roles_mac.h
++++ b/ui/accessibility/platform/ax_private_roles_mac.h
+@@ -11,6 +11,6 @@
+ 
+ // Private WebKit accessibility roles.
+ COMPONENT_EXPORT(AX_PLATFORM)
+-constexpr NSString* const NSAccessibilityWebAreaRole = @"AXWebArea";
++constexpr NSString* const ChromiumAccessibilityWebAreaRole = @"AXWebArea";
+ 
+ #endif  // UI_ACCESSIBILITY_PLATFORM_AX_PRIVATE_ROLES_MAC_H_
+diff --git a/ui/accessibility/platform/inspect/ax_inspect_utils_mac.mm b/ui/accessibility/platform/inspect/ax_inspect_utils_mac.mm
+index c0943ec22a..8c1bdf3161 100644
+--- a/ui/accessibility/platform/inspect/ax_inspect_utils_mac.mm
++++ b/ui/accessibility/platform/inspect/ax_inspect_utils_mac.mm
+@@ -56,7 +56,7 @@ bool IsValidAXAttribute(const std::string& attribute) {
+     NSAccessibilityARIARowIndexAttribute,
+     NSAccessibilityARIASetSizeAttribute,
+     NSAccessibilityAutocompleteValueAttribute,
+-    NSAccessibilityBlockQuoteLevelAttribute,
++    ChromiumAccessibilityBlockQuoteLevelAttribute,
+     NSAccessibilityBrailleLabelAttribute,
+     NSAccessibilityBrailleRoleDescription,
+     NSAccessibilityChromeAXNodeIdAttribute,
+@@ -94,7 +94,7 @@ bool IsValidAXAttribute(const std::string& attribute) {
+     NSAccessibilityTitleAttribute,
+     NSAccessibilityTitleUIElementAttribute,
+     NSAccessibilityURLAttribute,
+-    NSAccessibilityVisitedAttribute,
++    ChromiumAccessibilityVisitedAttribute,
+   ]];
+ 
+   return [valid_attributes containsObject:base::SysUTF8ToNSString(attribute)];

@@ -1,9 +1,9 @@
 chromium/
 out/
 dist/
+logs/
 *.zip
 *.dSYM/
 *.log
 .DS_Store
 depot_tools/
-

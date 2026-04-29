@@ -1,0 +1,60 @@
+diff --git a/content/browser/accessibility/browser_accessibility_cocoa.mm b/content/browser/accessibility/browser_accessibility_cocoa.mm
+index 63085cb76e..d230db86f9 100644
+--- a/content/browser/accessibility/browser_accessibility_cocoa.mm
++++ b/content/browser/accessibility/browser_accessibility_cocoa.mm
+@@ -73,7 +73,7 @@
+     NSAccessibilityUIElementCountForSearchPredicateParameterizedAttribute =
+         @"AXUIElementCountForSearchPredicate";
+ NSString* const
+-    NSAccessibilityUIElementsForSearchPredicateParameterizedAttribute =
++    ChromiumAccessibilityUIElementsForSearchPredicateParameterizedAttribute =
+         @"AXUIElementsForSearchPredicate";
+ 
+ // Private attributes for text markers.
+@@ -200,7 +200,8 @@
+ // const NSAccessibilityValueAutofillTypeAttribute = @"AXValueAutofillType";
+ 
+ // Actions.
+-NSString* const NSAccessibilityScrollToVisibleAction = @"AXScrollToVisible";
++NSString* const ChromiumAccessibilityScrollToVisibleAction =
++    @"AXScrollToVisible";
+ 
+ // A mapping from an accessibility attribute to its method name.
+ NSDictionary* gAttributeToMethodNameMap = nil;
+@@ -2110,7 +2111,7 @@ - (id)accessibilityAttributeValue:(NSString*)attribute
+ 
+   if ([attribute
+           isEqualToString:
+-              NSAccessibilityUIElementsForSearchPredicateParameterizedAttribute]) {
++              ChromiumAccessibilityUIElementsForSearchPredicateParameterizedAttribute]) {
+     OneShotAccessibilityTreeSearch search(_owner);
+     if (InitializeAccessibilityTreeSearch(&search, parameter)) {
+       size_t count = search.CountMatches();
+@@ -2294,7 +2295,7 @@ - (NSArray*)accessibilityParameterizedAttributeNames {
+     NSAccessibilityBoundsForRangeParameterizedAttribute,
+     NSAccessibilityStringForRangeParameterizedAttribute,
+     NSAccessibilityUIElementCountForSearchPredicateParameterizedAttribute,
+-    NSAccessibilityUIElementsForSearchPredicateParameterizedAttribute,
++    ChromiumAccessibilityUIElementsForSearchPredicateParameterizedAttribute,
+     NSAccessibilitySelectTextWithCriteriaParameterizedAttribute
+   ] mutableCopy];
+ 
+@@ -2342,7 +2343,7 @@ - (NSArray*)accessibilityActionNames {
+ 
+   NSMutableArray* actions = [NSMutableArray
+       arrayWithObjects:NSAccessibilityShowMenuAction,
+-                       NSAccessibilityScrollToVisibleAction, nil];
++                       ChromiumAccessibilityScrollToVisibleAction, nil];
+ 
+   // VoiceOver expects the "press" action to be first.
+   if (_owner->IsClickable())
+@@ -2615,7 +2616,8 @@ - (void)accessibilityPerformAction:(NSString*)action {
+     node->SetData(data);  // Set the data back in the node.
+   } else if ([action isEqualToString:NSAccessibilityShowMenuAction]) {
+     manager->ShowContextMenu(*actionTarget);
+-  } else if ([action isEqualToString:NSAccessibilityScrollToVisibleAction]) {
++  } else if ([action
++                 isEqualToString:ChromiumAccessibilityScrollToVisibleAction]) {
+     manager->ScrollToMakeVisible(*actionTarget, gfx::Rect());
+   } else if ([action isEqualToString:NSAccessibilityIncrementAction]) {
+     manager->Increment(*actionTarget);

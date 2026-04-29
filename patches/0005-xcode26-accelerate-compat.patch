@@ -1,0 +1,122 @@
+diff --git a/third_party/blink/renderer/platform/audio/biquad.cc b/third_party/blink/renderer/platform/audio/biquad.cc
+index 032b9fc736..b883d86f1c 100644
+--- a/third_party/blink/renderer/platform/audio/biquad.cc
++++ b/third_party/blink/renderer/platform/audio/biquad.cc
+@@ -38,7 +38,7 @@
+ #include <algorithm>
+ #include <complex>
+ #if BUILDFLAG(IS_MAC)
+-#include <Accelerate/Accelerate.h>
++#include "third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h"
+ #endif
+ 
+ namespace blink {
+diff --git a/third_party/blink/renderer/platform/audio/direct_convolver.cc b/third_party/blink/renderer/platform/audio/direct_convolver.cc
+index a9553f43ba..de8322905d 100644
+--- a/third_party/blink/renderer/platform/audio/direct_convolver.cc
++++ b/third_party/blink/renderer/platform/audio/direct_convolver.cc
+@@ -34,7 +34,7 @@
+ #include "third_party/blink/renderer/platform/audio/vector_math.h"
+ 
+ #if BUILDFLAG(IS_MAC)
+-#include <Accelerate/Accelerate.h>
++#include "third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h"
+ #endif
+ 
+ #if defined(ARCH_CPU_X86_FAMILY) && !BUILDFLAG(IS_MAC)
+diff --git a/third_party/blink/renderer/platform/audio/fft_frame.h b/third_party/blink/renderer/platform/audio/fft_frame.h
+index 7428719f5d..3cb50eb975 100644
+--- a/third_party/blink/renderer/platform/audio/fft_frame.h
++++ b/third_party/blink/renderer/platform/audio/fft_frame.h
+@@ -42,7 +42,7 @@
+ #include "third_party/blink/renderer/platform/wtf/hash_map.h"
+ #include "third_party/pffft/src/pffft.h"
+ #elif BUILDFLAG(IS_MAC)
+-#include <Accelerate/Accelerate.h>
++#include "third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h"
+ #endif
+ 
+ namespace blink {
+diff --git a/third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h b/third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h
+new file mode 100644
+index 0000000000..e4113afe5b
+--- /dev/null
++++ b/third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (C) 2026 The Chromium Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AUDIO_MAC_ACCELERATE_COMPAT_MAC_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AUDIO_MAC_ACCELERATE_COMPAT_MAC_H_
++
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_MAC)
++
++#if defined(__clang__)
++#ifndef __has_builtin
++#define __has_builtin(x) 0
++#define BLINK_ACCELERATE_COMPAT_UNDEF_HAS_BUILTIN
++#endif
++
++#ifndef __has_feature
++#define __has_feature(x) 0
++#define BLINK_ACCELERATE_COMPAT_UNDEF_HAS_FEATURE
++#endif
++
++// Xcode 26 SDK headers use newer clang availability grammar and builtins than
++// Chromium 124's bundled clang understands.
++#if !__has_builtin(__builtin_verbose_trap)
++#define __builtin_verbose_trap(category, reason) __builtin_trap()
++#define BLINK_ACCELERATE_COMPAT_UNDEF_VERBOSE_TRAP
++#endif
++
++#if !__has_feature(availability_visionos)
++#define __builtin_available(...) (true)
++#define BLINK_ACCELERATE_COMPAT_UNDEF_BUILTIN_AVAILABLE
++#endif
++#endif  // defined(__clang__)
++
++#include <Accelerate/Accelerate.h>
++
++#if defined(BLINK_ACCELERATE_COMPAT_UNDEF_BUILTIN_AVAILABLE)
++#undef __builtin_available
++#undef BLINK_ACCELERATE_COMPAT_UNDEF_BUILTIN_AVAILABLE
++#endif
++
++#if defined(BLINK_ACCELERATE_COMPAT_UNDEF_VERBOSE_TRAP)
++#undef __builtin_verbose_trap
++#undef BLINK_ACCELERATE_COMPAT_UNDEF_VERBOSE_TRAP
++#endif
++
++#if defined(BLINK_ACCELERATE_COMPAT_UNDEF_HAS_FEATURE)
++#undef __has_feature
++#undef BLINK_ACCELERATE_COMPAT_UNDEF_HAS_FEATURE
++#endif
++
++#if defined(BLINK_ACCELERATE_COMPAT_UNDEF_HAS_BUILTIN)
++#undef __has_builtin
++#undef BLINK_ACCELERATE_COMPAT_UNDEF_HAS_BUILTIN
++#endif
++
++#endif  // BUILDFLAG(IS_MAC)
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_AUDIO_MAC_ACCELERATE_COMPAT_MAC_H_
+diff --git a/third_party/blink/renderer/platform/audio/mac/vector_math_mac.h b/third_party/blink/renderer/platform/audio/mac/vector_math_mac.h
+index 7c50febaf6..220adfec44 100644
+--- a/third_party/blink/renderer/platform/audio/mac/vector_math_mac.h
++++ b/third_party/blink/renderer/platform/audio/mac/vector_math_mac.h
+@@ -5,9 +5,8 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AUDIO_MAC_VECTOR_MATH_MAC_H_
+ #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AUDIO_MAC_VECTOR_MATH_MAC_H_
+ 
+-#include <Accelerate/Accelerate.h>
+-
+ #include "build/build_config.h"
++#include "third_party/blink/renderer/platform/audio/mac/accelerate_compat_mac.h"
+ #include "third_party/blink/renderer/platform/audio/audio_array.h"
+ 
+ namespace blink {
