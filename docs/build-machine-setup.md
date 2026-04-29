@@ -9,6 +9,7 @@ This document is the week-1 operational checklist for producing a FingerBrowser 
 - `depot_tools` on `PATH`.
 - At least 500 GB free disk for Chromium source, build output, and cache.
 - No customer profile data, proxy credentials, license tokens, or desktop app databases on the build host.
+- `assets/macos/FingerBrowserKernel.icns` present for Dock/Finder branding.
 
 ## Bootstrap
 
@@ -29,6 +30,7 @@ The repository pins Chromium through `CHROMIUM_BASE_REVISION`. Do not use `stabl
 
 ```bash
 bash -n scripts/*.sh
+tests/kernel-icon-packaging.sh
 scripts/apply-patches.sh
 scripts/build-mac-arm64.sh
 scripts/package-runtime.sh
@@ -41,6 +43,8 @@ Expected outputs:
 - `dist/fingerbrowser-kernel-v<version>-mac-arm64.zip`
 - `dist/fingerbrowser-kernel-v<version>-mac-arm64.manifest.json`
 - `dist/checksums.txt`
+
+The package contains `FingerBrowser Kernel.app/Contents/Resources/FingerBrowserKernel.icns`, and `Info.plist` points `CFBundleIconFile` to `FingerBrowserKernel`.
 
 ## Desktop Validation
 

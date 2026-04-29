@@ -16,11 +16,13 @@ This repository is the Chromium kernel engineering companion for FingerBrowser. 
 - Chromium source cached under `chromium/src`.
 - Runtime output written under `dist/`.
 - `CHROMIUM_BASE_REVISION` pinned to an exact git sha or release tag. Formal builds must not use `stable`, `main`, branch heads, or other moving aliases.
+- macOS app icon assets live under `assets/macos/` and are applied during packaging.
 
 ## Workflow
 
 ```bash
 bash -n scripts/*.sh
+tests/kernel-icon-packaging.sh
 scripts/apply-patches.sh
 scripts/build-mac-arm64.sh
 scripts/package-runtime.sh
@@ -32,6 +34,8 @@ The package step emits:
 - `dist/fingerbrowser-kernel-v<PATCHSET_VERSION>-mac-arm64.zip`
 - `dist/fingerbrowser-kernel-v<PATCHSET_VERSION>-mac-arm64.manifest.json`
 - `dist/checksums.txt`
+
+`scripts/package-runtime.sh` renames the copied Chromium app bundle to `FingerBrowser Kernel.app`, applies `assets/macos/FingerBrowserKernel.icns`, and updates `Info.plist` bundle name, display name, icon file, and bundle identifier before checksumming the zip.
 
 ## Desktop App Handoff
 

@@ -9,11 +9,14 @@ Use this checklist before a 30-day trial handoff.
 - `fingerbrowser-kernel-v<version>-mac-arm64.manifest.json`.
 - `checksums.txt`.
 - Customer-facing installation note with the local manifest import steps.
+- `FingerBrowser Kernel.app` displays the FingerBrowser Kernel Dock/Finder icon after install.
 
 ## Preflight
 
 - `CHROMIUM_BASE_REVISION` is fixed to an explicit revision or release tag.
 - `dist/checksums.txt` verifies both runtime zip and manifest.
+- Runtime zip contains `FingerBrowser Kernel.app/Contents/Resources/FingerBrowserKernel.icns`.
+- `Info.plist` uses `CFBundleIconFile=FingerBrowserKernel`.
 - Manifest fields match the desktop contract:
   - `version`
   - `baseChromiumRevision`

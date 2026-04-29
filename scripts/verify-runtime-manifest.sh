@@ -4,15 +4,24 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST_PATH="${1:-$ROOT_DIR/manifest/fingerbrowser-kernel.manifest.json}"
 BASE_REVISION="$(tr -d '[:space:]' < "$ROOT_DIR/CHROMIUM_BASE_REVISION")"
+ICON_PATH="$ROOT_DIR/assets/macos/FingerBrowserKernel.icns"
 
 if [[ "$BASE_REVISION" == "stable" || "$BASE_REVISION" == "main" || "$BASE_REVISION" == refs/heads/* || "$BASE_REVISION" == origin/* ]]; then
   echo "CHROMIUM_BASE_REVISION must be an exact git sha or immutable release tag, not '$BASE_REVISION'" >&2
   exit 1
 fi
 
+if [[ ! -f "$ICON_PATH" ]]; then
+  echo "Kernel icon missing: $ICON_PATH" >&2
+  exit 1
+fi
+
 node - "$MANIFEST_PATH" "$BASE_REVISION" <<'NODE'
+const { execFileSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { existsSync, readFileSync } = require('node:fs');
+const { existsSync, mkdtempSync, readFileSync, rmSync } = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 
 const [, , manifestPath, baseRevision] = process.argv;
@@ -63,6 +72,41 @@ if (manifest.artifactUrl.startsWith('file://')) {
   const actualSha256 = createHash('sha256').update(readFileSync(artifactPath)).digest('hex');
   if (actualSha256 !== manifest.sha256) {
     throw new Error(`artifact sha256 mismatch: ${actualSha256}`);
+  }
+  const appMarker = '.app/';
+  const markerIndex = manifest.executableRelativePath.indexOf(appMarker);
+  if (markerIndex === -1) {
+    throw new Error(`executableRelativePath must point inside an app bundle: ${manifest.executableRelativePath}`);
+  }
+  const appRelativePath = manifest.executableRelativePath.slice(0, markerIndex + '.app'.length);
+  const unpackDir = mkdtempSync(path.join(os.tmpdir(), 'fingerbrowser-kernel-verify-'));
+  try {
+    execFileSync('ditto', ['-x', '-k', artifactPath, unpackDir]);
+    const appRoot = path.join(unpackDir, appRelativePath);
+    const iconPath = path.join(appRoot, 'Contents', 'Resources', 'FingerBrowserKernel.icns');
+    const plistPath = path.join(appRoot, 'Contents', 'Info.plist');
+    if (!existsSync(iconPath)) {
+      throw new Error('custom kernel icon missing from app bundle');
+    }
+    if (!existsSync(plistPath)) {
+      throw new Error('Info.plist missing from app bundle');
+    }
+    const readPlist = (key) =>
+      execFileSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, plistPath], { encoding: 'utf8' }).trim();
+    const expected = {
+      CFBundleName: 'FingerBrowser Kernel',
+      CFBundleDisplayName: 'FingerBrowser Kernel',
+      CFBundleIconFile: 'FingerBrowserKernel',
+      CFBundleIdentifier: 'com.fingerbrowser.kernel'
+    };
+    for (const [key, value] of Object.entries(expected)) {
+      const actual = readPlist(key);
+      if (actual !== value) {
+        throw new Error(`${key} mismatch: ${actual}`);
+      }
+    }
+  } finally {
+    rmSync(unpackDir, { recursive: true, force: true });
   }
 }
 
