@@ -20,6 +20,11 @@ if [[ ! -d "$APP_SOURCE" ]]; then
   exit 1
 fi
 
+if [[ "$BASE_REVISION" == "stable" || "$BASE_REVISION" == "main" || "$BASE_REVISION" == refs/heads/* || "$BASE_REVISION" == origin/* ]]; then
+  echo "CHROMIUM_BASE_REVISION must be an exact git sha or immutable release tag, not '$BASE_REVISION'" >&2
+  exit 1
+fi
+
 rm -rf "$PACKAGE_ROOT"
 mkdir -p "$PACKAGE_ROOT" "$DIST_DIR"
 ditto "$APP_SOURCE" "$PACKAGE_ROOT/$APP_NAME"
@@ -44,4 +49,3 @@ JSON
 shasum -a 256 "$ZIP_PATH" "$MANIFEST_PATH" > "$DIST_DIR/checksums.txt"
 echo "Packaged $ZIP_PATH"
 echo "Wrote $MANIFEST_PATH"
-

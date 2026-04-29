@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "baseChromiumRevision": "stable",
+  "baseChromiumRevision": "refs/tags/124.0.6367.207",
   "patchsetVersion": "2026.04.29.1",
   "platform": "darwin",
   "arch": "arm64",

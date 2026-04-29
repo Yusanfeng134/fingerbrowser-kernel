@@ -10,6 +10,11 @@ if [[ -z "$BASE_REVISION" ]]; then
   exit 1
 fi
 
+if [[ "$BASE_REVISION" == "stable" || "$BASE_REVISION" == "main" || "$BASE_REVISION" == refs/heads/* || "$BASE_REVISION" == origin/* ]]; then
+  echo "CHROMIUM_BASE_REVISION must be an exact git sha or immutable release tag, not '$BASE_REVISION'" >&2
+  exit 1
+fi
+
 if ! command -v fetch >/dev/null 2>&1 || ! command -v gclient >/dev/null 2>&1; then
   echo "depot_tools must be installed and available on PATH" >&2
   exit 1
@@ -40,4 +45,3 @@ for patch_file in "${patches[@]}"; do
 done
 
 echo "Patch queue applied to $BASE_REVISION"
-

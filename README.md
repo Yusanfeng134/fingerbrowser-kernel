@@ -15,6 +15,7 @@ This repository is the Chromium kernel engineering companion for FingerBrowser. 
 - `depot_tools` available on `PATH`.
 - Chromium source cached under `chromium/src`.
 - Runtime output written under `dist/`.
+- `CHROMIUM_BASE_REVISION` pinned to an exact git sha or release tag. Formal builds must not use `stable`, `main`, branch heads, or other moving aliases.
 
 ## Workflow
 
@@ -32,13 +33,23 @@ The package step emits:
 
 ## Desktop App Handoff
 
-Point the desktop app to the generated manifest before launching:
+Preferred trial handoff uses the desktop app UI:
+
+1. Open an environment.
+2. Switch `内核通道` to `自研内核`.
+3. Click `导入 manifest`.
+4. Select `dist/fingerbrowser-kernel-v<version>-mac-arm64.manifest.json`.
+5. Click `检查自研内核`.
+
+For developer sessions, the desktop app can still be pointed to a generated manifest before launching:
 
 ```bash
 FINGERBROWSER_KERNEL_MANIFEST=/path/to/fingerbrowser-kernel-v0.1.0-mac-arm64.manifest.json npm run dev
 ```
 
-For packaged builds, set the same environment variable when starting the app. The desktop app verifies the zip checksum before extracting a `file://` artifact and refuses to silently fall back when the custom kernel is missing or invalid.
+The desktop app verifies the zip checksum before extracting a `file://` artifact and refuses to silently fall back when the custom kernel is missing or invalid.
+
+See `docs/build-machine-setup.md` and `docs/trial-delivery-checklist.md` for the build-machine and customer-trial handoff runbooks.
 
 ## Repository Setup
 
