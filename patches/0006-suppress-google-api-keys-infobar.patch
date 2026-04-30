@@ -1,0 +1,20 @@
+diff --git a/chrome/browser/ui/startup/google_api_keys_infobar_delegate.cc b/chrome/browser/ui/startup/google_api_keys_infobar_delegate.cc
+index 6d3683aceb..51d2716359 100644
+--- a/chrome/browser/ui/startup/google_api_keys_infobar_delegate.cc
++++ b/chrome/browser/ui/startup/google_api_keys_infobar_delegate.cc
+@@ -16,10 +16,11 @@
+
+ // static
+ void GoogleApiKeysInfoBarDelegate::Create(
+-    infobars::ContentInfoBarManager* infobar_manager) {
+-  infobar_manager->AddInfoBar(
+-      CreateConfirmInfoBar(std::unique_ptr<ConfirmInfoBarDelegate>(
+-          new GoogleApiKeysInfoBarDelegate())));
++    infobars::ContentInfoBarManager*) {
++  // FingerBrowser Kernel intentionally does not embed Google API keys. Google
++  // services that require keys remain unavailable; suppress only the startup
++  // infobar shown by upstream Chromium development builds.
++  return;
+ }
+
+ GoogleApiKeysInfoBarDelegate::GoogleApiKeysInfoBarDelegate()
