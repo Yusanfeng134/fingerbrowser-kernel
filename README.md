@@ -17,6 +17,12 @@ This repository is the Chromium kernel engineering companion for FingerBrowser. 
 - Runtime output written under `dist/`.
 - `CHROMIUM_BASE_REVISION` pinned to an exact git sha or release tag. Formal builds must not use `stable`, `main`, branch heads, or other moving aliases.
 - macOS app icon assets live under `assets/macos/` and are applied during packaging.
+- Google API credentials are optional build inputs. To enable Chromium features that require Google APIs, provide all three values as environment variables before `scripts/build-mac-arm64.sh`:
+  - `FINGERBROWSER_GOOGLE_API_KEY`
+  - `FINGERBROWSER_GOOGLE_DEFAULT_CLIENT_ID`
+  - `FINGERBROWSER_GOOGLE_DEFAULT_CLIENT_SECRET`
+
+Do not commit Google API keys, OAuth client IDs, or OAuth client secrets. Chromium upstream documents that sign-in to Chromium builds is restricted unless the account is allowed by Google for Chromium sign-in testing; this repo only wires the supported key delivery path.
 
 ## Workflow
 
