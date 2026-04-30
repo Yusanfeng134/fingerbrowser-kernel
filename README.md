@@ -50,7 +50,7 @@ Preferred trial handoff uses the desktop app UI:
 For developer sessions, the desktop app can still be pointed to a generated manifest before launching:
 
 ```bash
-FINGERBROWSER_KERNEL_MANIFEST=/path/to/fingerbrowser-kernel-v0.1.0-mac-arm64.manifest.json npm run dev
+FINGERBROWSER_KERNEL_MANIFEST=/path/to/fingerbrowser-kernel-v0.1.1-mac-arm64.manifest.json npm run dev
 ```
 
 The desktop app verifies the zip checksum before extracting a `file://` artifact and refuses to silently fall back when the custom kernel is missing or invalid.

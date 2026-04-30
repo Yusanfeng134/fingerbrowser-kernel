@@ -34,12 +34,12 @@ FINGERBROWSER_KERNEL_BUILD_DIR="$BUILD_DIR" \
 FINGERBROWSER_KERNEL_DIST_DIR="$DIST_DIR" \
   "$ROOT_DIR/scripts/package-runtime.sh"
 
-MANIFEST_PATH="$DIST_DIR/fingerbrowser-kernel-v0.1.0-mac-arm64.manifest.json"
+MANIFEST_PATH="$DIST_DIR/fingerbrowser-kernel-v0.1.1-mac-arm64.manifest.json"
 "$ROOT_DIR/scripts/verify-runtime-manifest.sh" "$MANIFEST_PATH"
 
 UNPACK_DIR="$TMP_DIR/unpack"
 mkdir -p "$UNPACK_DIR"
-ditto -x -k "$DIST_DIR/fingerbrowser-kernel-v0.1.0-mac-arm64.zip" "$UNPACK_DIR"
+ditto -x -k "$DIST_DIR/fingerbrowser-kernel-v0.1.1-mac-arm64.zip" "$UNPACK_DIR"
 
 APP_ROOT="$UNPACK_DIR/FingerBrowser Kernel.app"
 PLIST_PATH="$APP_ROOT/Contents/Info.plist"
