@@ -20,6 +20,11 @@ plain_args="$(FINGERBROWSER_KERNEL_PRINT_GN_ARGS=1 "$ROOT_DIR/scripts/build-mac-
 [[ "$plain_args" != *'google_default_client_id='* ]]
 [[ "$plain_args" != *'google_default_client_secret='* ]]
 
+linux_args="$(FINGERBROWSER_KERNEL_PRINT_GN_ARGS=1 "$ROOT_DIR/scripts/build-linux-x64.sh")"
+[[ "$linux_args" == *'target_os="linux"'* ]]
+[[ "$linux_args" == *'target_cpu="x64"'* ]]
+[[ "$linux_args" != *'google_api_key='* ]]
+
 set +e
 partial_output="$(
   FINGERBROWSER_KERNEL_PRINT_GN_ARGS=1 \
