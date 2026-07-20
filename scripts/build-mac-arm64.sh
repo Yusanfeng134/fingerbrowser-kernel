@@ -25,7 +25,7 @@ if [[ "$google_value_count" -ne 0 && "$google_value_count" -ne 3 ]]; then
   exit 1
 fi
 
-GN_ARGS='target_os="mac" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 enable_nacl=false proprietary_codecs=false'
+GN_ARGS='target_os="mac" target_cpu="arm64" is_debug=false dcheck_always_on=false is_component_build=false symbol_level=0 enable_nacl=false proprietary_codecs=false'
 if [[ "$google_value_count" -eq 3 ]]; then
   GN_ARGS+=" google_api_key=\"$(gn_escape "$google_api_key")\""
   GN_ARGS+=" google_default_client_id=\"$(gn_escape "$google_client_id")\""

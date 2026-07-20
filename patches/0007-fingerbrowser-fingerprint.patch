@@ -1,0 +1,1028 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 0386b3db3c..c926d8185e 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -2068,6 +2068,7 @@ static_library("browser") {
+     "//chrome/browser/enterprise/identifiers",
+     "//chrome/browser/enterprise/platform_auth:features",
+     "//chrome/browser/favicon",
++    "//chrome/browser/fingerbrowser",
+     "//chrome/browser/first_party_sets",
+     "//chrome/browser/image_decoder",
+     "//chrome/browser/image_fetcher",
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 1d9bfb1c1d..ffdaf9719b 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -65,6 +65,7 @@
+ #include "chrome/browser/defaults.h"
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+ #include "chrome/browser/extensions/component_loader.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_policy.h"
+ #include "chrome/browser/first_run/first_run.h"
+ #include "chrome/browser/language/url_language_histogram_factory.h"
+ #include "chrome/browser/lifetime/application_lifetime.h"
+@@ -1021,6 +1022,11 @@ int ChromeBrowserMainParts::ApplyFirstRunPrefs() {
+ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+   TRACE_EVENT0("startup", "ChromeBrowserMainParts::PreCreateThreadsImpl");
+
++  if (!fingerbrowser::ApplyFingerBrowserPolicyFromCommandLine(
++          base::CommandLine::ForCurrentProcess())) {
++    return chrome::RESULT_CODE_UNSUPPORTED_PARAM;
++  }
++
+   if (browser_process_->GetApplicationLocale().empty()) {
+     ShowMissingLocaleMessageBox();
+     return chrome::RESULT_CODE_MISSING_DATA;
+diff --git a/chrome/browser/fingerbrowser/BUILD.gn b/chrome/browser/fingerbrowser/BUILD.gn
+new file mode 100644
+index 0000000000..4d8d18b6e3
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/BUILD.gn
+@@ -0,0 +1,39 @@
++import("//testing/test.gni")
++
++source_set("fingerbrowser") {
++  sources = [
++    "fingerbrowser_policy.cc",
++    "fingerbrowser_policy.h",
++  ]
++
++  deps = [
++    "//base",
++    "//chrome/common",
++    "//components/permissions",
++    "//content/public/common",
++    "//third_party/icu",
++    "//ui/base",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++
++  sources = [ "fingerbrowser_policy_unittest.cc" ]
++
++  deps = [
++    ":fingerbrowser",
++    "//base",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
++
++test("fingerbrowser_policy_unittests") {
++  testonly = true
++
++  deps = [
++    ":unit_tests",
++    "//base/test:run_all_unittests",
++  ]
++}
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+new file mode 100644
+index 0000000000..d7e1fe4241
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -0,0 +1,321 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/fingerbrowser/fingerbrowser_policy.h"
++
++#include <memory>
++#include <string>
++#include <string_view>
++
++#include "base/check.h"
++#include "base/command_line.h"
++#include "base/environment.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "chrome/common/chrome_switches.h"
++#include "components/permissions/switches.h"
++#include "content/public/common/content_switches.h"
++#include "ui/base/ui_base_switches.h"
++#include "unicode/timezone.h"
++#include "unicode/unistr.h"
++
++#if BUILDFLAG(IS_POSIX) || BUILDFLAG(IS_FUCHSIA)
++#include <time.h>
++#endif
++
++namespace fingerbrowser {
++namespace {
++
++constexpr int kPolicySchemaVersion = 1;
++constexpr int kMinWindowSide = 200;
++constexpr int kMaxWindowSide = 10000;
++
++bool IsSensitiveText(std::string_view value) {
++  const std::string lower = base::ToLowerASCII(value);
++  return lower.find("password") != std::string::npos ||
++         lower.find("token") != std::string::npos ||
++         lower.find("secret") != std::string::npos ||
++         lower.find("encrypted") != std::string::npos ||
++         lower.find("cookie") != std::string::npos ||
++         lower.find("cache") != std::string::npos;
++}
++
++bool ContainsSensitiveData(const base::Value& value) {
++  if (value.is_string()) {
++    return IsSensitiveText(value.GetString());
++  }
++  if (value.is_dict()) {
++    for (const auto [key, entry] : value.GetDict()) {
++      if (IsSensitiveText(key) || ContainsSensitiveData(entry)) {
++        return true;
++      }
++    }
++  }
++  if (value.is_list()) {
++    for (const base::Value& entry : value.GetList()) {
++      if (ContainsSensitiveData(entry)) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool IsSafePolicyString(std::string_view value) {
++  if (value.empty() || value.size() > 128) {
++    return false;
++  }
++  for (const char c : value) {
++    if (base::IsAsciiWhitespace(c) || c < 0x20 || c == 0x7f) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Looser than IsSafePolicyString: allows interior spaces, parentheses and
++// commas (real GPU strings look like "ANGLE (Apple, Apple M1, ...)") while
++// still rejecting control characters and over-long values. Leading/trailing
++// whitespace is rejected. Sensitive content is already filtered globally by
++// ContainsSensitiveData() before this runs.
++bool IsSafeDisplayString(std::string_view value) {
++  if (value.empty() || value.size() > 256) {
++    return false;
++  }
++  if (base::IsAsciiWhitespace(value.front()) ||
++      base::IsAsciiWhitespace(value.back())) {
++    return false;
++  }
++  for (const char c : value) {
++    if (c == '\t' || c == '\n' || c == '\r' || (c >= 0 && c < 0x20) ||
++        c == 0x7f) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsValidTimeZone(std::string_view timezone) {
++  if (!IsSafePolicyString(timezone)) {
++    return false;
++  }
++  std::unique_ptr<icu::TimeZone> zone(icu::TimeZone::createTimeZone(
++      icu::UnicodeString::fromUTF8(std::string(timezone))));
++  return zone && *zone != icu::TimeZone::getUnknown();
++}
++
++bool IsValidWindowSide(int value) {
++  return value >= kMinWindowSide && value <= kMaxWindowSide;
++}
++
++std::optional<FingerBrowserPolicy> ParsePolicyDict(
++    const base::Value::Dict& root) {
++  const std::optional<int> schema_version = root.FindInt("schemaVersion");
++  const std::string* profile_id = root.FindString("profileId");
++  const std::string* runtime_channel = root.FindString("runtimeChannel");
++  const base::Value::Dict* fingerprint_policy =
++      root.FindDict("fingerprintPolicy");
++  if (schema_version != kPolicySchemaVersion || !profile_id ||
++      profile_id->empty() || !runtime_channel ||
++      *runtime_channel != "custom-kernel" || !fingerprint_policy) {
++    return std::nullopt;
++  }
++
++  const std::string* locale = fingerprint_policy->FindString("locale");
++  const std::string* timezone = fingerprint_policy->FindString("timezone");
++  const base::Value::Dict* window_size =
++      fingerprint_policy->FindDict("windowSize");
++  const std::string* permission_defaults =
++      fingerprint_policy->FindString("permissionDefaults");
++  const std::string* webrtc_ip_policy =
++      fingerprint_policy->FindString("webrtcIpPolicy");
++  if (!locale || !timezone || !window_size || !permission_defaults ||
++      !webrtc_ip_policy) {
++    return std::nullopt;
++  }
++
++  const std::optional<int> width = window_size->FindInt("width");
++  const std::optional<int> height = window_size->FindInt("height");
++  if (!width || !height || !IsSafePolicyString(*locale) ||
++      !IsValidTimeZone(*timezone) || !IsValidWindowSide(*width) ||
++      !IsValidWindowSide(*height) ||
++      (*permission_defaults != "ask" && *permission_defaults != "deny") ||
++      (*webrtc_ip_policy != "default" &&
++       *webrtc_ip_policy != "disable_non_proxied_udp")) {
++    return std::nullopt;
++  }
++
++  FingerBrowserPolicy policy;
++  policy.profile_id = *profile_id;
++  policy.locale = *locale;
++  policy.timezone = *timezone;
++  policy.window_width = *width;
++  policy.window_height = *height;
++  policy.permission_defaults = *permission_defaults;
++  policy.webrtc_ip_policy = *webrtc_ip_policy;
++
++  // Optional L2 hardware profile. Every field is optional and individually
++  // validated; an invalid field is skipped (left unset) rather than failing
++  // the whole policy, so compliant policies without this block are unaffected.
++  if (const base::Value::Dict* hardware_profile =
++          fingerprint_policy->FindDict("hardwareProfile")) {
++    if (const std::string* gpu_vendor =
++            hardware_profile->FindString("gpuVendor");
++        gpu_vendor && IsSafeDisplayString(*gpu_vendor)) {
++      policy.gpu_vendor = *gpu_vendor;
++    }
++    if (const std::string* gpu_renderer =
++            hardware_profile->FindString("gpuRenderer");
++        gpu_renderer && IsSafeDisplayString(*gpu_renderer)) {
++      policy.gpu_renderer = *gpu_renderer;
++    }
++    if (const std::string* platform =
++            hardware_profile->FindString("platform");
++        platform && IsSafeDisplayString(*platform)) {
++      policy.platform = *platform;
++    }
++    if (const std::optional<int> hardware_concurrency =
++            hardware_profile->FindInt("hardwareConcurrency");
++        hardware_concurrency && *hardware_concurrency >= 1 &&
++        *hardware_concurrency <= 128) {
++      policy.hardware_concurrency = *hardware_concurrency;
++    }
++    if (const std::optional<int> device_memory =
++            hardware_profile->FindInt("deviceMemory");
++        device_memory && (*device_memory == 1 || *device_memory == 2 ||
++                          *device_memory == 4 || *device_memory == 8)) {
++      policy.device_memory = *device_memory;
++    }
++    if (const std::optional<int> canvas_noise =
++            hardware_profile->FindInt("canvasNoise");
++        canvas_noise && *canvas_noise > 0) {
++      policy.canvas_noise_seed = *canvas_noise;
++    }
++    if (const std::optional<int> audio_noise =
++            hardware_profile->FindInt("audioNoise");
++        audio_noise && *audio_noise > 0) {
++      policy.audio_noise_seed = *audio_noise;
++    }
++  }
++
++  return policy;
++}
++
++void ApplyTimezone(std::string_view timezone) {
++  std::unique_ptr<base::Environment> environment = base::Environment::Create();
++  environment->SetVar("TZ", std::string(timezone));
++#if BUILDFLAG(IS_POSIX) || BUILDFLAG(IS_FUCHSIA)
++  tzset();
++#endif
++  icu::TimeZone::adoptDefault(icu::TimeZone::createTimeZone(
++      icu::UnicodeString::fromUTF8(std::string(timezone))));
++}
++
++}  // namespace
++
++FingerBrowserPolicy::FingerBrowserPolicy() = default;
++
++FingerBrowserPolicy::FingerBrowserPolicy(const FingerBrowserPolicy&) = default;
++
++FingerBrowserPolicy& FingerBrowserPolicy::operator=(
++    const FingerBrowserPolicy&) = default;
++
++FingerBrowserPolicy::~FingerBrowserPolicy() = default;
++
++std::optional<FingerBrowserPolicy> LoadFingerBrowserPolicy(
++    const base::FilePath& policy_path) {
++  std::string contents;
++  if (!base::ReadFileToString(policy_path, &contents)) {
++    LOG(ERROR) << "FingerBrowser policy file is missing or unreadable: "
++               << policy_path;
++    return std::nullopt;
++  }
++  std::optional<base::Value::Dict> root =
++      base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC, 20);
++  if (!root) {
++    LOG(ERROR) << "FingerBrowser policy JSON is invalid";
++    return std::nullopt;
++  }
++  if (ContainsSensitiveData(base::Value(root->Clone()))) {
++    LOG(ERROR) << "FingerBrowser policy contains sensitive data";
++    return std::nullopt;
++  }
++  std::optional<FingerBrowserPolicy> policy = ParsePolicyDict(*root);
++  if (!policy) {
++    LOG(ERROR) << "FingerBrowser policy schema is invalid";
++  }
++  return policy;
++}
++
++void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
++                              base::CommandLine* command_line) {
++  CHECK(command_line);
++  command_line->AppendSwitchASCII(switches::kLang, policy.locale);
++  command_line->AppendSwitchASCII(
++      switches::kWindowSize,
++      base::NumberToString(policy.window_width) + "," +
++          base::NumberToString(policy.window_height));
++  if (policy.permission_defaults == "deny") {
++    command_line->AppendSwitch(permissions::switches::kDenyPermissionPrompts);
++  }
++  if (policy.webrtc_ip_policy != "default") {
++    command_line->AppendSwitchASCII(switches::kForceWebRtcIPHandlingPolicy,
++                                    policy.webrtc_ip_policy);
++  }
++
++  // L2 hardware profile -> renderer switches. Switch names must stay in sync
++  // with third_party/blink/.../fingerbrowser/fingerbrowser_fingerprint.h and
++  // the propagation list in render_process_host_impl.cc.
++  if (!policy.gpu_vendor.empty()) {
++    command_line->AppendSwitchASCII("fp-gpu-vendor", policy.gpu_vendor);
++  }
++  if (!policy.gpu_renderer.empty()) {
++    command_line->AppendSwitchASCII("fp-gpu-renderer", policy.gpu_renderer);
++  }
++  if (!policy.platform.empty()) {
++    command_line->AppendSwitchASCII("fp-platform", policy.platform);
++  }
++  if (policy.hardware_concurrency > 0) {
++    command_line->AppendSwitchASCII(
++        "fp-hardware-concurrency",
++        base::NumberToString(policy.hardware_concurrency));
++  }
++  if (policy.device_memory > 0) {
++    command_line->AppendSwitchASCII(
++        "fp-device-memory", base::NumberToString(policy.device_memory));
++  }
++  if (policy.canvas_noise_seed > 0) {
++    command_line->AppendSwitchASCII(
++        "fp-canvas-noise", base::NumberToString(policy.canvas_noise_seed));
++  }
++  if (policy.audio_noise_seed > 0) {
++    command_line->AppendSwitchASCII(
++        "fp-audio-noise", base::NumberToString(policy.audio_noise_seed));
++  }
++
++  ApplyTimezone(policy.timezone);
++}
++
++bool ApplyFingerBrowserPolicyFromCommandLine(base::CommandLine* command_line) {
++  CHECK(command_line);
++  if (!command_line->HasSwitch(switches::kFingerBrowserPolicy)) {
++    return true;
++  }
++  const base::FilePath policy_path =
++      command_line->GetSwitchValuePath(switches::kFingerBrowserPolicy);
++  std::optional<FingerBrowserPolicy> policy =
++      LoadFingerBrowserPolicy(policy_path);
++  if (!policy) {
++    return false;
++  }
++  ApplyFingerBrowserPolicy(*policy, command_line);
++  return true;
++}
++
++}  // namespace fingerbrowser
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+new file mode 100644
+index 0000000000..56583133e1
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_POLICY_H_
++#define CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_POLICY_H_
++
++#include <optional>
++#include <string>
++
++#include "base/files/file_path.h"
++
++namespace base {
++class CommandLine;
++}
++
++namespace fingerbrowser {
++
++struct FingerBrowserPolicy {
++  FingerBrowserPolicy();
++  FingerBrowserPolicy(const FingerBrowserPolicy&);
++  FingerBrowserPolicy& operator=(const FingerBrowserPolicy&);
++  ~FingerBrowserPolicy();
++
++  std::string profile_id;
++  std::string locale;
++  std::string timezone;
++  int window_width = 0;
++  int window_height = 0;
++  std::string permission_defaults;
++  std::string webrtc_ip_policy;
++
++  // Optional L2 hardware profile (anti-detect). Empty/zero == not set, in
++  // which case the renderer keeps the genuine value. Parsed from an optional
++  // "hardwareProfile" dict inside "fingerprintPolicy".
++  std::string gpu_vendor;
++  std::string gpu_renderer;
++  std::string platform;
++  int hardware_concurrency = 0;
++  int device_memory = 0;
++  int canvas_noise_seed = 0;
++  int audio_noise_seed = 0;
++};
++
++std::optional<FingerBrowserPolicy> LoadFingerBrowserPolicy(
++    const base::FilePath& policy_path);
++
++void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
++                              base::CommandLine* command_line);
++
++bool ApplyFingerBrowserPolicyFromCommandLine(base::CommandLine* command_line);
++
++}  // namespace fingerbrowser
++
++#endif  // CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_POLICY_H_
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc
+new file mode 100644
+index 0000000000..00555a13c3
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc
+@@ -0,0 +1,128 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/fingerbrowser/fingerbrowser_policy.h"
++
++#include "base/check.h"
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/test/scoped_command_line.h"
++#include "chrome/common/chrome_switches.h"
++#include "components/permissions/switches.h"
++#include "content/public/common/content_switches.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/ui_base_switches.h"
++
++namespace fingerbrowser {
++namespace {
++
++base::FilePath WritePolicy(base::ScopedTempDir* temp_dir,
++                           const std::string& body) {
++  CHECK(temp_dir->CreateUniqueTempDir());
++  const base::FilePath path =
++      temp_dir->GetPath().AppendASCII("fingerbrowser_policy.json");
++  CHECK(base::WriteFile(path, body));
++  return path;
++}
++
++TEST(FingerBrowserPolicyTest, LoadsValidPolicy) {
++  base::ScopedTempDir temp_dir;
++  const base::FilePath path = WritePolicy(
++      &temp_dir,
++      R"({
++        "schemaVersion": 1,
++        "profileId": "profile-1",
++        "runtimeChannel": "custom-kernel",
++        "fingerprintPolicy": {
++          "locale": "zh-CN",
++          "timezone": "America/Chicago",
++          "windowSize": { "width": 1360, "height": 900 },
++          "permissionDefaults": "deny",
++          "webrtcIpPolicy": "disable_non_proxied_udp"
++        }
++      })");
++
++  const std::optional<FingerBrowserPolicy> policy =
++      LoadFingerBrowserPolicy(path);
++
++  ASSERT_TRUE(policy.has_value());
++  EXPECT_EQ("profile-1", policy->profile_id);
++  EXPECT_EQ("zh-CN", policy->locale);
++  EXPECT_EQ("America/Chicago", policy->timezone);
++  EXPECT_EQ(1360, policy->window_width);
++  EXPECT_EQ(900, policy->window_height);
++  EXPECT_EQ("deny", policy->permission_defaults);
++  EXPECT_EQ("disable_non_proxied_udp", policy->webrtc_ip_policy);
++}
++
++TEST(FingerBrowserPolicyTest, RejectsSensitiveKeys) {
++  base::ScopedTempDir temp_dir;
++  const base::FilePath path = WritePolicy(
++      &temp_dir,
++      R"({
++        "schemaVersion": 1,
++        "profileId": "profile-1",
++        "runtimeChannel": "custom-kernel",
++        "fingerprintPolicy": {
++          "locale": "zh-CN",
++          "timezone": "America/Chicago",
++          "windowSize": { "width": 1360, "height": 900 },
++          "permissionDefaults": "deny",
++          "webrtcIpPolicy": "disable_non_proxied_udp",
++          "proxyPassword": "secret"
++        }
++      })");
++
++  EXPECT_FALSE(LoadFingerBrowserPolicy(path).has_value());
++}
++
++TEST(FingerBrowserPolicyTest, RejectsInvalidTimezone) {
++  base::ScopedTempDir temp_dir;
++  const base::FilePath path = WritePolicy(
++      &temp_dir,
++      R"({
++        "schemaVersion": 1,
++        "profileId": "profile-1",
++        "runtimeChannel": "custom-kernel",
++        "fingerprintPolicy": {
++          "locale": "zh-CN",
++          "timezone": "Mars/Colony",
++          "windowSize": { "width": 1360, "height": 900 },
++          "permissionDefaults": "deny",
++          "webrtcIpPolicy": "disable_non_proxied_udp"
++        }
++      })");
++
++  EXPECT_FALSE(LoadFingerBrowserPolicy(path).has_value());
++}
++
++TEST(FingerBrowserPolicyTest, AppliesPolicyToCommandLine) {
++  base::test::ScopedCommandLine scoped_command_line;
++  base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  FingerBrowserPolicy policy;
++  policy.profile_id = "profile-1";
++  policy.locale = "zh-CN";
++  policy.timezone = "America/Chicago";
++  policy.window_width = 1360;
++  policy.window_height = 900;
++  policy.permission_defaults = "deny";
++  policy.webrtc_ip_policy = "disable_non_proxied_udp";
++
++  ApplyFingerBrowserPolicy(policy, command_line);
++
++  EXPECT_EQ("zh-CN", command_line->GetSwitchValueASCII(switches::kLang));
++  EXPECT_EQ("1360,900",
++            command_line->GetSwitchValueASCII(switches::kWindowSize));
++  EXPECT_TRUE(command_line->HasSwitch(
++      permissions::switches::kDenyPermissionPrompts));
++  EXPECT_EQ("disable_non_proxied_udp",
++            command_line->GetSwitchValueASCII(
++                switches::kForceWebRtcIPHandlingPolicy));
++}
++
++}  // namespace
++}  // namespace fingerbrowser
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index b82d425ba1..4ed36676ca 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -313,6 +313,9 @@ const char kExtensionsInstallVerification[] = "extensions-install-verification";
+ // be treated as not from the webstore when doing install verification.
+ const char kExtensionsNotWebstore[] = "extensions-not-webstore";
+
++// Path to the FingerBrowser custom-kernel policy file.
++const char kFingerBrowserPolicy[] = "fingerbrowser-policy";
++
+ // Forces application mode. This hides certain system UI elements and forces
+ // the app to be installed if it hasn't been already.
+ const char kForceAppMode[] = "force-app-mode";
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 2d73a5d2c8..19199a066f 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -111,6 +111,7 @@ extern const char kExtensionContentVerificationEnforce[];
+ extern const char kExtensionContentVerificationEnforceStrict[];
+ extern const char kExtensionsInstallVerification[];
+ extern const char kExtensionsNotWebstore[];
++extern const char kFingerBrowserPolicy[];
+ extern const char kForceAppMode[];
+ #if BUILDFLAG(IS_CHROMEOS)
+ extern const char kForceDevToolsAvailable[];
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index ddeef4098e..29eb7f86f6 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3370,6 +3370,15 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+   // Propagate the following switches to the renderer command line (along
+   // with any associated values) if present in the browser command line.
+   static const char* const kSwitchNames[] = {
++      // FingerBrowser L2 fingerprint switches (browser -> renderer). Names must
++      // match the blink-side reader and the browser-side emitter.
++      "fp-gpu-vendor",
++      "fp-gpu-renderer",
++      "fp-platform",
++      "fp-hardware-concurrency",
++      "fp-device-memory",
++      "fp-canvas-noise",
++      "fp-audio-noise",
+       switches::kDisableInProcessStackTraces,
+       sandbox::policy::switches::kDisableSeccompFilterSandbox,
+       sandbox::policy::switches::kNoSandbox,
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index aafe16cde1..672cdaa9d3 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -27,6 +27,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+@@ -58,6 +59,13 @@ String Navigator::vendorSub() const {
+ }
+
+ String Navigator::platform() const {
++  // FingerBrowser L2: native platform override (takes precedence over the
++  // devtools/settings override path below).
++  const std::string fb_platform =
++      fingerbrowser::SwitchValue(fingerbrowser::kPlatformSwitch);
++  if (!fb_platform.empty()) {
++    return String::FromUTF8(fb_platform);
++  }
+   // TODO(955620): Consider changing devtools overrides to only allow overriding
+   // the platform with a frozen platform to distinguish between
+   // mobile and desktop when ReduceUserAgent is enabled.
+diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2d1b..6c2b964838 100644
+--- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -5,10 +5,16 @@
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+
+ #include "base/system/sys_info.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+
+ namespace blink {
+
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++  const int spoofed =
++      fingerbrowser::IntSwitch(fingerbrowser::kHardwareConcurrencySwitch);
++  if (spoofed > 0) {
++    return static_cast<unsigned>(spoofed);
++  }
+   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
+ }
+
+diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+index 2876aad298..f49e3158fc 100644
+--- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
++++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+@@ -10,10 +10,16 @@
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+
+ namespace blink {
+
+ float NavigatorDeviceMemory::deviceMemory() const {
++  const int spoofed =
++      fingerbrowser::IntSwitch(fingerbrowser::kDeviceMemorySwitch);
++  if (spoofed > 0) {
++    return static_cast<float>(spoofed);
++  }
+   return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
+ }
+
+diff --git a/third_party/blink/renderer/core/frame/navigator_id.cc b/third_party/blink/renderer/core/frame/navigator_id.cc
+index 50a1727f8d..a2e51ae85b 100644
+--- a/third_party/blink/renderer/core/frame/navigator_id.cc
++++ b/third_party/blink/renderer/core/frame/navigator_id.cc
+@@ -34,6 +34,7 @@
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+
+ #if !BUILDFLAG(IS_MAC) && !BUILDFLAG(IS_WIN)
+@@ -59,6 +60,11 @@ String NavigatorID::appVersion() {
+ }
+
+ String NavigatorID::platform() const {
++  const std::string spoofed =
++      fingerbrowser::SwitchValue(fingerbrowser::kPlatformSwitch);
++  if (!spoofed.empty()) {
++    return String::FromUTF8(spoofed);
++  }
+ #if BUILDFLAG(IS_MAC)
+   // Match Safari and Mozilla on Mac x86.
+   return "MacIntel";
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 7626ccf7bd..41f98cae5c 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -12,6 +12,7 @@
+
+ #include "base/check_deref.h"
+ #include "base/logging.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+@@ -2491,6 +2492,18 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+     }
+   }
+
++  // FingerBrowser L2: deterministic readback noise (canvas fingerprint
++  // defense). No-op unless a per-profile seed switch is present.
++  if (const uint32_t fb_seed = fingerbrowser::CanvasSeed()) {
++    SkPixmap fb_pixmap = image_data->GetSkPixmap();
++    if (fb_pixmap.addr()) {
++      fingerbrowser::PerturbPixels(
++          static_cast<uint8_t*>(fb_pixmap.writable_addr()),
++          fb_pixmap.computeByteSize(), fb_seed,
++          fb_pixmap.info().bytesPerPixel());
++    }
++  }
++
+   return image_data;
+ }
+
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+index 9aad422c44..859f302c86 100644
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+@@ -35,7 +35,10 @@
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_listener.h"
+ #include "third_party/blink/renderer/modules/webaudio/deferred_task_handler.h"
++#include "third_party/blink/renderer/core/typed_arrays/dom_typed_array.h"
++#include "third_party/blink/renderer/modules/webaudio/audio_buffer.h"
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_completion_event.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_node.h"
+ #include "third_party/blink/renderer/platform/audio/audio_utilities.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_messages.h"
+@@ -370,6 +373,22 @@ void OfflineAudioContext::FireCompletionEvent() {
+       return;
+     }
+
++    // FingerBrowser L2: deterministic noise on the offline-rendered result
++    // (the audio-fingerprint vector that fingerprintjs/creepjs read). Safe
++    // here: this is one-shot render output handed to JS, not live playback, so
++    // AudioBuffer.getChannelData stays untouched/native. No-op unless a
++    // per-profile seed switch is present.
++    if (const uint32_t fb_audio_seed = fingerbrowser::AudioSeed()) {
++      for (unsigned fb_ch = 0; fb_ch < rendered_buffer->numberOfChannels();
++           ++fb_ch) {
++        DOMFloat32Array* fb_data = rendered_buffer->getChannelData(fb_ch).Get();
++        if (fb_data) {
++          fingerbrowser::PerturbAudio(fb_data->Data(), fb_data->length(),
++                                      fb_audio_seed + fb_ch);
++        }
++      }
++    }
++
+     // Call the offline rendering completion event listener and resolve the
+     // promise too.
+     DispatchEvent(*OfflineAudioCompletionEvent::Create(rendered_buffer));
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index aa89d49c0e..6e523e8819 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -34,6 +34,7 @@
+ #include "base/numerics/checked_math.h"
+ #include "base/synchronization/lock.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "build/build_config.h"
+ #include "gpu/GLES2/gl2extchromium.h"
+ #include "gpu/command_buffer/client/gles2_interface.h"
+@@ -3862,6 +3863,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        const std::string fb_renderer =
++            fingerbrowser::SwitchValue(fingerbrowser::kGpuRendererSwitch);
++        if (!fb_renderer.empty()) {
++          return WebGLAny(script_state, String::FromUTF8(fb_renderer));
++        }
+         if (IdentifiabilityStudySettings::Get()->ShouldSampleType(
+                 blink::IdentifiableSurface::Type::kWebGLParameter)) {
+           RecordIdentifiableGLParameterDigest(
+@@ -3877,6 +3883,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        const std::string fb_vendor =
++            fingerbrowser::SwitchValue(fingerbrowser::kGpuVendorSwitch);
++        if (!fb_vendor.empty()) {
++          return WebGLAny(script_state, String::FromUTF8(fb_vendor));
++        }
+         if (IdentifiabilityStudySettings::Get()->ShouldSampleType(
+                 blink::IdentifiableSurface::Type::kWebGLParameter)) {
+           RecordIdentifiableGLParameterDigest(
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+new file mode 100644
+index 0000000000..35590e499c
+--- /dev/null
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -0,0 +1,109 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// FingerBrowser L2 fingerprint helpers (renderer-side).
++//
++// Header-only. Each spoof seam (navigator / WebGL / canvas / audio) reads its
++// per-profile value from a command-line switch that the browser process
++// appended from the FingerBrowser policy (see
++// chrome/browser/fingerbrowser/fingerbrowser_policy.cc) and that
++// content/browser/renderer_host/render_process_host_impl.cc propagates to the
++// renderer. The switch names below MUST match those two files exactly.
++//
++// Noise is deterministic from a per-profile seed (mulberry32), so a given
++// profile produces a stable-but-unique fingerprint: same profile + same input
++// -> same output; different profile (different seed) -> different output.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERBROWSER_FINGERBROWSER_FINGERPRINT_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERBROWSER_FINGERBROWSER_FINGERPRINT_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++
++namespace blink {
++namespace fingerbrowser {
++
++// Switch names — keep in sync with the browser-side emitter and propagator.
++inline constexpr char kGpuVendorSwitch[] = "fp-gpu-vendor";
++inline constexpr char kGpuRendererSwitch[] = "fp-gpu-renderer";
++inline constexpr char kPlatformSwitch[] = "fp-platform";
++inline constexpr char kHardwareConcurrencySwitch[] = "fp-hardware-concurrency";
++inline constexpr char kDeviceMemorySwitch[] = "fp-device-memory";
++inline constexpr char kCanvasNoiseSwitch[] = "fp-canvas-noise";
++inline constexpr char kAudioNoiseSwitch[] = "fp-audio-noise";
++
++inline std::string SwitchValue(const char* name) {
++  const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++  return cmd->HasSwitch(name) ? cmd->GetSwitchValueASCII(name) : std::string();
++}
++
++inline int IntSwitch(const char* name) {
++  const std::string value = SwitchValue(name);
++  int parsed = 0;
++  return (!value.empty() && base::StringToInt(value, &parsed)) ? parsed : 0;
++}
++
++inline uint32_t CanvasSeed() {
++  return static_cast<uint32_t>(IntSwitch(kCanvasNoiseSwitch));
++}
++
++inline uint32_t AudioSeed() {
++  return static_cast<uint32_t>(IntSwitch(kAudioNoiseSwitch));
++}
++
++// mulberry32 — small, fast, deterministic PRNG.
++inline uint32_t NextRandom(uint32_t& state) {
++  state += 0x6D2B79F5u;
++  uint32_t t = state;
++  t = (t ^ (t >> 15)) * (t | 1u);
++  t ^= t + (t ^ (t >> 7)) * (t | 61u);
++  return t ^ (t >> 14);
++}
++
++// Perturb ~3% of each color channel by +/-1, deterministically. Alpha (the 4th
++// byte of each pixel) is left untouched so the change stays imperceptible.
++inline void PerturbPixels(uint8_t* data,
++                          size_t byte_length,
++                          uint32_t seed,
++                          int bytes_per_pixel) {
++  if (!data || !seed || bytes_per_pixel < 3) {
++    return;
++  }
++  uint32_t state = seed;
++  const int color_channels = bytes_per_pixel >= 4 ? 3 : bytes_per_pixel;
++  for (size_t i = 0; i + static_cast<size_t>(bytes_per_pixel) <= byte_length;
++       i += static_cast<size_t>(bytes_per_pixel)) {
++    for (int channel = 0; channel < color_channels; ++channel) {
++      if ((NextRandom(state) & 0xFFu) < 8u) {  // ~3.1% of channels
++        const int delta = (NextRandom(state) & 1u) ? 1 : -1;
++        const int value = static_cast<int>(data[i + channel]) + delta;
++        data[i + channel] =
++            static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
++      }
++    }
++  }
++}
++
++// Add an inaudible deterministic perturbation to float audio samples. Used by
++// the offline-render audio seam (Build 2); harmless if unreferenced.
++inline void PerturbAudio(float* data, size_t count, uint32_t seed) {
++  if (!data || !seed) {
++    return;
++  }
++  uint32_t state = seed;
++  for (size_t i = 0; i < count; ++i) {
++    const float unit =
++        static_cast<float>(NextRandom(state) & 0xFFFFu) / 65535.0f - 0.5f;
++    data[i] += unit * 2e-7f;
++  }
++}
++
++}  // namespace fingerbrowser
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERBROWSER_FINGERBROWSER_FINGERPRINT_H_
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index 16875cc89c..1f31faa63e 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -36,12 +36,14 @@
+
+ #include "base/compiler_specific.h"
+ #include "base/memory/ptr_util.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
++#include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkImage.h"
+ #include "third_party/skia/include/core/SkSurface.h"
+ #include "third_party/skia/include/core/SkSwizzle.h"
+@@ -146,6 +148,24 @@ bool ImageDataBuffer::EncodeImageInternal(const ImageEncodingMimeType mime_type,
+                                           const SkPixmap& pixmap) const {
+   DCHECK(is_valid_);
+
++  // FingerBrowser L2: deterministic canvas noise. toDataURL and toBlob both
++  // funnel through here, so noising a copy here covers both while leaving the
++  // source pixmap (and any other readers) untouched. No-op unless a per-profile
++  // seed switch is present.
++  SkBitmap fb_noised;
++  SkPixmap fb_noised_pixmap;
++  const SkPixmap* active_pixmap = &pixmap;
++  if (const uint32_t fb_seed = fingerbrowser::CanvasSeed();
++      fb_seed && pixmap.addr() && fb_noised.tryAllocPixels(pixmap.info()) &&
++      pixmap.readPixels(fb_noised.pixmap()) &&
++      fb_noised.peekPixels(&fb_noised_pixmap)) {
++    fingerbrowser::PerturbPixels(
++        static_cast<uint8_t*>(fb_noised_pixmap.writable_addr()),
++        fb_noised_pixmap.computeByteSize(), fb_seed,
++        fb_noised_pixmap.info().bytesPerPixel());
++    active_pixmap = &fb_noised_pixmap;
++  }
++
+   if (mime_type == kMimeTypeJpeg) {
+     SkJpegEncoder::Options options;
+     options.fQuality = ImageEncoder::ComputeJpegQuality(quality);
+@@ -153,19 +173,19 @@ bool ImageDataBuffer::EncodeImageInternal(const ImageEncodingMimeType mime_type,
+     if (options.fQuality == 100) {
+       options.fDownsample = SkJpegEncoder::Downsample::k444;
+     }
+-    return ImageEncoder::Encode(encoded_image, pixmap, options);
++    return ImageEncoder::Encode(encoded_image, *active_pixmap, options);
+   }
+
+   if (mime_type == kMimeTypeWebp) {
+     SkWebpEncoder::Options options = ImageEncoder::ComputeWebpOptions(quality);
+-    return ImageEncoder::Encode(encoded_image, pixmap, options);
++    return ImageEncoder::Encode(encoded_image, *active_pixmap, options);
+   }
+
+   DCHECK_EQ(mime_type, kMimeTypePng);
+   SkPngEncoder::Options options;
+   options.fFilterFlags = SkPngEncoder::FilterFlag::kSub;
+   options.fZLibLevel = 3;
+-  return ImageEncoder::Encode(encoded_image, pixmap, options);
++  return ImageEncoder::Encode(encoded_image, *active_pixmap, options);
+ }
+
+ String ImageDataBuffer::ToDataURL(const ImageEncodingMimeType mime_type,
