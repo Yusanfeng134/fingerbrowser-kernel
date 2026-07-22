@@ -1251,10 +1251,10 @@ index 97be6ed099..9f5e796023 100644
          memoryHeapProperties.heapInfo[i]));
 diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
 new file mode 100644
-index 0000000000..f1b646d394
+index 0000000000..7b7225f344
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,179 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1395,12 +1395,18 @@ index 0000000000..f1b646d394
 +      if (i + static_cast<size_t>(bytes_per_pixel) > byte_length) {
 +        break;
 +      }
-+      const uint32_t pixel_hash =
-+          PixelHash(seed, origin_x + col, origin_y + row);
++      // One hash per pixel, sliced into per-channel fields, rather than one
++      // hash per channel. Hashing each channel separately cost four PixelHash
++      // calls per pixel (~16 multiplies) and made getImageData 5-10x slower;
++      // on canvas-heavy pages that was enough to stall rendering outright.
++      // Small test canvases hid this -- the cost only shows at real sizes.
++      //
++      // Layout: bits 0-7, 8-15, 16-23 carry each channel's probability field,
++      // bits 24-26 carry its sign. 27 bits used of 32, no overlap.
++      const uint32_t h = PixelHash(seed, origin_x + col, origin_y + row);
 +      for (int channel = 0; channel < color_channels; ++channel) {
-+        const uint32_t channel_hash = PixelHash(pixel_hash, channel, 0);
-+        if ((channel_hash & 0xFFu) < 8u) {  // ~3.1% of channels
-+          const int delta = (channel_hash & 0x100u) ? 1 : -1;
++        if (((h >> (channel * 8)) & 0xFFu) < 8u) {  // ~3.1% of channels
++          const int delta = (h & (1u << (24 + channel))) ? 1 : -1;
 +          const int value = static_cast<int>(data[i + channel]) + delta;
 +          data[i + channel] =
 +              static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
