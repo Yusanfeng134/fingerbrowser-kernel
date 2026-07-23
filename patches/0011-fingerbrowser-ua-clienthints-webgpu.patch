@@ -1,0 +1,242 @@
+From: FingerBrowser
+Subject: [PATCH 0011] UA/Client Hints and WebGPU identity consistency
+
+Stop blanking high-entropy Client Hints when a custom UA is set under a
+FingerBrowser profile; complete the Client Hints brand list with the product
+brand a Chrome UA implies; and spoof the WebGPU adapter identity so it names
+the same GPU as WebGL. All three remove same-page contradictions between the
+UA string and the values a detector reads back.
+
+Depends on: 0001-0010.
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index 83ecb56..f0e4470 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -160,6 +160,13 @@ std::optional<FingerBrowserPolicy> ParsePolicyDict(
+   policy.permission_defaults = *permission_defaults;
+   policy.webrtc_ip_policy = *webrtc_ip_policy;
+ 
++  // Brand sits at the policy root rather than under hardwareProfile: it
++  // describes the browser product, not the machine.
++  if (const std::string* brand = fingerprint_policy->FindString("brand");
++      brand && IsSafeDisplayString(*brand)) {
++    policy.brand = *brand;
++  }
++
+   // Optional L2 hardware profile. Every field is optional and individually
+   // validated; an invalid field is skipped (left unset) rather than failing
+   // the whole policy, so compliant policies without this block are unaffected.
+@@ -175,6 +182,26 @@ std::optional<FingerBrowserPolicy> ParsePolicyDict(
+         gpu_renderer && IsSafeDisplayString(*gpu_renderer)) {
+       policy.gpu_renderer = *gpu_renderer;
+     }
++    if (const std::string* webgpu_vendor =
++            hardware_profile->FindString("webgpuVendor");
++        webgpu_vendor && IsSafeDisplayString(*webgpu_vendor)) {
++      policy.webgpu_vendor = *webgpu_vendor;
++    }
++    if (const std::string* webgpu_architecture =
++            hardware_profile->FindString("webgpuArchitecture");
++        webgpu_architecture && IsSafeDisplayString(*webgpu_architecture)) {
++      policy.webgpu_architecture = *webgpu_architecture;
++    }
++    if (const std::string* webgpu_device =
++            hardware_profile->FindString("webgpuDevice");
++        webgpu_device && IsSafeDisplayString(*webgpu_device)) {
++      policy.webgpu_device = *webgpu_device;
++    }
++    if (const std::string* webgpu_description =
++            hardware_profile->FindString("webgpuDescription");
++        webgpu_description && IsSafeDisplayString(*webgpu_description)) {
++      policy.webgpu_description = *webgpu_description;
++    }
+     if (const std::string* platform =
+             hardware_profile->FindString("platform");
+         platform && IsSafeDisplayString(*platform)) {
+@@ -279,6 +306,17 @@ std::optional<FingerBrowserPolicy> LoadFingerBrowserPolicy(
+ void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
+                               base::CommandLine* command_line) {
+   CHECK(command_line);
++  // Marks this process as running under a FingerBrowser profile. Read by
++  // components/embedder_support/user_agent_utils.cc, which otherwise blanks
++  // every high-entropy Client Hint whenever --user-agent is present -- leaving
++  // a populated UA string and brand list next to an empty platform_version /
++  // uaFullVersion / fullVersionList. No real Chrome install reports that
++  // combination, and upstream's own comment warns that empty low-entropy hints
++  // trip web application firewalls.
++  command_line->AppendSwitch("fp-active");
++  if (!policy.brand.empty()) {
++    command_line->AppendSwitchASCII("fp-brand", policy.brand);
++  }
+   command_line->AppendSwitchASCII(switches::kLang, policy.locale);
+   command_line->AppendSwitchASCII(
+       switches::kWindowSize,
+@@ -301,6 +339,20 @@ void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
+   if (!policy.gpu_renderer.empty()) {
+     command_line->AppendSwitchASCII("fp-gpu-renderer", policy.gpu_renderer);
+   }
++  if (!policy.webgpu_vendor.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-vendor", policy.webgpu_vendor);
++  }
++  if (!policy.webgpu_architecture.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-architecture",
++                                    policy.webgpu_architecture);
++  }
++  if (!policy.webgpu_device.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-device", policy.webgpu_device);
++  }
++  if (!policy.webgpu_description.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-description",
++                                    policy.webgpu_description);
++  }
+   if (!policy.platform.empty()) {
+     command_line->AppendSwitchASCII("fp-platform", policy.platform);
+   }
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+index 1e7d494..0d32f82 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+@@ -33,8 +33,19 @@ struct FingerBrowserPolicy {
+   // Optional L2 hardware profile (anti-detect). Empty/zero == not set, in
+   // which case the renderer keeps the genuine value. Parsed from an optional
+   // "hardwareProfile" dict inside "fingerprintPolicy".
++  // Product brand for the Client Hints brand list, e.g. "Google Chrome".
++  // Unbranded Chromium builds omit it entirely, leaving a list that never
++  // mentions the product the UA string claims to be.
++  std::string brand;
+   std::string gpu_vendor;
+   std::string gpu_renderer;
++  // WebGPU reports a different vocabulary than WebGL (lowercase "nvidia" /
++  // "ampere" rather than "Google Inc. (NVIDIA)"), so it needs its own values
++  // instead of reusing the WebGL strings.
++  std::string webgpu_vendor;
++  std::string webgpu_architecture;
++  std::string webgpu_device;
++  std::string webgpu_description;
+   std::string platform;
+   int hardware_concurrency = 0;
+   int device_memory = 0;
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 205d12a..41eed45 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -190,6 +190,28 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+ #if !BUILDFLAG(CHROMIUM_BRANDING)
+   brand = version_info::GetProductName();
+ #endif
++  // FingerBrowser: supply the product brand that an unbranded build lacks.
++  //
++  // Only branded builds set `brand` above, so a build from public Chromium
++  // source emits a two-entry list (GREASE + "Chromium") while real Chrome
++  // emits three (GREASE + "Chromium" + "Google Chrome"). A UA string claiming
++  // Chrome next to a brand list that never mentions it is a contradiction no
++  // real install produces.
++  //
++  // Setting `brand` here rather than rewriting the list afterwards is
++  // deliberate: GenerateBrandVersionList() below places the three entries in
++  // one of six permutations chosen by major version. Appending an entry
++  // post-hoc would leave the ordering fixed, and a brand list whose order
++  // never varies is itself a distinguishing signal.
++  {
++    const base::CommandLine* fb_cmd = base::CommandLine::ForCurrentProcess();
++    if (fb_cmd->HasSwitch("fp-active")) {
++      const std::string fb_brand = fb_cmd->GetSwitchValueASCII("fp-brand");
++      if (!fb_brand.empty()) {
++        brand = fb_brand;
++      }
++    }
++  }
+   std::optional<std::string> maybe_brand_override =
+       base::GetFieldTrialParamValueByFeature(features::kGreaseUACH,
+                                              "brand_override");
+@@ -483,11 +505,16 @@ blink::UserAgentMetadata GetUserAgentMetadata(const PrefService* pref_service,
+   // Notes: Sending low entropy hints with empty values may cause requests being
+   // blocked by web application firewall software, etc.
+   std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
+-  if (custom_ua.has_value()) {
++  if (custom_ua.has_value() &&
++      !base::CommandLine::ForCurrentProcess()->HasSwitch("fp-active")) {
+     return base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)
+                ? blink::UserAgentMetadata()
+                : metadata;
+   }
++  // Under a FingerBrowser profile we fall through instead of returning early.
++  // The declared UA describes the platform this build actually runs on, so the
++  // natively computed high-entropy hints already agree with it; blanking them
++  // would manufacture a self-contradictory identity rather than hide one.
+ 
+   if (only_low_entropy_ch) {
+     return metadata;
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 6ed0bf6..bb46e77 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3374,6 +3374,11 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       // match the blink-side reader and the browser-side emitter.
+       "fp-gpu-vendor",
+       "fp-gpu-renderer",
++      "fp-brand",
++      "fp-webgpu-vendor",
++      "fp-webgpu-architecture",
++      "fp-webgpu-device",
++      "fp-webgpu-description",
+       "fp-platform",
+       "fp-hardware-concurrency",
+       "fp-device-memory",
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+index 97be6ed..9f5e796 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+@@ -18,6 +18,7 @@
+ #include "third_party/blink/renderer/modules/webgpu/gpu_device.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_device_lost_info.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_supported_features.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_supported_limits.h"
+ #include "third_party/blink/renderer/modules/webgpu/string_utils.h"
+@@ -136,6 +137,43 @@ GPUAdapter::GPUAdapter(
+   }
+   description_ = properties.name;
+   driver_ = properties.driverDescription;
++
++  // FingerBrowser: override the adapter identity before anything reads it, so
++  // both requestAdapterInfo() branches and the `info` attribute stay in sync.
++  //
++  // Only the identity strings are overridden. limits and features still
++  // describe the real adapter, and deliberately so: a page that requests a
++  // feature we claimed but the hardware lacks would fail at device creation,
++  // turning a fingerprinting defense into a rendering bug. That leaves a
++  // residual inconsistency (a claimed Apple adapter still reporting
++  // texture-compression-bc, which Apple hardware never exposes), which the
++  // launcher should account for by choosing an identity in the same GPU family
++  // as the host rather than an arbitrary one.
++  {
++    const std::string fb_vendor =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuVendorSwitch);
++    if (!fb_vendor.empty()) {
++      vendor_ = String::FromUTF8(fb_vendor);
++    }
++    const std::string fb_arch =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuArchitectureSwitch);
++    if (!fb_arch.empty()) {
++      architecture_ = String::FromUTF8(fb_arch);
++    }
++    const std::string fb_device =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuDeviceSwitch);
++    if (!fb_device.empty()) {
++      device_ = String::FromUTF8(fb_device);
++    }
++    const std::string fb_desc =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuDescriptionSwitch);
++    if (!fb_desc.empty()) {
++      description_ = String::FromUTF8(fb_desc);
++      // The driver string names the real vendor too; clear it rather than
++      // leave "NVIDIA ..." next to a claimed Apple adapter.
++      driver_ = String();
++    }
++  }
+   for (size_t i = 0; i < memoryHeapProperties.heapCount; ++i) {
+     memory_heaps_.push_back(MakeGarbageCollected<GPUMemoryHeapInfo>(
+         memoryHeapProperties.heapInfo[i]));

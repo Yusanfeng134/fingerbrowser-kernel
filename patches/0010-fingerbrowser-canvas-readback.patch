@@ -1,0 +1,138 @@
+From: FingerBrowser
+Subject: [PATCH 0010] canvas readback coordinate keying and cost
+
+Key canvas noise on absolute pixel coordinates rather than buffer offset, so
+partial and full getImageData agree on shared pixels. Noise is computed with
+one hash per pixel sliced into per-channel fields; the earlier per-channel
+hashing made getImageData 5-10x slower and stalled canvas-heavy pages.
+
+Depends on: 0001-0009.
+
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 41f98ca..10de546 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -2497,10 +2497,13 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+   if (const uint32_t fb_seed = fingerbrowser::CanvasSeed()) {
+     SkPixmap fb_pixmap = image_data->GetSkPixmap();
+     if (fb_pixmap.addr()) {
+-      fingerbrowser::PerturbPixels(
++      // Key on absolute canvas coordinates (sx, sy), not buffer offset, so a
++      // partial read and a full read agree on the pixels they share.
++      fingerbrowser::PerturbPixelsAt(
+           static_cast<uint8_t*>(fb_pixmap.writable_addr()),
+           fb_pixmap.computeByteSize(), fb_seed,
+-          fb_pixmap.info().bytesPerPixel());
++          fb_pixmap.info().bytesPerPixel(), fb_pixmap.rowBytes(),
++          fb_pixmap.width(), fb_pixmap.height(), sx, sy);
+     }
+   }
+ 
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index e6b918f..7b7225f 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -92,23 +92,68 @@ inline uint32_t NextRandom(uint32_t& state) {
+ 
+ // Perturb ~3% of each color channel by +/-1, deterministically. Alpha (the 4th
+ // byte of each pixel) is left untouched so the change stays imperceptible.
+-inline void PerturbPixels(uint8_t* data,
+-                          size_t byte_length,
+-                          uint32_t seed,
+-                          int bytes_per_pixel) {
+-  if (!data || !seed || bytes_per_pixel < 3) {
++// Deterministic hash of (seed, x, y). Finalizer-style mixing so that adjacent
++// coordinates do not produce correlated output.
++inline uint32_t PixelHash(uint32_t seed, int32_t x, int32_t y) {
++  uint32_t h = seed;
++  h ^= static_cast<uint32_t>(x) * 0x9E3779B1u;
++  h = (h ^ (h >> 15)) * 0x85EBCA6Bu;
++  h ^= static_cast<uint32_t>(y) * 0xC2B2AE35u;
++  h = (h ^ (h >> 13)) * 0xC2B2AE35u;
++  return h ^ (h >> 16);
++}
++
++// Perturb a pixel block, keying the noise on each pixel's ABSOLUTE canvas
++// coordinate rather than on its offset within the returned buffer.
++//
++// This distinction is load-bearing. A buffer-offset-keyed stream gives the same
++// canvas pixel different noise depending on the shape of the read that returned
++// it, so getImageData(sx, sy, w, h) disagrees with getImageData(0, 0, W, H) for
++// the pixels they share. That breaks legitimate partial-readback image
++// processing (measured: 59 mismatched bytes over a 20x20 sub-read). Keying on
++// absolute coordinates makes every read of a given pixel agree, which is a
++// correctness requirement for the canvas API independent of any defense goal.
++inline void PerturbPixelsAt(uint8_t* data,
++                            size_t byte_length,
++                            uint32_t seed,
++                            int bytes_per_pixel,
++                            size_t row_bytes,
++                            int32_t width,
++                            int32_t height,
++                            int32_t origin_x,
++                            int32_t origin_y) {
++  if (!data || !seed || bytes_per_pixel < 3 || width <= 0 || height <= 0) {
+     return;
+   }
+-  uint32_t state = seed;
+   const int color_channels = bytes_per_pixel >= 4 ? 3 : bytes_per_pixel;
+-  for (size_t i = 0; i + static_cast<size_t>(bytes_per_pixel) <= byte_length;
+-       i += static_cast<size_t>(bytes_per_pixel)) {
+-    for (int channel = 0; channel < color_channels; ++channel) {
+-      if ((NextRandom(state) & 0xFFu) < 8u) {  // ~3.1% of channels
+-        const int delta = (NextRandom(state) & 1u) ? 1 : -1;
+-        const int value = static_cast<int>(data[i + channel]) + delta;
+-        data[i + channel] =
+-            static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
++  for (int32_t row = 0; row < height; ++row) {
++    const size_t row_offset = static_cast<size_t>(row) * row_bytes;
++    if (row_offset >= byte_length) {
++      break;
++    }
++    for (int32_t col = 0; col < width; ++col) {
++      const size_t i =
++          row_offset + static_cast<size_t>(col) *
++                           static_cast<size_t>(bytes_per_pixel);
++      if (i + static_cast<size_t>(bytes_per_pixel) > byte_length) {
++        break;
++      }
++      // One hash per pixel, sliced into per-channel fields, rather than one
++      // hash per channel. Hashing each channel separately cost four PixelHash
++      // calls per pixel (~16 multiplies) and made getImageData 5-10x slower;
++      // on canvas-heavy pages that was enough to stall rendering outright.
++      // Small test canvases hid this -- the cost only shows at real sizes.
++      //
++      // Layout: bits 0-7, 8-15, 16-23 carry each channel's probability field,
++      // bits 24-26 carry its sign. 27 bits used of 32, no overlap.
++      const uint32_t h = PixelHash(seed, origin_x + col, origin_y + row);
++      for (int channel = 0; channel < color_channels; ++channel) {
++        if (((h >> (channel * 8)) & 0xFFu) < 8u) {  // ~3.1% of channels
++          const int delta = (h & (1u << (24 + channel))) ? 1 : -1;
++          const int value = static_cast<int>(data[i + channel]) + delta;
++          data[i + channel] =
++              static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
++        }
+       }
+     }
+   }
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index 1f31faa..c5eabeb 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -159,10 +159,14 @@ bool ImageDataBuffer::EncodeImageInternal(const ImageEncodingMimeType mime_type,
+       fb_seed && pixmap.addr() && fb_noised.tryAllocPixels(pixmap.info()) &&
+       pixmap.readPixels(fb_noised.pixmap()) &&
+       fb_noised.peekPixels(&fb_noised_pixmap)) {
+-    fingerbrowser::PerturbPixels(
++    // Origin (0, 0): this path always encodes the whole canvas. Sharing the
++    // coordinate-keyed function with the getImageData seam means toDataURL and
++    // getImageData report the same value for the same pixel.
++    fingerbrowser::PerturbPixelsAt(
+         static_cast<uint8_t*>(fb_noised_pixmap.writable_addr()),
+         fb_noised_pixmap.computeByteSize(), fb_seed,
+-        fb_noised_pixmap.info().bytesPerPixel());
++        fb_noised_pixmap.info().bytesPerPixel(), fb_noised_pixmap.rowBytes(),
++        fb_noised_pixmap.width(), fb_noised_pixmap.height(), 0, 0);
+     active_pixmap = &fb_noised_pixmap;
+   }
+ 

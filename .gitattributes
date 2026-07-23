@@ -1,0 +1,17 @@
+# 仓库内所有文本文件在检出时统一为 LF。
+#
+# 起因：源码经 macOS 打包、NAS 中转、Windows 检出后，工作树里的文本文件变成了
+# CRLF，而索引中是 LF。仓库此前没有 .gitattributes，core.autocrlf 又是 false，
+# 于是 26 个文件（含全部编号补丁）长期显示为「已修改」，diff 却是
+# 2251 insertions / 2251 deletions 这种完全对称的纯行尾符噪音。
+#
+# 补丁文件尤其不能容忍这种漂移：git apply 对行尾符敏感，CRLF 化的补丁在
+# Linux/macOS 构建机上会套用失败。
+* text=auto eol=lf
+
+# 构建脚本必须是 LF，否则 shebang 后带 CR 会让解释器报 "bad interpreter"。
+*.sh text eol=lf
+
+# 二进制资源不做任何转换。
+*.png binary
+*.icns binary

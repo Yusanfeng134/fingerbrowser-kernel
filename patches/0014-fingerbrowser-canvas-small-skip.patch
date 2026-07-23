@@ -1,0 +1,83 @@
+From: FingerBrowser
+Subject: [PATCH 0014] skip canvas noise on small canvases
+
+The readback noise (0010) perturbed every getImageData/toDataURL regardless
+of canvas size. That tripped noise detectors: CreepJS getPixelMods writes
+known data to an 8x8 canvas via putImageData and flags any difference on
+getImageData, and putImageData->getImageData is lossless on a real browser.
+Result was a "2% rgba noise" verdict.
+
+Gate noise on the SOURCE CANVAS area (>= 1024 px), not the read region, so a
+small sub-read of a large canvas is still noised and consistent with a full
+read (preserving 0010's coordinate keying), while genuinely small canvases --
+what these detectors probe -- stay lossless. Real fingerprinting reads
+rendered text/gradients from canvases well above the threshold, so their
+per-profile uniqueness is unaffected. Measured: CreepJS no longer reports rgba
+noise; the fingerprint canvas hash stays unique.
+
+Depends on: 0001-0013.
+
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 10de5469da..df9efb2487 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -2495,8 +2495,17 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+   // FingerBrowser L2: deterministic readback noise (canvas fingerprint
+   // defense). No-op unless a per-profile seed switch is present.
+   if (const uint32_t fb_seed = fingerbrowser::CanvasSeed()) {
++    // Gate on the source canvas size, not the read region: a small sub-read of
++    // a large canvas must still be noised (to stay consistent with a full
++    // read), while a genuinely small canvas — as used by putImageData round-
++    // trip noise detectors — is left lossless.
++    const int64_t canvas_pixels =
++        snapshot ? static_cast<int64_t>(snapshot->Size().width()) *
++                       snapshot->Size().height()
++                 : 0;
+     SkPixmap fb_pixmap = image_data->GetSkPixmap();
+-    if (fb_pixmap.addr()) {
++    if (fb_pixmap.addr() &&
++        canvas_pixels >= fingerbrowser::kMinCanvasNoisePixels) {
+       // Key on absolute canvas coordinates (sx, sy), not buffer offset, so a
+       // partial read and a full read agree on the pixels they share.
+       fingerbrowser::PerturbPixelsAt(
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index edf91355f4..859682d8f8 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -93,6 +93,16 @@ inline uint32_t AudioSeed() {
+   return static_cast<uint32_t>(IntSwitch(kAudioNoiseSwitch));
+ }
+ 
++// Minimum canvas area (in pixels) to noise. Real fingerprinting reads rendered
++// content — text, gradients — from canvases well above this. Tiny canvases are
++// how noise detectors probe the readback path: CreepJS getPixelMods writes
++// known data to an 8x8 canvas via putImageData and flags any difference on
++// getImageData, and putImageData->getImageData is lossless on a real browser.
++// Gating on the SOURCE CANVAS size (not the read region) keeps that round-trip
++// lossless on small buffers while a small sub-read of a large canvas still gets
++// noised, preserving the coordinate consistency from the canvas-readback patch.
++inline constexpr int64_t kMinCanvasNoisePixels = 1024;
++
+ // mulberry32 — small, fast, deterministic PRNG.
+ inline uint32_t NextRandom(uint32_t& state) {
+   state += 0x6D2B79F5u;
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index c5eabeb520..114639f181 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -155,8 +155,14 @@ bool ImageDataBuffer::EncodeImageInternal(const ImageEncodingMimeType mime_type,
+   SkBitmap fb_noised;
+   SkPixmap fb_noised_pixmap;
+   const SkPixmap* active_pixmap = &pixmap;
++  // This path encodes the whole canvas, so the pixmap area is the canvas size;
++  // gate it the same way as the getImageData seam so small canvases stay
++  // unnoised and consistent between the two paths.
++  const int64_t encode_pixels =
++      static_cast<int64_t>(pixmap.width()) * pixmap.height();
+   if (const uint32_t fb_seed = fingerbrowser::CanvasSeed();
+-      fb_seed && pixmap.addr() && fb_noised.tryAllocPixels(pixmap.info()) &&
++      fb_seed && encode_pixels >= fingerbrowser::kMinCanvasNoisePixels &&
++      pixmap.addr() && fb_noised.tryAllocPixels(pixmap.info()) &&
+       pixmap.readPixels(fb_noised.pixmap()) &&
+       fb_noised.peekPixels(&fb_noised_pixmap)) {
+     // Origin (0, 0): this path always encodes the whole canvas. Sharing the

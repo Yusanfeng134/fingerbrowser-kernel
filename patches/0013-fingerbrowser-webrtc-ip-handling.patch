@@ -1,0 +1,98 @@
+From: FingerBrowser
+Subject: [PATCH 0013] WebRTC IP handling to stop real-IP leak
+
+The WebRTC IP handling policy shipped as a no-op: the browser process
+appended --force-webrtc-ip-handling-policy, which nothing in this build
+consumes, so WebRTC kept gathering a STUN reflexive candidate that leaked the
+host's real public IP even when HTTP traffic exited through a proxy in
+another country -- a US HTTP IP next to a China WebRTC IP.
+
+The policy is actually read as a renderer preference populated from a pref
+the command line never sets. This adds an fp-webrtc-ip-policy switch, sends
+it to the renderer, and reads it in PeerConnectionDependencyFactory to force
+the policy (e.g. disable_non_proxied_udp) before it maps to port-allocator
+flags. With the policy applied WebRTC yields no IP candidates at all.
+
+Depends on: 0001-0012.
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index f0e4470d59..02dcc7c752 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -326,7 +326,11 @@ void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
+     command_line->AppendSwitch(permissions::switches::kDenyPermissionPrompts);
+   }
+   if (policy.webrtc_ip_policy != "default") {
+-    command_line->AppendSwitchASCII(switches::kForceWebRtcIPHandlingPolicy,
++    // switches::kForceWebRtcIPHandlingPolicy is not consumed anywhere in this
++    // build, so passing it did nothing and WebRTC kept leaking the real IP.
++    // Send a dedicated fp switch that the peer-connection factory reads in the
++    // renderer instead.
++    command_line->AppendSwitchASCII("fp-webrtc-ip-policy",
+                                     policy.webrtc_ip_policy);
+   }
+ 
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index bb46e773e8..3821414393 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3390,6 +3390,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       "fp-screen-height",
+       "fp-geo-lat-e6",
+       "fp-geo-lon-e6",
++      "fp-webrtc-ip-policy",
+       switches::kDisableInProcessStackTraces,
+       sandbox::policy::switches::kDisableSeccompFilterSandbox,
+       sandbox::policy::switches::kNoSandbox,
+diff --git a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+index fd6ce5a7f0..ab492efa6b 100644
+--- a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -38,6 +38,7 @@
+ #include "net/net_buildflags.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/public/platform/modules/webrtc/webrtc_logging.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/task_type.h"
+@@ -834,6 +835,16 @@ PeerConnectionDependencyFactory::CreatePortAllocator(
+       // |request_multiple_routes|. Whether local IP addresses could be
+       // collected depends on if mic/camera permission is granted for this
+       // origin.
++      // FingerBrowser: the IP handling policy normally arrives via a renderer
++      // preference populated from the kWebRTCIPHandlingPolicy pref, which our
++      // browser-process command line never sets. Force it from our own switch
++      // so WebRTC honours the profile's policy (e.g. disable_non_proxied_udp)
++      // instead of falling back to kDefault and leaking the host's real IP.
++      if (const std::string fb_webrtc = fingerbrowser::SwitchValue(
++              fingerbrowser::kWebRtcIpPolicySwitch);
++          !fb_webrtc.empty()) {
++        webrtc_ip_handling_policy = WebString::FromUTF8(fb_webrtc);
++      }
+       WebRTCIPHandlingPolicy policy =
+           GetWebRTCIPHandlingPolicy(webrtc_ip_handling_policy);
+       switch (policy) {
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index 7b7225f344..edf91355f4 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -52,6 +52,18 @@ inline constexpr char kDoNotTrackSwitch[] = "fp-do-not-track";
+ inline constexpr char kGeoLatitudeE6Switch[] = "fp-geo-lat-e6";
+ inline constexpr char kGeoLongitudeE6Switch[] = "fp-geo-lon-e6";
+ 
++// WebRTC IP handling policy (e.g. "disable_non_proxied_udp"). This must be a
++// renderer switch, not just a pref: Chromium reads the policy from a renderer
++// preference (webrtc_ip_handling_policy) that is populated from the
++// kWebRTCIPHandlingPolicy pref, and the browser-process command line never
++// sets that pref -- so the renderer sees an empty string, falls back to
++// kDefault, and enable_nonproxied_udp stays true. The result is a STUN
++// reflexive candidate that leaks the host's real public IP even when HTTP
++// traffic exits through a proxy in another country. Reading this switch
++// directly in the peer-connection factory forces the policy regardless of the
++// pref plumbing.
++inline constexpr char kWebRtcIpPolicySwitch[] = "fp-webrtc-ip-policy";
++
+ // WebGPU adapter identity. Separate from the WebGL switches because the two
+ // APIs use different vocabularies: WebGL reports "Google Inc. (NVIDIA)" and an
+ // ANGLE renderer string, while WebGPU reports lowercase tokens ("nvidia",

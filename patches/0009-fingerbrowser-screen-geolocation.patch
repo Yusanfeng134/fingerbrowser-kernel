@@ -1,0 +1,215 @@
+From: FingerBrowser
+Subject: [PATCH 0009] screen dimensions and geolocation
+
+Override screen.width/height/availWidth/availHeight and short-circuit the
+Geolocation API with the per-profile coordinates, so window size and reported
+location match the rest of the profile.
+
+Depends on: 0001-0008.
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index 48e89d5..83ecb56 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -202,6 +202,29 @@ std::optional<FingerBrowserPolicy> ParsePolicyDict(
+         audio_noise && *audio_noise > 0) {
+       policy.audio_noise_seed = *audio_noise;
+     }
++    if (const std::optional<int> screen_width =
++            hardware_profile->FindInt("screenWidth");
++        screen_width && IsValidWindowSide(*screen_width)) {
++      policy.screen_width = *screen_width;
++    }
++    if (const std::optional<int> screen_height =
++            hardware_profile->FindInt("screenHeight");
++        screen_height && IsValidWindowSide(*screen_height)) {
++      policy.screen_height = *screen_height;
++    }
++  }
++
++  // 地理位置：经纬度必须成对出现且在合法范围内，缺一不可（只给一半会造出
++  // 本初子午线/赤道上的假坐标，比不伪装更可疑）。
++  if (const base::Value::Dict* geo = fingerprint_policy->FindDict("geolocation")) {
++    const std::optional<double> lat = geo->FindDouble("latitude");
++    const std::optional<double> lon = geo->FindDouble("longitude");
++    if (lat && lon && *lat >= -90.0 && *lat <= 90.0 && *lon >= -180.0 &&
++        *lon <= 180.0) {
++      policy.has_geo = true;
++      policy.geo_latitude_e6 = static_cast<int>(*lat * 1e6);
++      policy.geo_longitude_e6 = static_cast<int>(*lon * 1e6);
++    }
+   }
+ 
+   return policy;
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+index 5658313..1e7d494 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+@@ -40,6 +40,15 @@ struct FingerBrowserPolicy {
+   int device_memory = 0;
+   int canvas_noise_seed = 0;
+   int audio_noise_seed = 0;
++
++  // screen.width/height。--window-size 只影响浏览器窗口，网站读到的仍是宿主
++  // 真实分辨率，必须单独伪装。
++  int screen_width = 0;
++  int screen_height = 0;
++  // 经纬度以 1e6 倍整数保存，0 表示未配置（用 has_geo 区分真实的 0 坐标）。
++  bool has_geo = false;
++  int geo_latitude_e6 = 0;
++  int geo_longitude_e6 = 0;
+ };
+ 
+ std::optional<FingerBrowserPolicy> LoadFingerBrowserPolicy(
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index f99c26b..151e0cb 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -28,7 +28,10 @@
+ 
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
++#include <algorithm>
++
+ #include "base/numerics/safe_conversions.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+@@ -97,13 +100,32 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
+   return true;
+ }
+ 
++namespace {
++
++// Windows 任务栏在 100% 缩放下约占 40px。screen.height 与 availHeight 完全相等
++// 反而不自然（等于宣称没有任务栏），指纹脚本会把这个差值本身当作特征，所以伪装
++// 时保留一个常见差值。
++constexpr int kFingerBrowserTaskbarHeight = 40;
++
++}  // namespace
++
+ int Screen::height() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).height();
+ }
+ 
+ int Screen::width() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).width();
+@@ -132,12 +154,22 @@ int Screen::availTop() const {
+ }
+ 
+ int Screen::availHeight() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      spoofed > 0) {
++    return std::max(1, spoofed - kFingerBrowserTaskbarHeight);
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).height();
+ }
+ 
+ int Screen::availWidth() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).width();
+diff --git a/third_party/blink/renderer/modules/geolocation/geolocation.cc b/third_party/blink/renderer/modules/geolocation/geolocation.cc
+index 1051a55..6ff75dd 100644
+--- a/third_party/blink/renderer/modules/geolocation/geolocation.cc
++++ b/third_party/blink/renderer/modules/geolocation/geolocation.cc
+@@ -28,7 +28,9 @@
+ #include "third_party/blink/renderer/modules/geolocation/geolocation.h"
+ 
+ #include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
+ #include "services/device/public/mojom/geoposition.mojom-blink.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/public/common/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/mojom/permissions_policy/permissions_policy.mojom-blink.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -69,6 +71,39 @@ Geoposition* CreateGeoposition(
+       coordinates, ConvertTimeToEpochTimeStamp(position.timestamp));
+ }
+ 
++// FingerBrowser L2：策略给定坐标时用它满足定位请求，完全不接触真实定位服务。
++// 返回 nullptr 表示未配置，走原生流程。
++Geoposition* CreateFingerBrowserGeoposition() {
++  const std::string lat =
++      fingerbrowser::SwitchValue(fingerbrowser::kGeoLatitudeE6Switch);
++  const std::string lon =
++      fingerbrowser::SwitchValue(fingerbrowser::kGeoLongitudeE6Switch);
++  if (lat.empty() || lon.empty()) {
++    return nullptr;
++  }
++  const double latitude =
++      fingerbrowser::IntSwitch(fingerbrowser::kGeoLatitudeE6Switch) / 1e6;
++  const double longitude =
++      fingerbrowser::IntSwitch(fingerbrowser::kGeoLongitudeE6Switch) / 1e6;
++  auto* coordinates = MakeGarbageCollected<GeolocationCoordinates>(
++      latitude, longitude,
++      /*provides_altitude=*/false, 0.0,
++      // 民用 GPS 的常见量级；给 0 反而不像真实设备。
++      /*accuracy=*/40.0,
++      /*provides_altitude_accuracy=*/false, 0.0,
++      /*provides_heading=*/false, 0.0,
++      /*provides_speed=*/false, 0.0);
++  return MakeGarbageCollected<Geoposition>(
++      coordinates, ConvertTimeToEpochTimeStamp(base::Time::Now()));
++}
++
++bool FingerBrowserGeolocationActive() {
++  return !fingerbrowser::SwitchValue(fingerbrowser::kGeoLatitudeE6Switch)
++              .empty() &&
++         !fingerbrowser::SwitchValue(fingerbrowser::kGeoLongitudeE6Switch)
++              .empty();
++}
++
+ GeolocationPositionError* CreatePositionError(
+     const device::mojom::blink::GeopositionError& error) {
+   GeolocationPositionError::ErrorCode error_code =
+@@ -232,6 +267,14 @@ int Geolocation::watchPosition(V8PositionCallback* success_callback,
+ }
+ 
+ void Geolocation::StartRequest(GeoNotifier* notifier) {
++  // FingerBrowser L2：策略指定坐标时直接满足请求。走 SetUseCachedPosition()
++  // 而不是同步回调，是为了复用既有的异步投递路径，保持规范要求的回调时序。
++  if (Geoposition* spoofed = CreateFingerBrowserGeoposition()) {
++    last_position_ = spoofed;
++    notifier->SetUseCachedPosition();
++    return;
++  }
++
+   RecordOriginTypeAccess();
+   String error_message;
+   if (!GetFrame()->GetSettings()->GetAllowGeolocationOnInsecureOrigins() &&
+@@ -445,6 +488,11 @@ void Geolocation::PositionChanged() {
+ }
+ 
+ void Geolocation::StartUpdating(GeoNotifier* notifier) {
++  // 伪装生效时绝不连真实定位服务。watchPosition 的首次回调已由 StartRequest
++  // 用伪装坐标满足，这里若放行，后续更新会带回宿主真实位置，把前面的伪装抵消掉。
++  if (FingerBrowserGeolocationActive()) {
++    return;
++  }
+   updating_ = true;
+   if (notifier->Options()->enableHighAccuracy() && !enable_high_accuracy_) {
+     enable_high_accuracy_ = true;

@@ -1,0 +1,155 @@
+From: FingerBrowser
+Subject: [PATCH 0008] renderer timezone and Accept-Language
+
+Apply the per-profile timezone and Accept-Language inside the renderer
+process. The browser process sets these via ICU/tzset, but those are
+per-process (and tzset is POSIX-only), so Intl/Date and navigator.language
+in the renderer would otherwise report the host values on Windows.
+
+Depends on: 0001-0007.
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index d7e1fe4..48e89d5 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -299,6 +299,29 @@ void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
+         "fp-audio-noise", base::NumberToString(policy.audio_noise_seed));
+   }
+ 
++  // Timezone and Accept-Language must also reach the renderer. ApplyTimezone()
++  // below only adjusts this (browser) process: tzset() is POSIX-only and
++  // icu::TimeZone::adoptDefault() is per-process, while Intl/Date run in the
++  // renderer against its own ICU instance. Likewise --lang sets the UI locale,
++  // not the Accept-Language list that navigator.language reports.
++  command_line->AppendSwitchASCII("fp-timezone", policy.timezone);
++  command_line->AppendSwitchASCII("fp-accept-lang", policy.locale);
++
++  if (policy.screen_width > 0) {
++    command_line->AppendSwitchASCII("fp-screen-width",
++                                    base::NumberToString(policy.screen_width));
++  }
++  if (policy.screen_height > 0) {
++    command_line->AppendSwitchASCII("fp-screen-height",
++                                    base::NumberToString(policy.screen_height));
++  }
++  if (policy.has_geo) {
++    command_line->AppendSwitchASCII(
++        "fp-geo-lat-e6", base::NumberToString(policy.geo_latitude_e6));
++    command_line->AppendSwitchASCII(
++        "fp-geo-lon-e6", base::NumberToString(policy.geo_longitude_e6));
++  }
++
+   ApplyTimezone(policy.timezone);
+ }
+ 
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 29eb7f8..6ed0bf6 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3379,6 +3379,12 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       "fp-device-memory",
+       "fp-canvas-noise",
+       "fp-audio-noise",
++      "fp-timezone",
++      "fp-accept-lang",
++      "fp-screen-width",
++      "fp-screen-height",
++      "fp-geo-lat-e6",
++      "fp-geo-lon-e6",
+       switches::kDisableInProcessStackTraces,
+       sandbox::policy::switches::kDisableSeccompFilterSandbox,
+       sandbox::policy::switches::kNoSandbox,
+diff --git a/third_party/blink/renderer/core/frame/navigator_language.cc b/third_party/blink/renderer/core/frame/navigator_language.cc
+index 36018e4..ef77138 100644
+--- a/third_party/blink/renderer/core/frame/navigator_language.cc
++++ b/third_party/blink/renderer/core/frame/navigator_language.cc
+@@ -7,6 +7,7 @@
+ #include "services/network/public/cpp/features.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/language.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
+@@ -65,6 +66,13 @@ void NavigatorLanguage::EnsureUpdatedLanguage() {
+ 
+     if (!accept_languages_override.IsNull()) {
+       languages_ = ParseAndSanitize(accept_languages_override);
++    } else if (const std::string fb_lang = fingerbrowser::SwitchValue(
++                   fingerbrowser::kAcceptLangSwitch);
++               !fb_lang.empty()) {
++      // FingerBrowser L2: per-profile Accept-Language. The browser process
++      // appends --lang, but that only picks the UI locale; navigator.language
++      // reads the Accept-Language list, which lives here in the renderer.
++      languages_ = ParseAndSanitize(String::FromUTF8(fb_lang));
+     } else {
+       languages_ = ParseAndSanitize(GetAcceptLanguages());
+       if (RuntimeEnabledFeatures::ReduceAcceptLanguageEnabled(
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.cc b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+index 07561c9..437b364 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -18,6 +18,7 @@
+ #include "third_party/blink/renderer/core/workers/worker_backing_thread.h"
+ #include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"
+ #include "third_party/blink/renderer/core/workers/worker_thread.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/main_thread.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/main_thread_scheduler.h"
+@@ -114,6 +115,19 @@ void TimeZoneController::Init() {
+   Platform::Current()->GetBrowserInterfaceBroker()->GetInterface(
+       monitor.BindNewPipeAndPassReceiver());
+   monitor->AddClient(instance().receiver_.BindNewPipeAndPassRemote());
++
++  // FingerBrowser L2: apply the per-profile timezone inside this renderer.
++  // The browser process calls icu::TimeZone::adoptDefault(), but that is
++  // per-process and tzset() is POSIX-only, so on Windows Intl/Date here would
++  // otherwise keep reporting the host zone. Going through
++  // SetTimeZoneOverride() also notifies V8 so its date cache is invalidated.
++  // The handle is released on purpose: ~TimeZoneOverride() would clear the
++  // override, and this one must last for the life of the renderer.
++  const std::string fb_timezone =
++      fingerbrowser::SwitchValue(fingerbrowser::kTimezoneSwitch);
++  if (!fb_timezone.empty()) {
++    (void)SetTimeZoneOverride(String::FromUTF8(fb_timezone)).release();
++  }
+ }
+ 
+ // static
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index 35590e4..e6b918f 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -36,6 +36,31 @@ inline constexpr char kHardwareConcurrencySwitch[] = "fp-hardware-concurrency";
+ inline constexpr char kDeviceMemorySwitch[] = "fp-device-memory";
+ inline constexpr char kCanvasNoiseSwitch[] = "fp-canvas-noise";
+ inline constexpr char kAudioNoiseSwitch[] = "fp-audio-noise";
++// Renderer-side timezone / Accept-Language overrides. The browser process also
++// sets ICU's default zone and --lang, but those only affect the browser
++// process: Intl/Date and navigator.language are evaluated in the renderer,
++// which has its own ICU instance and reads Accept-Language, so the values have
++// to be propagated here explicitly.
++inline constexpr char kTimezoneSwitch[] = "fp-timezone";
++inline constexpr char kAcceptLangSwitch[] = "fp-accept-lang";
++// screen.* 与窗口尺寸是两回事：--window-size 只改浏览器窗口，网站读到的
++// screen.width/height 仍是宿主真实分辨率，两者不一致本身就是可检测特征。
++inline constexpr char kScreenWidthSwitch[] = "fp-screen-width";
++inline constexpr char kScreenHeightSwitch[] = "fp-screen-height";
++inline constexpr char kDoNotTrackSwitch[] = "fp-do-not-track";
++// 经纬度以 1e6 倍整数传递（命令行开关只走整数解析，避免浮点字符串的本地化问题）。
++inline constexpr char kGeoLatitudeE6Switch[] = "fp-geo-lat-e6";
++inline constexpr char kGeoLongitudeE6Switch[] = "fp-geo-lon-e6";
++
++// WebGPU adapter identity. Separate from the WebGL switches because the two
++// APIs use different vocabularies: WebGL reports "Google Inc. (NVIDIA)" and an
++// ANGLE renderer string, while WebGPU reports lowercase tokens ("nvidia",
++// "ampere"). Spoofing only WebGL leaves the two APIs contradicting each other
++// within a single page, which is a stronger signal than not spoofing at all.
++inline constexpr char kWebGpuVendorSwitch[] = "fp-webgpu-vendor";
++inline constexpr char kWebGpuArchitectureSwitch[] = "fp-webgpu-architecture";
++inline constexpr char kWebGpuDeviceSwitch[] = "fp-webgpu-device";
++inline constexpr char kWebGpuDescriptionSwitch[] = "fp-webgpu-description";
+ 
+ inline std::string SwitchValue(const char* name) {
+   const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();

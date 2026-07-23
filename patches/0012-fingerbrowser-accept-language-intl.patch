@@ -1,0 +1,111 @@
+From: FingerBrowser
+Subject: [PATCH 0012] Accept-Language header and Intl locale consistency
+
+navigator.language was already overridden (0008), but two locale surfaces
+still leaked the host value: the Accept-Language HTTP header and the ICU
+default locale that Intl reads.
+
+- Accept-Language: ProfileNetworkContextService::ComputeAcceptLanguage feeds
+  NetworkContextParams.accept_language (the real header source) from a pref
+  our command line never set. Override it from fp-accept-lang, reusing
+  Chromium's own header formatter so "en-US" expands to "en-US,en;q=0.9".
+  Also overrides the parallel GetAcceptLangs accessor for other consumers.
+- Intl: V8's Isolate::DefaultLocale reads icu::Locale::getDefault() in the
+  renderer, which --lang does not set. Force it at blink init alongside the
+  timezone override so Intl.DateTimeFormat().resolvedOptions().locale agrees
+  with navigator.language.
+
+Depends on: 0001-0011.
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index ac42bd8b0c..cc91620a6e 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2876,6 +2876,24 @@ std::string ChromeContentBrowserClient::GetApplicationLocale() {
+ 
+ std::string ChromeContentBrowserClient::GetAcceptLangs(
+     content::BrowserContext* context) {
++  // FingerBrowser: the Accept-Language HTTP header comes from this pref, which
++  // our command line never sets, so it leaked the host locale (e.g. zh-CN)
++  // even when navigator.language was overridden to en-US. Return the profile
++  // locale here so the header matches. Expand "en-US" to "en-US,en" the way a
++  // real browser does; the network stack appends the q-values.
++  {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("fp-active")) {
++      const std::string fb_lang = cmd->GetSwitchValueASCII("fp-accept-lang");
++      if (!fb_lang.empty()) {
++        const size_t dash = fb_lang.find('-');
++        if (dash != std::string::npos && fb_lang.find(',') == std::string::npos) {
++          return fb_lang + "," + fb_lang.substr(0, dash);
++        }
++        return fb_lang;
++      }
++    }
++  }
+   Profile* profile = Profile::FromBrowserContext(context);
+   return profile->GetPrefs()->GetString(language::prefs::kAcceptLanguages);
+ }
+diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
+index e50641649a..a28e36f908 100644
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -479,6 +479,21 @@ void ProfileNetworkContextService::OnFirstPartySetsEnabledChanged(
+ }
+ 
+ std::string ProfileNetworkContextService::ComputeAcceptLanguage() const {
++  // FingerBrowser: this feeds NetworkContextParams.accept_language, the real
++  // source of the Accept-Language request header. It reads a pref our command
++  // line never sets, so the header leaked the host locale (zh-CN) even with
++  // navigator.language overridden. Override from our switch and reuse the same
++  // expansion/q-value formatting (en-US -> "en-US,en;q=0.9").
++  {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("fp-active")) {
++      const std::string fb_lang = cmd->GetSwitchValueASCII("fp-accept-lang");
++      if (!fb_lang.empty()) {
++        return ComputeAcceptLanguageFromPref(fb_lang);
++      }
++    }
++  }
++
+   // If reduce accept language is enabled, only return the first language
+   // without expanding the language list.
+   if (base::FeatureList::IsEnabled(network::features::kReduceAcceptLanguage)) {
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.cc b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+index 437b364f10..7ba3b64ac5 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -23,6 +23,8 @@
+ #include "third_party/blink/renderer/platform/scheduler/public/main_thread.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/main_thread_scheduler.h"
+ #include "third_party/icu/source/common/unicode/char16ptr.h"
++#include "third_party/icu/source/common/unicode/locid.h"
++#include "third_party/icu/source/common/unicode/stringpiece.h"
+ #include "third_party/icu/source/i18n/unicode/timezone.h"
+ #include "v8/include/v8.h"
+ 
+@@ -128,6 +130,23 @@ void TimeZoneController::Init() {
+   if (!fb_timezone.empty()) {
+     (void)SetTimeZoneOverride(String::FromUTF8(fb_timezone)).release();
+   }
++
++  // FingerBrowser L2: override the ICU default locale so Intl reports the
++  // profile locale, not the host's. V8 reads icu::Locale::getDefault() lazily
++  // on first Intl use (Isolate::DefaultLocale()); setting it here at blink
++  // init — before any page script runs — makes
++  // Intl.DateTimeFormat().resolvedOptions().locale agree with
++  // navigator.language. --lang sets the UI locale but not this.
++  const std::string fb_lang =
++      fingerbrowser::SwitchValue(fingerbrowser::kAcceptLangSwitch);
++  if (!fb_lang.empty()) {
++    UErrorCode status = U_ZERO_ERROR;
++    icu::Locale fb_locale = icu::Locale::forLanguageTag(
++        icu::StringPiece(fb_lang.data(), fb_lang.size()), status);
++    if (U_SUCCESS(status) && !fb_locale.isBogus()) {
++      icu::Locale::setDefault(fb_locale, status);
++    }
++  }
+ }
+ 
+ // static
