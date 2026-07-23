@@ -49,6 +49,7 @@ The desktop app writes `fingerbrowser_policy.json` into each profile `userDataDi
 | `permissionDefaults` | 0007 | `deny` blocks permission prompts. |
 | `webrtcIpPolicy` | 0007 / 0013 | e.g. `disable_non_proxied_udp`. 0007 shipped the field but the switch it set was a no-op; 0013 makes it actually stop the WebRTC real-IP leak. |
 | `brand` | 0011 | Product brand added to the Client Hints brand list (`Google Chrome`, `Microsoft Edge`, …). Must match the product the UA string claims; an unbranded build otherwise omits it. |
+| `blockCjkFonts` | 0016 | Bool. Hide the host's CJK fonts and remap generic families to US fonts. Set for a non-CJK persona so a Chinese/Japanese/Korean Windows does not leak its region through font enumeration. |
 
 `hardwareProfile` (all optional; an invalid field is skipped, not fatal):
 

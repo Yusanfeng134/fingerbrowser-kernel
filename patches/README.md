@@ -19,8 +19,9 @@ the fingerprint layer and apply in order:
 | `0013` | WebRTC IP handling: `--force-webrtc-ip-handling-policy` was a no-op in this build, so WebRTC leaked the host's real IP through STUN. Reads the policy in the renderer via a dedicated switch instead. |
 | `0014` | Skip canvas noise on canvases below 1024 px. Small canvases are how noise detectors probe the readback path (CreepJS getPixelMods uses 8x8); keeping them lossless drops the "rgba noise" verdict while the fingerprint canvas stays noised and unique. |
 | `0015` | Key audio noise on the sample value, not position, so equal samples stay equal. Position-keyed noise made every sample distinct (unique count maxed out); value-keyed preserves the natural duplicate structure while staying unique per profile. |
+| `0016` | Hide CJK fonts and remap generics for a non-CJK persona. Blocks explicit CJK-font enumeration and remaps sans-serif/serif/monospace to US fonts, so a Chinese/Japanese/Korean host does not leak its region through fonts. CJK text still renders via glyph fallback. |
 
-`0008`-`0015` each carry an increment on top of `0007`; they must be applied in
+`0008`-`0016` each carry an increment on top of `0007`; they must be applied in
 numeric order. The full set has been verified to apply cleanly in sequence and
 to reproduce the reference worktree byte-for-byte.
 
