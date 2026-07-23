@@ -43,11 +43,11 @@ The desktop app writes `fingerbrowser_policy.json` into each profile `userDataDi
 
 | Field | Since | Notes |
 | --- | --- | --- |
-| `locale` | 0007 | UI locale and the Accept-Language list the renderer reports. |
+| `locale` | 0007 / 0008 / 0012 | Drives navigator.language (0008), the Accept-Language header, and the Intl/ICU default locale (0012) — all three surfaces, kept consistent. |
 | `timezone` | 0007 / 0008 | IANA zone. 0008 also propagates it into the renderer's own ICU. |
 | `windowSize` | 0007 | Initial window, not `screen.*`. |
 | `permissionDefaults` | 0007 | `deny` blocks permission prompts. |
-| `webrtcIpPolicy` | 0007 | e.g. `disable_non_proxied_udp`. |
+| `webrtcIpPolicy` | 0007 / 0013 | e.g. `disable_non_proxied_udp`. 0007 shipped the field but the switch it set was a no-op; 0013 makes it actually stop the WebRTC real-IP leak. |
 | `brand` | 0011 | Product brand added to the Client Hints brand list (`Google Chrome`, `Microsoft Edge`, …). Must match the product the UA string claims; an unbranded build otherwise omits it. |
 
 `hardwareProfile` (all optional; an invalid field is skipped, not fatal):
