@@ -16,7 +16,7 @@
 
 ### 涵盖的改动
 
-按加入时间排序，其中后三项从未进入过编号序列：
+按加入时间排序，其中后四项（4-7）从未进入过编号序列：
 
 1. L2 硬件画像：platform、hardwareConcurrency、deviceMemory、WebGL 厂商/渲染器、
    canvas 与音频噪声（原 patch 0007）
@@ -35,6 +35,11 @@
    全空」的自相矛盾状态
 6. WebGPU 适配器身份伪装 —— 此前只伪装了 WebGL，同一页面内 WebGPU 仍上报真实
    显卡，两个 API 互相矛盾
+7. Client Hints 产品品牌补齐 —— 非品牌 Chromium 构建的 brands 列表只有
+   Chromium + GREASE，缺少产品项（真实 Chrome 是 Chromium + Google Chrome +
+   GREASE 三项），而 UA 却写着 Chrome。在 GetUserAgentBrandList 里用 policy 的
+   brand 字段补齐，走原生 GenerateBrandVersionList，排列由编译版本号决定，
+   天然等于真实 Chrome 同版本的排列。brands 与 fullVersionList 两个通道同步
 
 ### 已知残留
 
@@ -47,4 +52,4 @@ WebGPU 的 `limits` 与 `features` 仍如实描述真实硬件，未伪造。伪
 
 生成时通过反向与正向 `git apply` 双向往返检查，工作树无残留差异。
 
-导出于 2026-07-23，SHA-256 `9325a993ed45b32e6216c35c915331c6e9d11f5ef1c860325de130b78f8ef93d`。
+导出于 2026-07-23，SHA-256 `46b1b570a3ff8c8c34e6fcb5745d81f32a41cd0b189f2d31ae68420708c73c56`。

@@ -81,10 +81,10 @@ index 0000000000..4d8d18b6e3
 +}
 diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
 new file mode 100644
-index 0000000000..5362001478
+index 0000000000..f0e4470d59
 --- /dev/null
 +++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,419 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -247,6 +247,13 @@ index 0000000000..5362001478
 +  policy.permission_defaults = *permission_defaults;
 +  policy.webrtc_ip_policy = *webrtc_ip_policy;
 +
++  // Brand sits at the policy root rather than under hardwareProfile: it
++  // describes the browser product, not the machine.
++  if (const std::string* brand = fingerprint_policy->FindString("brand");
++      brand && IsSafeDisplayString(*brand)) {
++    policy.brand = *brand;
++  }
++
 +  // Optional L2 hardware profile. Every field is optional and individually
 +  // validated; an invalid field is skipped (left unset) rather than failing
 +  // the whole policy, so compliant policies without this block are unaffected.
@@ -394,6 +401,9 @@ index 0000000000..5362001478
 +  // combination, and upstream's own comment warns that empty low-entropy hints
 +  // trip web application firewalls.
 +  command_line->AppendSwitch("fp-active");
++  if (!policy.brand.empty()) {
++    command_line->AppendSwitchASCII("fp-brand", policy.brand);
++  }
 +  command_line->AppendSwitchASCII(switches::kLang, policy.locale);
 +  command_line->AppendSwitchASCII(
 +      switches::kWindowSize,
@@ -496,10 +506,10 @@ index 0000000000..5362001478
 +}  // namespace fingerbrowser
 diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
 new file mode 100644
-index 0000000000..d84a3ea58d
+index 0000000000..0d32f82981
 --- /dev/null
 +++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,75 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -535,6 +545,10 @@ index 0000000000..d84a3ea58d
 +  // Optional L2 hardware profile (anti-detect). Empty/zero == not set, in
 +  // which case the renderer keeps the genuine value. Parsed from an optional
 +  // "hardwareProfile" dict inside "fingerprintPolicy".
++  // Product brand for the Client Hints brand list, e.g. "Google Chrome".
++  // Unbranded Chromium builds omit it entirely, leaving a list that never
++  // mentions the product the UA string claims to be.
++  std::string brand;
 +  std::string gpu_vendor;
 +  std::string gpu_renderer;
 +  // WebGPU reports a different vocabulary than WebGL (lowercase "nvidia" /
@@ -732,10 +746,39 @@ index 2d73a5d2c8..19199a066f 100644
  #if BUILDFLAG(IS_CHROMEOS)
  extern const char kForceDevToolsAvailable[];
 diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
-index 205d12a97c..a6d3b57e38 100644
+index 205d12a97c..41eed45bbf 100644
 --- a/components/embedder_support/user_agent_utils.cc
 +++ b/components/embedder_support/user_agent_utils.cc
-@@ -483,11 +483,16 @@ blink::UserAgentMetadata GetUserAgentMetadata(const PrefService* pref_service,
+@@ -190,6 +190,28 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+ #if !BUILDFLAG(CHROMIUM_BRANDING)
+   brand = version_info::GetProductName();
+ #endif
++  // FingerBrowser: supply the product brand that an unbranded build lacks.
++  //
++  // Only branded builds set `brand` above, so a build from public Chromium
++  // source emits a two-entry list (GREASE + "Chromium") while real Chrome
++  // emits three (GREASE + "Chromium" + "Google Chrome"). A UA string claiming
++  // Chrome next to a brand list that never mentions it is a contradiction no
++  // real install produces.
++  //
++  // Setting `brand` here rather than rewriting the list afterwards is
++  // deliberate: GenerateBrandVersionList() below places the three entries in
++  // one of six permutations chosen by major version. Appending an entry
++  // post-hoc would leave the ordering fixed, and a brand list whose order
++  // never varies is itself a distinguishing signal.
++  {
++    const base::CommandLine* fb_cmd = base::CommandLine::ForCurrentProcess();
++    if (fb_cmd->HasSwitch("fp-active")) {
++      const std::string fb_brand = fb_cmd->GetSwitchValueASCII("fp-brand");
++      if (!fb_brand.empty()) {
++        brand = fb_brand;
++      }
++    }
++  }
+   std::optional<std::string> maybe_brand_override =
+       base::GetFieldTrialParamValueByFeature(features::kGreaseUACH,
+                                              "brand_override");
+@@ -483,11 +505,16 @@ blink::UserAgentMetadata GetUserAgentMetadata(const PrefService* pref_service,
    // Notes: Sending low entropy hints with empty values may cause requests being
    // blocked by web application firewall software, etc.
    std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
@@ -754,10 +797,10 @@ index 205d12a97c..a6d3b57e38 100644
    if (only_low_entropy_ch) {
      return metadata;
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
-index ddeef4098e..051273f234 100644
+index ddeef4098e..bb46e773e8 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
 +++ b/content/browser/renderer_host/render_process_host_impl.cc
-@@ -3370,6 +3370,25 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+@@ -3370,6 +3370,26 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
    // Propagate the following switches to the renderer command line (along
    // with any associated values) if present in the browser command line.
    static const char* const kSwitchNames[] = {
@@ -765,6 +808,7 @@ index ddeef4098e..051273f234 100644
 +      // match the blink-side reader and the browser-side emitter.
 +      "fp-gpu-vendor",
 +      "fp-gpu-renderer",
++      "fp-brand",
 +      "fp-webgpu-vendor",
 +      "fp-webgpu-architecture",
 +      "fp-webgpu-device",
