@@ -1,0 +1,46 @@
+From: FingerBrowser
+Subject: [PATCH 0015] key audio noise on sample value to preserve duplicates
+
+The offline-render audio noise (0007) perturbed every sample with a
+position-sequential PRNG, giving each sample an independent nudge. That
+destroyed the duplicate sample values a real render naturally has: measured
+unique-sample count over a 5000-sample render jumped from ~4736 to a maxed-out
+5000, which CreepJS surfaces as "unique" and a detector can read as an
+all-samples-distinct signature no real audio produces.
+
+Key the perturbation on each sample's value (hash the float bits) instead of
+its position, so equal samples get equal noise and stay equal. The duplicate
+structure is preserved (unique count back to ~4735) while the fingerprint still
+shifts deterministically per profile -- distinct audioNoise seeds still produce
+distinct sums. getChannelData still matches copyFromChannel.
+
+Depends on: 0001-0014.
+
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index 859682d8f8..65df927715 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -187,10 +187,20 @@ inline void PerturbAudio(float* data, size_t count, uint32_t seed) {
+   if (!data || !seed) {
+     return;
+   }
+-  uint32_t state = seed;
++  // Key the perturbation on each sample's VALUE, not its position. A
++  // position-sequential PRNG gave every sample an independent nudge, which
++  // destroyed the duplicate sample values a real render naturally has: measured
++  // unique-sample count jumped from ~4736/5000 to a maxed-out 5000/5000, a
++  // signature detectors read (CreepJS reports it as "unique"). Hashing the
++  // sample value means equal samples get equal noise and stay equal, so the
++  // duplicate structure is preserved while the fingerprint still shifts
++  // deterministically per profile.
+   for (size_t i = 0; i < count; ++i) {
+-    const float unit =
+-        static_cast<float>(NextRandom(state) & 0xFFFFu) / 65535.0f - 0.5f;
++    uint32_t bits = 0;
++    static_assert(sizeof(bits) == sizeof(float), "float must be 32-bit");
++    __builtin_memcpy(&bits, &data[i], sizeof(bits));
++    const uint32_t h = PixelHash(seed, static_cast<int32_t>(bits), 0);
++    const float unit = static_cast<float>(h & 0xFFFFu) / 65535.0f - 0.5f;
+     data[i] += unit * 2e-7f;
+   }
+ }
