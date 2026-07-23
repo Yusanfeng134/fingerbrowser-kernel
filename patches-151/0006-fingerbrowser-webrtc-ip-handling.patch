@@ -1,0 +1,45 @@
+diff --git a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+index 7d641391d1..2f438b7bfc 100644
+--- a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -38,6 +38,7 @@
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "net/net_buildflags.h"
+ #include "services/network/public/cpp/features.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "services/network/public/cpp/ip_address_space_util.h"
+ #include "services/network/public/mojom/ip_address_space.mojom-shared.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -1066,6 +1067,32 @@ PeerConnectionDependencyFactory::CreatePortAllocator(
+       Platform::Current()->GetWebRTCRendererPreferences(
+           web_frame, &webrtc_ip_handling_policy, &min_port, &max_port,
+           &allow_mdns_obfuscation);
++      // FingerBrowser: the IP handling policy normally arrives via a renderer
++      // preference populated from the kWebRTCIPHandlingPolicy pref, which our
++      // browser-process command line never sets. Force it from our own switch
++      // so WebRTC honours the profile's policy (e.g. disable_non_proxied_udp)
++      // instead of falling back to kDefault and leaking the host's real IP.
++      // 151 changed this from a WebString to the mojom::blink enum, so map the
++      // switch string here rather than assigning a string. (The common
++      // ToWebRTCIPHandlingPolicy helper returns the cross-process variant
++      // blink::mojom::, a different C++ type from this blink-internal var.)
++      if (const std::string fb_webrtc = fingerbrowser::SwitchValue(
++              fingerbrowser::kWebRtcIpPolicySwitch);
++          !fb_webrtc.empty()) {
++        if (fb_webrtc == "disable_non_proxied_udp") {
++          webrtc_ip_handling_policy =
++              mojom::blink::WebRtcIpHandlingPolicy::kDisableNonProxiedUdp;
++        } else if (fb_webrtc == "default_public_interface_only") {
++          webrtc_ip_handling_policy =
++              mojom::blink::WebRtcIpHandlingPolicy::kDefaultPublicInterfaceOnly;
++        } else if (fb_webrtc == "default_public_and_private_interfaces") {
++          webrtc_ip_handling_policy = mojom::blink::WebRtcIpHandlingPolicy::
++              kDefaultPublicAndPrivateInterfaces;
++        } else if (fb_webrtc == "default") {
++          webrtc_ip_handling_policy =
++              mojom::blink::WebRtcIpHandlingPolicy::kDefault;
++        }
++      }
+       DVLOG(1) << "Active WebRtcIPHandlingPolicy: "
+                << ToString(webrtc_ip_handling_policy);
+       // TODO(guoweis): |enable_multiple_routes| should be renamed to

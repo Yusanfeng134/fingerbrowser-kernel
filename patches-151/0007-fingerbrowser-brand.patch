@@ -1,0 +1,60 @@
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 608bea5cb3..0d78444b25 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -167,6 +167,29 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   brand = version_info::GetProductName();
+ #endif
+ 
++  // FingerBrowser: supply the product brand that an unbranded build lacks.
++  //
++  // Only branded builds set `brand` above, so a build from public Chromium
++  // source emits a two-entry list (GREASE + "Chromium") while real Chrome
++  // emits three (GREASE + "Chromium" + "Google Chrome"). A UA string claiming
++  // Chrome next to a brand list that never mentions it is a contradiction no
++  // real install produces.
++  //
++  // Setting `brand` here rather than rewriting the list afterwards is
++  // deliberate: GenerateBrandVersionList() below places the three entries in
++  // one of six permutations chosen by major version. Appending an entry
++  // post-hoc would leave the ordering fixed, and a brand list whose order
++  // never varies is itself a distinguishing signal.
++  {
++    const base::CommandLine* fb_cmd = base::CommandLine::ForCurrentProcess();
++    if (fb_cmd->HasSwitch("fp-active")) {
++      const std::string fb_brand = fb_cmd->GetSwitchValueASCII("fp-brand");
++      if (!fb_brand.empty()) {
++        brand = fb_brand;
++      }
++    }
++  }
++
+   std::string brand_version =
+       output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+           ? full_version
+@@ -190,6 +213,7 @@ const blink::UserAgentBrandList GetUserAgentBrandMajorVersionListInternal(
+ }
+ 
+ // For desktop and android:
++
+ // Returns true if kReduceUserAgentMinorVersionName is enabled.
+ //
+ // It helps us avoid introducing individual enterprise policy controls for
+@@ -650,11 +674,16 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   // Notes: Sending low entropy hints with empty values may cause requests being
+   // blocked by web application firewall software, etc.
+   std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
+-  if (custom_ua.has_value()) {
++  if (custom_ua.has_value() &&
++      !base::CommandLine::ForCurrentProcess()->HasSwitch("fp-active")) {
+     return base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)
+                ? blink::UserAgentMetadata()
+                : metadata;
+   }
++  // Under a FingerBrowser profile we fall through instead of returning early.
++  // The declared UA describes the platform this build actually runs on, so the
++  // natively computed high-entropy hints already agree with it; blanking them
++  // would manufacture a self-contradictory identity rather than hide one.
+ 
+   if (only_low_entropy_ch) {
+     return metadata;

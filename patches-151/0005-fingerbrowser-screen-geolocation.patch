@@ -1,0 +1,163 @@
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index 69ffc2b05f..d3cde3da40 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -28,7 +28,10 @@
+ 
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
++#include <algorithm>
++
+ #include "base/numerics/safe_conversions.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+@@ -78,13 +81,32 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
+   return true;
+ }
+ 
++namespace {
++
++// Windows 任务栏在 100% 缩放下约占 40px。screen.height 与 availHeight 完全相等
++// 反而不自然（等于宣称没有任务栏），指纹脚本会把这个差值本身当作特征，所以伪装
++// 时保留一个常见差值。
++constexpr int kFingerBrowserTaskbarHeight = 40;
++
++}  // namespace
++
+ int Screen::height() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).height();
+ }
+ 
+ int Screen::width() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).width();
+@@ -122,12 +144,22 @@ int Screen::availTop() const {
+ }
+ 
+ int Screen::availHeight() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      spoofed > 0) {
++    return std::max(1, spoofed - kFingerBrowserTaskbarHeight);
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).height();
+ }
+ 
+ int Screen::availWidth() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).width();
+diff --git a/third_party/blink/renderer/core/geolocation/geolocation.cc b/third_party/blink/renderer/core/geolocation/geolocation.cc
+index 32bbb76f92..88c904d912 100644
+--- a/third_party/blink/renderer/core/geolocation/geolocation.cc
++++ b/third_party/blink/renderer/core/geolocation/geolocation.cc
+@@ -31,6 +31,7 @@
+ #include <optional>
+ 
+ #include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "services/device/public/mojom/geoposition.mojom-blink.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+@@ -46,6 +47,7 @@
+ #include "third_party/blink/renderer/core/geolocation/geo_notifier_v8.h"
+ #include "third_party/blink/renderer/core/geolocation/geolocation_coordinates.h"
+ #include "third_party/blink/renderer/core/geolocation/geolocation_error.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+@@ -84,6 +86,40 @@ Geoposition* CreateGeoposition(
+       coordinates, ConvertTimeToEpochTimeStamp(position.timestamp));
+ }
+ 
++// FingerBrowser: build a spoofed position from the per-profile geolocation
++// switches. Returns null when they are not set. Adapted to 151's
++// GeolocationCoordinates constructor (std::optional fields).
++Geoposition* CreateFingerBrowserGeoposition() {
++  const std::string lat =
++      fingerbrowser::SwitchValue(fingerbrowser::kGeoLatitudeE6Switch);
++  const std::string lon =
++      fingerbrowser::SwitchValue(fingerbrowser::kGeoLongitudeE6Switch);
++  if (lat.empty() || lon.empty()) {
++    return nullptr;
++  }
++  const double latitude =
++      fingerbrowser::IntSwitch(fingerbrowser::kGeoLatitudeE6Switch) / 1e6;
++  const double longitude =
++      fingerbrowser::IntSwitch(fingerbrowser::kGeoLongitudeE6Switch) / 1e6;
++  auto* coordinates = MakeGarbageCollected<GeolocationCoordinates>(
++      latitude, longitude,
++      /*altitude=*/std::nullopt,
++      // 民用 GPS 的常见量级；给 0 反而不像真实设备。
++      /*accuracy=*/40.0,
++      /*altitude_accuracy=*/std::nullopt,
++      /*heading=*/std::nullopt,
++      /*speed=*/std::nullopt);
++  return MakeGarbageCollected<Geoposition>(
++      coordinates, ConvertTimeToEpochTimeStamp(base::Time::Now()));
++}
++
++bool FingerBrowserGeolocationActive() {
++  return !fingerbrowser::SwitchValue(fingerbrowser::kGeoLatitudeE6Switch)
++              .empty() &&
++         !fingerbrowser::SwitchValue(fingerbrowser::kGeoLongitudeE6Switch)
++              .empty();
++}
++
+ GeolocationPositionError* CreatePositionError(
+     const device::mojom::blink::GeopositionError& error) {
+   GeolocationPositionError::ErrorCode error_code =
+@@ -340,6 +376,16 @@ int Geolocation::WatchPositionInternal(GeoNotifier* notifier) {
+ }
+ 
+ void Geolocation::StartRequest(GeoNotifier* notifier) {
++  // FingerBrowser: satisfy the request from the spoofed position and short-
++  // circuit before any real geolocation service is contacted. Both the V8 and
++  // Blink notifier paths funnel here, so this covers getCurrentPosition and the
++  // first watchPosition callback.
++  if (Geoposition* spoofed = CreateFingerBrowserGeoposition()) {
++    last_position_ = spoofed;
++    notifier->SetUseCachedPosition();
++    return;
++  }
++
+   RecordOriginTypeAccess();
+   String error_message;
+   if (!GetFrame()->GetSettings()->GetAllowGeolocationOnInsecureOrigins() &&
+@@ -560,6 +606,13 @@ void Geolocation::PositionChanged() {
+ }
+ 
+ void Geolocation::UpdateGeolocationState() {
++  // FingerBrowser: never connect to the real service while spoofing. The first
++  // watchPosition callback was already satisfied by StartRequest with the
++  // spoofed position; letting this proceed would bring back the host's real
++  // location on subsequent updates and undo the spoof.
++  if (FingerBrowserGeolocationActive()) {
++    return;
++  }
+   if (!EnsureGeolocationConnection() || permission_request_in_progress_) {
+     // Return early while waiting for asynchronous setup to complete; this
+     // function will be recalled by `OnGeolocationPermissionStatusUpdated`. The

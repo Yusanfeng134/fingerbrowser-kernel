@@ -1,0 +1,20 @@
+diff --git a/testing/scripts/common.py b/testing/scripts/common.py
+index b8f19747c3..939749df43 100644
+--- a/testing/scripts/common.py
++++ b/testing/scripts/common.py
+@@ -66,9 +66,14 @@ def set_lpac_acls(acl_dir, is_test_script=False):
+   if sys.getwindowsversion().build < 19041:
+     return
+   try:
++    # errors='replace': on a non-English Windows (e.g. zh-CN) icacls prints
++    # localized messages in the OEM codepage, which fails a strict UTF-8 decode
++    # (forced by PYTHONUTF8=1). We only scan for the ASCII SID strings below, so
++    # replacing the localized bytes is harmless.
+     existing_acls = subprocess.check_output(['icacls', acl_dir],
+                                             stderr=subprocess.STDOUT,
+-                                            universal_newlines=True)
++                                            encoding='utf-8',
++                                            errors='replace')
+   except subprocess.CalledProcessError as e:
+     logging.error('Failed to retrieve existing ACLs for directory %s', acl_dir)
+     logging.error('Command output: %s', e.output)
