@@ -57,7 +57,7 @@ index cbac8ed617..88d65d085e 100644
        prefs->GetInteger(prefs::kWebKitDefaultFontSize);
    web_prefs->default_fixed_font_size =
 diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
-index c30ac8186a..a48aeff01e 100644
+index c30ac8186a..19ab1e93fd 100644
 --- a/chrome/browser/net/profile_network_context_service.cc
 +++ b/chrome/browser/net/profile_network_context_service.cc
 @@ -479,6 +479,7 @@ bool GetHttpCacheBackendResetParam(
@@ -68,7 +68,38 @@ index c30ac8186a..a48aeff01e 100644
    const std::string current_field_trial_status =
        base::JoinString(experiment_parts, kDiskCacheExperimentNameSeparator);
  
-@@ -717,6 +718,21 @@ std::string ProfileNetworkContextService::ComputeAcceptLanguage() const {
+@@ -520,6 +521,30 @@ ProfileNetworkContextService::ProfileNetworkContextService(Profile* profile)
+       proxy_config_monitor_(std::make_unique<ProxyConfigMonitor>(profile)) {
+   TRACE_EVENT0("startup", "ProfileNetworkContextService::ctor");
+   PrefService* profile_prefs = profile->GetPrefs();
++  // FingerBrowser: make the profile language pref the single source of truth
++  // for Accept-Language.
++  //
++  // Overriding ComputeAcceptLanguage() (NetworkContextParams.accept_language)
++  // and ChromeContentBrowserClient::GetAcceptLangs() is NOT sufficient on 151:
++  // for navigations, ReduceAcceptLanguageUtils::AddNavigationRequestAccept-
++  // LanguageHeaders() rebuilds the header from this pref and SetHeader()s it,
++  // overwriting both. Measured: navigator.language reported en-US while the
++  // wire header was still "zh-CN,zh;q=0.9" (the host locale) -- exactly the
++  // JS-vs-HTTP contradiction the persona is supposed to avoid.
++  //
++  // Setting the pref instead of adding a third hook makes every consumer
++  // (reduce-accept-language, the network context, GetAcceptLangs) agree. Done
++  // before the StringPrefMember Init below so the initial read sees it; the
++  // pref-change callbacks refresh any service that already cached a value.
++  {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("fp-active")) {
++      const std::string fb_lang = cmd->GetSwitchValueASCII("fp-accept-lang");
++      if (!fb_lang.empty()) {
++        profile_prefs->SetString(language::prefs::kAcceptLanguages, fb_lang);
++      }
++    }
++  }
+   quic_allowed_.Init(prefs::kQuicAllowed, profile_prefs,
+                      base::BindRepeating(
+                          &ProfileNetworkContextService::DisableQuicIfNotAllowed,
+@@ -717,6 +742,21 @@ std::string ProfileNetworkContextService::ComputeAcceptLanguage() const {
    // expanding the language list if the DisableReduceAcceptLanguage deprecation
    // trial ends.
  

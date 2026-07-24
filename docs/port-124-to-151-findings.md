@@ -49,6 +49,18 @@
   `else` 默认 web 分支（**只传 vendor_/architecture_**）。伪装覆盖必须放在两分支
   **之前**（函数顶部）。放进 developer 分支 = web 路径不执行 → 真实用户机器泄露真实
   GPU。device/description 在 web 路径本就不暴露（返回空，与真实 Chrome 一致，勿填）。
+- **Accept-Language（真实泄露，检测站标红后才发现）**：124 上钩住
+  `ProfileNetworkContextService::ComputeAcceptLanguage()`（喂
+  `NetworkContextParams.accept_language`）即可。151 不行——导航请求会走
+  `ReduceAcceptLanguageUtils::AddNavigationRequestAcceptLanguageHeaders()`，
+  它从 profile 的 `intl.accept_languages` pref 重新 `ExpandLanguageList` +
+  生成 q 值，然后 `SetHeader()` **直接覆写**，把网络上下文和
+  `ChromeContentBrowserClient::GetAcceptLangs()` 的结果全盖掉。
+  实测（带日志的构建）：两个钩子都命中且都返回 `en-US,en;q=0.9`，
+  线上头仍是 `zh-CN,zh;q=0.9`。
+  **修法**：不加第三个钩子，在 `ProfileNetworkContextService` 构造时把
+  `intl.accept_languages` pref 设成人设语言（单一真相源）；该 pref 有变更回调，
+  已缓存的 service 会自动刷新，与 KeyedService 创建顺序无关。
 - **geolocation**（0009）：151 从 modules/geolocation/ 移到 core/geolocation/，
   `GeolocationCoordinates` 构造从 provides_X+double 对改成 `std::optional<double>`；
   `StartUpdating` 更名 `UpdateGeolocationState`。手工移植。
@@ -68,10 +80,20 @@
 151 主 chrome 二进制不再支持 `--dump-dom`（迁到独立 chrome-headless-shell）。
 用 `--remote-debugging-port` + `/json/list` 的 title 字段取结果。
 
-全部 16 项接缝验证通过：platform / Accept-Language / navigator.language / timezone /
-Intl locale / brands→Chrome / WebGL vendor+renderer / WebGPU vendor+architecture /
-canvas 小画布无损（CreepJS getPixelMods 安全）/ audio 值键噪声(4734/5000) /
+探针页由本地 HTTP 服务托管（`probe/echo-server.cjs` 把该次导航的真实
+Accept-Language 注入页面），**一次运行同时覆盖线上请求头与 JS 取值**。
+
+全部接缝验证通过：**Accept-Language 线上头(en-US,en;q=0.9)** / navigator.language /
+platform / timezone / Intl locale / brands→Chrome / UA↔高熵 CH 版本一致 /
+WebGL vendor+renderer / WebGPU vendor+architecture /
+canvas 小画布无损（CreepJS getPixelMods 安全）/ audio 值键噪声 /
 CJK 字体屏蔽（Arial 不受影响）。
 
-**教训**：headless / `--enable-unsafe-swiftshader` 会**开启** WebGPUDeveloperFeatures，
+**教训一**：headless / `--enable-unsafe-swiftshader` 会**开启** WebGPUDeveloperFeatures，
 掩盖 WebGPU web 路径的泄露——WebGPU 伪装不能只靠 headless 探针验证。
+
+**教训二（更普遍）**：不要用**渲染进程侧的 JS 取值**去证明**线上网络行为**。
+早期探针读到 `navigator.language === 'en-US'` 就判定 Accept-Language 通过，
+而真实 HTTP 头当时仍在发 `zh-CN,zh;q=0.9`——两者是独立代码路径，前者通过
+不蕴含后者通过。凡"既有 JS 表示又有线上表示"的项（语言、UA、时区、WebRTC
+候选、代理出口），验证必须落到真实网络行为上。
