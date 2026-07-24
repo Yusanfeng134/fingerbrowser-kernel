@@ -92,6 +92,27 @@ CJK 字体屏蔽（Arial 不受影响）。
 **教训一**：headless / `--enable-unsafe-swiftshader` 会**开启** WebGPUDeveloperFeatures，
 掩盖 WebGPU web 路径的泄露——WebGPU 伪装不能只靠 headless 探针验证。
 
+### WebRTC ICE 差分验证（webrtcIpPolicy）
+
+按教训二的要求补做了真实网络行为验证，不再只确认"开关接上了"。
+同一构建、同一探针页，仅切换是否加 `--fingerbrowser-policy`：
+
+| | 基线（无策略） | 开策略 disable_non_proxied_udp |
+|---|---|---|
+| 候选数 | 2 | 0 |
+| 类型 | host:1, **srflx:1** | 无 |
+| 公网 IP 泄露 | **是**（srflx 暴露真实公网 IP） | **否** |
+| iceGatheringState | complete | complete |
+
+两侧 gathering 均为 `complete`（非超时），故 0 候选是真实的"无可收集"。
+这同时运行时验证了 151 移植中那处手写的**字符串→`mojom::blink::WebRtcIpHandlingPolicy`
+枚举映射**（151 把该策略从 WebString 改成了枚举）。
+
+> **权衡**：`disable_non_proxied_udp` 会导致**零 ICE 候选**。这是 Chrome 原生该策略
+> 的标准行为（企业部署常用），但对"普通家庭用户"人设而言零候选本身是弱信号。
+> 更理想是经环境代理产生 relay 候选（需代理支持 UDP）。无代理直连时，
+> 零候选仍远好过泄露真实公网 IP。
+
 **教训二（更普遍）**：不要用**渲染进程侧的 JS 取值**去证明**线上网络行为**。
 早期探针读到 `navigator.language === 'en-US'` 就判定 Accept-Language 通过，
 而真实 HTTP 头当时仍在发 `zh-CN,zh;q=0.9`——两者是独立代码路径，前者通过

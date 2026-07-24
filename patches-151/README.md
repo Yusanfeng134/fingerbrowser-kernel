@@ -39,6 +39,11 @@ DevTools 远程调试端口读 `document.title`（151 主二进制不再支持 `
 Intl locale / brands→Chrome / UA↔高熵 CH 版本一致 / WebGL vendor+renderer /
 WebGPU vendor+architecture / canvas 小画布无损 / audio 值键噪声 / CJK 字体屏蔽。
 
+**WebRTC** 另做差分 ICE 验证（`probe/webrtc-probe.html`）：基线收到
+host+srflx 两个候选、srflx 暴露真实公网 IP；开策略后 0 候选、无公网 IP，
+两侧 `iceGatheringState` 均为 complete。这同时验证了 151 那处
+字符串→`mojom::blink::WebRtcIpHandlingPolicy` 枚举映射在运行时有效。
+
 > **验证方法上的教训**：早期探针只读 `navigator.language`／`navigator.languages`，
 > 据此判定 Accept-Language 通过——**这是错的**。二者是不同代码路径：JS 侧已是
 > en-US 时，线上头仍在发 `zh-CN,zh;q=0.9`（见下节 ReduceAcceptLanguage）。
