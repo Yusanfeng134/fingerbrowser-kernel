@@ -113,6 +113,28 @@ CJK 字体屏蔽（Arial 不受影响）。
 > 更理想是经环境代理产生 relay 候选（需代理支持 UDP）。无代理直连时，
 > 零候选仍远好过泄露真实公网 IP。
 
+### 地理定位差分验证（手工移植项，最高风险）
+
+geolocation 是 124→151 手工移植改动最大的一项（文件从 modules/geolocation/
+移到 core/geolocation/、`GeolocationCoordinates` 构造改成 `std::optional<double>`、
+`StartUpdating`→`UpdateGeolocationState`），此前只编译过、从没运行过。差分实测：
+
+| | 基线（无策略） | 开策略 geo=40.7128,-74.006 |
+|---|---|---|
+| getCurrentPosition | User denied（headless 默认拒绝） | 40.7128 / -74.006, accuracy 40 |
+| watchPosition | User denied | 40.7128 / -74.006 |
+| altitude/heading/speed | — | null |
+
+运行时确认：151 的 `std::optional<double>` 构造正确（可选字段为 null）；伪装在
+`Geolocation::StartRequest` 顶部短路，绕过 `permissionDefaults: deny` 与安全上下文
+检查；getCurrentPosition 与 watchPosition 两条 notifier 路径都覆盖。坐标与
+timezone（America/New_York）人格一致。
+
+> **客户端缺口（非内核问题）**：内核 policy 解析器读 `geolocation.latitude/longitude`
+> 并翻译成 `fp-geo-lat-e6/lon-e6`，但客户端 `kernel-launcher.ts` 的 `buildPolicy()`
+> **不 emit `geolocation` 字段**。因此内核伪装虽正确，真实客户端路径下从不触发。
+> 要启用需在 buildPolicy 里按环境的定位设置输出 geolocation 字段。
+
 **教训二（更普遍）**：不要用**渲染进程侧的 JS 取值**去证明**线上网络行为**。
 早期探针读到 `navigator.language === 'en-US'` 就判定 Accept-Language 通过，
 而真实 HTTP 头当时仍在发 `zh-CN,zh;q=0.9`——两者是独立代码路径，前者通过
