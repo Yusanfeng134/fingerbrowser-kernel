@@ -135,6 +135,38 @@ timezone（America/New_York）人格一致。
 > **不 emit `geolocation` 字段**。因此内核伪装虽正确，真实客户端路径下从不触发。
 > 要启用需在 buildPolicy 里按环境的定位设置输出 geolocation 字段。
 
+### 其余"接上未验"接缝的差分验证（screen / hw / 大画布噪声 / 权限）
+
+同一构建，policy vs baseline：
+
+| 字段 | POLICY | BASELINE | 判定 |
+|---|---|---|---|
+| screen.width×height | 1920×1080（avail 1920×1040） | 800×600（headless 默认） | ✅ 屏幕分辨率伪装生效，且 screen≠window |
+| hardwareConcurrency | 8 | 32（真实核数） | ✅ |
+| deviceMemory | 8 | 32 | ✅（见下） |
+| canvasBigHash（大画布） | 值A | 值B（≠A） | ✅ 施加了噪声 |
+| canvas 同 seed 重跑 | 值A | 值A | ✅ 每 profile 确定 |
+| audioUnique | 4731/5000 | 4734/5000 | ✅ 施加且确定，自然重复保留 |
+
+- **canvas 大画布噪声**补齐了之前只验"小画布无损"的缺口：差分证明施加了噪声，
+  同 seed 重跑证明每 profile 确定（与 audio 一致）。
+- **deviceMemory baseline=32**：规范上限是 8，但 `navigator_device_memory.cc` 的
+  非伪装分支就是 stock 的 `ApproximatedDeviceMemory::GetApproximatedDeviceMemory()`
+  原样——**非本补丁引入**。伪装模式下正确为 8；32 只在不带 fp-active 的日常
+  （`fp-shell`）模式出现，属上游透传行为。
+- **permissionDefaults**：策略正确追加 upstream 的 `--deny-permission-prompts`
+  （该开关 124→151 未变）。但 headless 下 `Notification.requestPermission()`
+  policy 与 baseline 都返回 denied——**headless 自身默认拒绝提示，掩盖了开关的差分**
+  （与 WebGPU headless 掩盖同类）。运行时差分需窗口模式才能隔离，暂列未闭环。
+- **`fp-shell` 日常模式**（不带 fp-active）未测——是独立启动路径，且非防检测环境。
+
+### 客户端缺口小结（内核支持但 buildPolicy 不 emit → 伪装是死的）
+
+- `geolocation`（已验内核侧生效，客户端不发）
+- `screenWidth` / `screenHeight`（内核解析器读 hardwareProfile.screenWidth/Height，
+  但 buildPolicy 只 emit `windowSize`，不 emit screen——正是补丁注释所说 screen≠window
+  的检测点，客户端却没接）
+
 **教训二（更普遍）**：不要用**渲染进程侧的 JS 取值**去证明**线上网络行为**。
 早期探针读到 `navigator.language === 'en-US'` 就判定 Accept-Language 通过，
 而真实 HTTP 头当时仍在发 `zh-CN,zh;q=0.9`——两者是独立代码路径，前者通过
