@@ -86,10 +86,10 @@ index 0000000000..4d8d18b6e3
 +}
 diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
 new file mode 100644
-index 0000000000..568cdd7c41
+index 0000000000..96588721ab
 --- /dev/null
 +++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,443 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -351,6 +351,11 @@ index 0000000000..568cdd7c41
 +    policy.block_cjk_fonts = *block;
 +  }
 +
++  if (const std::optional<bool> passkey =
++          fingerprint_policy->FindBool("passkeyAuthenticator")) {
++    policy.passkey_authenticator = *passkey;
++  }
++
 +  return policy;
 +}
 +
@@ -411,6 +416,10 @@ index 0000000000..568cdd7c41
 +  // combination, and upstream's own comment warns that empty low-entropy hints
 +  // trip web application firewalls.
 +  command_line->AppendSwitch("fp-active");
++  // 工作环境同样要有浏览器外壳（垂直标签栏、AI 侧栏）。外壳与伪装是两个开关：
++  // 日常 profile 只带 fp-shell 不带 fp-active，工作环境两者都带。客户端启动日常
++  // 浏览器时需自行传 --fp-shell（那条路径不走策略文件）。
++  command_line->AppendSwitch("fp-shell");
 +  if (!policy.brand.empty()) {
 +    command_line->AppendSwitchASCII("fp-brand", policy.brand);
 +  }
@@ -500,6 +509,9 @@ index 0000000000..568cdd7c41
 +  if (policy.block_cjk_fonts) {
 +    command_line->AppendSwitch("fp-block-cjk-fonts");
 +  }
++  if (policy.passkey_authenticator) {
++    command_line->AppendSwitch("fp-passkey");
++  }
 +
 +  ApplyTimezone(policy.timezone);
 +}
@@ -523,10 +535,10 @@ index 0000000000..568cdd7c41
 +}  // namespace fingerbrowser
 diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
 new file mode 100644
-index 0000000000..3173415f84
+index 0000000000..e35ade5e8d
 --- /dev/null
 +++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,85 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -592,6 +604,13 @@ index 0000000000..3173415f84
 +  // Report CJK font families as unavailable (for a non-CJK persona whose host
 +  // has Chinese/Japanese/Korean fonts installed).
 +  bool block_cjk_fonts = false;
++  // Provide this environment with its own software passkey authenticator
++  // (WebAuthn). Without one, sites that require a security key cannot be
++  // satisfied at all: the host's platform authenticator would tie every store
++  // account to the same machine, and the phone/USB routes are unavailable to
++  // most users. Each environment gets an isolated authenticator, so credentials
++  // never cross environments.
++  bool passkey_authenticator = false;
 +};
 +
 +std::optional<FingerBrowserPolicy> LoadFingerBrowserPolicy(

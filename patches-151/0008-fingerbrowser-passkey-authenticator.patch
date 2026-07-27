@@ -1,0 +1,662 @@
+diff --git a/base/threading/thread_restrictions.h b/base/threading/thread_restrictions.h
+index c97be53dd6..0d5c6f3aaa 100644
+--- a/base/threading/thread_restrictions.h
++++ b/base/threading/thread_restrictions.h
+@@ -240,6 +240,7 @@ class ContentMainRunnerImpl;
+ class DesktopCaptureDevice;
+ class DWriteFontCollectionProxy;
+ class DWriteFontProxyImpl;
++class FingerBrowserPasskeyStore;
+ class InProcessUtilityThread;
+ class NestedMessagePumpAndroid;
+ class NetworkServiceInstancePrivate;
+@@ -622,6 +623,12 @@ class BASE_EXPORT ScopedAllowBlocking {
+   friend class chromecast::CrashUtil;
+   friend class content::BrowserProcessIOThread;
+   friend class content::DWriteFontProxyImpl;
++  // FingerBrowser: reads the environment's encrypted passkey store while the
++  // software authenticator is being created. The authenticator must come up
++  // already holding its credentials -- a request arriving against an
++  // empty authenticator would fail the user's sign-in. The file is small and
++  // read once per environment.
++  friend class content::FingerBrowserPasskeyStore;
+   friend class content::NetworkServiceInstancePrivate;
+   friend class content::PepperPrintSettingsManagerImpl;
+   friend class content::RenderProcessHostImpl;
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 2c3a21e01a..65dacbb75b 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3623,6 +3623,8 @@ source_set("browser") {
+       "webauth/authenticator_environment.h",
+       "webauth/authenticator_impl.cc",
+       "webauth/authenticator_impl.h",
++      "webauth/fingerbrowser_passkey_store.cc",
++      "webauth/fingerbrowser_passkey_store.h",
+       "webauth/default_authenticator_request_client_delegate.cc",
+       "webauth/default_authenticator_request_client_delegate.h",
+       "webauth/is_uvpaa.cc",
+diff --git a/content/browser/webauth/authenticator_environment.cc b/content/browser/webauth/authenticator_environment.cc
+index 6e2f4a4cda..172bce0790 100644
+--- a/content/browser/webauth/authenticator_environment.cc
++++ b/content/browser/webauth/authenticator_environment.cc
+@@ -7,16 +7,38 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/no_destructor.h"
+ #include "base/not_fatal_until.h"
++#include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "content/browser/webauth/fingerbrowser_passkey_store.h"
+ #include "content/browser/webauth/virtual_authenticator.h"
++#include "content/browser/webauth/virtual_authenticator_manager_impl.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/browser/webauth/virtual_discovery.h"
+ #include "content/browser/webauth/virtual_fido_discovery_factory.h"
+ #include "content/public/browser/scoped_authenticator_environment_for_testing.h"
+ #include "device/fido/fido_discovery_factory.h"
++#include "device/fido/public/fido_transport_protocol.h"
++#include "device/fido/public/fido_types.h"
+ 
+ namespace content {
+ 
++namespace {
++
++// FingerBrowser: enables the per-environment software passkey authenticator.
++// Emitted by chrome/browser/fingerbrowser/fingerbrowser_policy.cc from the
++// profile's policy file, and propagated to renderers alongside the other fp-*
++// switches.
++constexpr char kFingerBrowserPasskeySwitch[] = "fp-passkey";
++
++bool FingerBrowserPasskeyEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      kFingerBrowserPasskeySwitch);
++}
++
++}  // namespace
++
+ ScopedAuthenticatorEnvironmentForTesting::
+     ScopedAuthenticatorEnvironmentForTesting(
+         std::unique_ptr<device::FidoDiscoveryFactory> factory) {
+@@ -86,14 +108,123 @@ bool AuthenticatorEnvironment::IsVirtualAuthenticatorEnabledFor(
+ VirtualAuthenticatorManagerImpl*
+ AuthenticatorEnvironment::MaybeGetVirtualAuthenticatorManager(
+     FrameTreeNode* node) {
++  FrameTreeNode* const requested_node = node;
+   for (; node; node = FrameTreeNode::From(node->parent())) {
+     if (virtual_authenticator_managers_.contains(node)) {
+       return virtual_authenticator_managers_[node].get();
+     }
+   }
++  // FingerBrowser: nothing configured for this frame tree. If the profile's
++  // policy asked for a software passkey authenticator, provision it now rather
++  // than leaving the request with no authenticator to talk to.
++  if (requested_node && FingerBrowserPasskeyEnabled()) {
++    return EnsureFingerBrowserAuthenticatorFor(requested_node);
++  }
+   return nullptr;
+ }
+ 
++VirtualAuthenticatorManagerImpl*
++AuthenticatorEnvironment::EnsureFingerBrowserAuthenticatorFor(
++    FrameTreeNode* node) {
++  // Always attach at the root of the frame tree. Lookups walk from a frame up
++  // to its ancestors, so a manager on the root serves every frame in the tab.
++  // Attaching to whichever frame happened to ask first would give a subframe
++  // its own authenticator, and the main frame would later get a second one --
++  // two separate credential stores in one tab, so a passkey registered in one
++  // would be invisible to the other.
++  while (FrameTreeNode* parent = FrameTreeNode::From(node->parent())) {
++    node = parent;
++  }
++  EnableVirtualAuthenticatorFor(node, /*enable_ui=*/false);
++  auto it = virtual_authenticator_managers_.find(node);
++  if (it == virtual_authenticator_managers_.end()) {
++    return nullptr;
++  }
++  VirtualAuthenticatorManagerImpl* manager = it->second.get();
++
++  VirtualAuthenticator::Options options;
++  options.protocol = device::ProtocolVersion::kCtap2;
++  options.ctap2_version = device::Ctap2Version::kCtap2_1;
++  // An internal/platform authenticator: this environment's own passkey store,
++  // not a roaming key. Discoverable credentials are required because that is
++  // what "passkey" means to a relying party (and what lets sign-in work without
++  // the site supplying allowCredentials).
++  options.transport = device::FidoTransportProtocol::kInternal;
++  options.attachment = device::AuthenticatorAttachment::kPlatform;
++  options.has_resident_key = true;
++  options.has_user_verification = true;
++  // Identify no vendor. See VirtualAuthenticator::Options::zero_aaguid.
++  options.zero_aaguid = true;
++
++  VirtualAuthenticator* authenticator =
++      manager->AddAuthenticatorAndReturnNonOwningPointer(options);
++  if (authenticator) {
++    // The environment itself is the trust boundary: the user already unlocked
++    // the profile to open it, so the authenticator does not impose a second
++    // gesture. No UI is shown (enable_ui above is false).
++    authenticator->set_user_verified(true);
++    authenticator->SetUserPresence(true);
++
++    // Restore this environment's passkeys and keep them in sync from here on.
++    // The profile directory is what makes environments isolated: each one has
++    // its own user-data-dir, so credentials never cross store accounts.
++    base::FilePath profile_dir;
++    if (BrowserContext* context = node->current_frame_host()
++                                      ? node->current_frame_host()->GetBrowserContext()
++                                      : nullptr) {
++      profile_dir = context->GetPath();
++    }
++    if (!profile_dir.empty()) {
++      fingerbrowser_passkey_paths_[authenticator] = profile_dir;
++      FingerBrowserPasskeyStore::Load(authenticator, profile_dir);
++    }
++    authenticator->AddObserver(this);
++  }
++  return manager;
++}
++
++void AuthenticatorEnvironment::PersistFingerBrowserPasskeys(
++    VirtualAuthenticator* authenticator) {
++  auto it = fingerbrowser_passkey_paths_.find(authenticator);
++  if (it == fingerbrowser_passkey_paths_.end()) {
++    return;  // Not one of ours (e.g. a DevTools-created authenticator).
++  }
++  FingerBrowserPasskeyStore::Save(authenticator, it->second);
++}
++
++void AuthenticatorEnvironment::OnCredentialCreated(
++    VirtualAuthenticator* authenticator,
++    const device::VirtualFidoDevice::Credential& credential) {
++  PersistFingerBrowserPasskeys(authenticator);
++}
++
++void AuthenticatorEnvironment::OnCredentialDeleted(
++    VirtualAuthenticator* authenticator,
++    base::span<const uint8_t> credential_id) {
++  PersistFingerBrowserPasskeys(authenticator);
++}
++
++void AuthenticatorEnvironment::OnCredentialUpdated(
++    VirtualAuthenticator* authenticator,
++    const device::VirtualFidoDevice::Credential& credential) {
++  PersistFingerBrowserPasskeys(authenticator);
++}
++
++void AuthenticatorEnvironment::OnAssertion(
++    VirtualAuthenticator* authenticator,
++    const device::VirtualFidoDevice::Credential& credential) {
++  // Each assertion advances the signature counter, which relying parties track
++  // to detect cloned authenticators. Persist so the counter never regresses
++  // after a restart.
++  PersistFingerBrowserPasskeys(authenticator);
++}
++
++void AuthenticatorEnvironment::OnAuthenticatorWillBeDestroyed(
++    VirtualAuthenticator* authenticator) {
++  PersistFingerBrowserPasskeys(authenticator);
++  fingerbrowser_passkey_paths_.erase(authenticator);
++}
++
+ bool AuthenticatorEnvironment::HasVirtualUserVerifyingPlatformAuthenticator(
+     FrameTreeNode* node) {
+   VirtualAuthenticatorManagerImpl* authenticator_manager =
+diff --git a/content/browser/webauth/authenticator_environment.h b/content/browser/webauth/authenticator_environment.h
+index be75824f0a..5c00e1f714 100644
+--- a/content/browser/webauth/authenticator_environment.h
++++ b/content/browser/webauth/authenticator_environment.h
+@@ -8,9 +8,12 @@
+ #include <map>
+ #include <memory>
+ 
++#include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/no_destructor.h"
++#include "base/scoped_observation.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
++#include "content/browser/webauth/virtual_authenticator.h"
+ #include "content/common/content_export.h"
+ 
+ namespace device {
+@@ -25,7 +28,8 @@ class VirtualAuthenticatorManagerImpl;
+ // Authentication API. Disabling the environment resets its state.
+ //
+ // This class is a singleton.
+-class CONTENT_EXPORT AuthenticatorEnvironment : public FrameTreeNode::Observer {
++class CONTENT_EXPORT AuthenticatorEnvironment : public FrameTreeNode::Observer,
++                                                public VirtualAuthenticator::Observer {
+  public:
+   static AuthenticatorEnvironment* GetInstance();
+ 
+@@ -69,6 +73,24 @@ class CONTENT_EXPORT AuthenticatorEnvironment : public FrameTreeNode::Observer {
+   // FrameTreeNode::Observer:
+   void OnFrameTreeNodeDestroyed(FrameTreeNode* node) override;
+ 
++  // VirtualAuthenticator::Observer: persists FingerBrowser passkeys on every
++  // change. Updates matter as much as creations -- the signature counter moves
++  // on each assertion, and a counter that regresses after a restart looks to a
++  // relying party like a cloned authenticator.
++  void OnCredentialCreated(
++      VirtualAuthenticator* authenticator,
++      const device::VirtualFidoDevice::Credential& credential) override;
++  void OnCredentialDeleted(VirtualAuthenticator* authenticator,
++                           base::span<const uint8_t> credential_id) override;
++  void OnCredentialUpdated(
++      VirtualAuthenticator* authenticator,
++      const device::VirtualFidoDevice::Credential& credential) override;
++  void OnAssertion(
++      VirtualAuthenticator* authenticator,
++      const device::VirtualFidoDevice::Credential& credential) override;
++  void OnAuthenticatorWillBeDestroyed(
++      VirtualAuthenticator* authenticator) override;
++
+  protected:
+   AuthenticatorEnvironment();
+   ~AuthenticatorEnvironment() override;
+@@ -76,8 +98,31 @@ class CONTENT_EXPORT AuthenticatorEnvironment : public FrameTreeNode::Observer {
+  private:
+   friend class base::NoDestructor<AuthenticatorEnvironment>;
+ 
++  // FingerBrowser: provisions the per-environment software passkey
++  // authenticator for |node| on first use, when the profile's policy enabled
++  // it (--fp-passkey).
++  //
++  // Why lazily, from the lookup path: a fingerprint-browser environment cannot
++  // use the host's platform authenticator (Windows Hello binds to the real
++  // machine, so several store accounts sharing it are trivially correlated),
++  // and the phone/hybrid and USB routes are unavailable to most of our users.
++  // With no authenticator at all, navigator.credentials.create() simply hangs
++  // forever -- measured -- which is what sellers experience today. Provisioning
++  // here means any frame that actually performs a WebAuthn request gets an
++  // authenticator, without needing to hook frame creation.
++  VirtualAuthenticatorManagerImpl* EnsureFingerBrowserAuthenticatorFor(
++      FrameTreeNode* node);
++
++  // Writes |authenticator|'s credentials back to the profile they belong to.
++  void PersistFingerBrowserPasskeys(VirtualAuthenticator* authenticator);
++
+   std::unique_ptr<device::FidoDiscoveryFactory> replaced_discovery_factory_;
+ 
++  // Profile directory backing each FingerBrowser authenticator, so credential
++  // changes can be written back to the right environment.
++  std::map<VirtualAuthenticator*, base::FilePath>
++      fingerbrowser_passkey_paths_;
++
+   std::map<FrameTreeNode*, std::unique_ptr<VirtualAuthenticatorManagerImpl>>
+       virtual_authenticator_managers_;
+ };
+diff --git a/content/browser/webauth/fingerbrowser_passkey_store.cc b/content/browser/webauth/fingerbrowser_passkey_store.cc
+new file mode 100644
+index 0000000000..1db752316d
+--- /dev/null
++++ b/content/browser/webauth/fingerbrowser_passkey_store.cc
+@@ -0,0 +1,271 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/webauth/fingerbrowser_passkey_store.h"
++
++#include <utility>
++
++#include "base/base64.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/task/thread_pool.h"
++#include "base/threading/scoped_blocking_call.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "content/browser/webauth/virtual_authenticator.h"
++#include "device/fido/public/public_key_credential_rp_entity.h"
++#include "device/fido/public/public_key_credential_user_entity.h"
++
++#if BUILDFLAG(IS_WIN)
++#include <windows.h>
++
++#include <wincrypt.h>
++#endif
++
++namespace content {
++
++namespace {
++
++constexpr char kStoreFileName[] = "FingerBrowserPasskeys";
++
++// Serialized field names.
++constexpr char kCredentials[] = "credentials";
++constexpr char kCredentialId[] = "id";
++constexpr char kPrivateKey[] = "privateKey";
++constexpr char kRpIdHash[] = "rpIdHash";
++constexpr char kCounter[] = "counter";
++constexpr char kIsResident[] = "isResident";
++constexpr char kRpId[] = "rpId";
++constexpr char kRpName[] = "rpName";
++constexpr char kUserId[] = "userId";
++constexpr char kUserName[] = "userName";
++constexpr char kUserDisplayName[] = "userDisplayName";
++
++// A passkey private key is the account credential itself. It is only ever
++// written through these two functions, which bind the data to the current OS
++// user account (DPAPI on Windows -- the same mechanism that protects the
++// profile's cookies).
++//
++// On platforms without an implementation here, persistence is refused rather
++// than falling back to plaintext: losing passkeys across restarts is an
++// inconvenience, leaking them is an account compromise.
++bool EncryptForStorage(const std::string& plaintext, std::string* out) {
++#if BUILDFLAG(IS_WIN)
++  DATA_BLOB input = {};
++  input.pbData =
++      reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
++  input.cbData = static_cast<DWORD>(plaintext.size());
++  DATA_BLOB output = {};
++  if (!::CryptProtectData(&input, L"FingerBrowser passkeys", /*pOptionalEntropy=*/nullptr,
++                          /*pvReserved=*/nullptr, /*pPromptStruct=*/nullptr,
++                          /*dwFlags=*/0, &output)) {
++    return false;
++  }
++  out->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
++  ::LocalFree(output.pbData);
++  return true;
++#else
++  return false;
++#endif
++}
++
++bool DecryptFromStorage(const std::string& ciphertext, std::string* out) {
++#if BUILDFLAG(IS_WIN)
++  DATA_BLOB input = {};
++  input.pbData =
++      reinterpret_cast<BYTE*>(const_cast<char*>(ciphertext.data()));
++  input.cbData = static_cast<DWORD>(ciphertext.size());
++  DATA_BLOB output = {};
++  if (!::CryptUnprotectData(&input, /*ppszDataDescr=*/nullptr,
++                            /*pOptionalEntropy=*/nullptr, /*pvReserved=*/nullptr,
++                            /*pPromptStruct=*/nullptr, /*dwFlags=*/0, &output)) {
++    return false;
++  }
++  out->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
++  ::LocalFree(output.pbData);
++  return true;
++#else
++  return false;
++#endif
++}
++
++// Writes the already-encrypted blob. Runs on a thread pool sequence: file I/O
++// is forbidden on the UI thread, and credential changes arrive on it.
++void WriteStoreOnBlockingSequence(const base::FilePath& path,
++                                  const std::string& encrypted) {
++  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
++                                                base::BlockingType::MAY_BLOCK);
++  if (!base::WriteFile(path, encrypted)) {
++    LOG(ERROR) << "FingerBrowser: failed writing passkey store.";
++  }
++}
++
++}  // namespace
++
++// static
++base::FilePath FingerBrowserPasskeyStore::PathFor(
++    const base::FilePath& profile_dir) {
++  return profile_dir.AppendASCII(kStoreFileName);
++}
++
++// static
++void FingerBrowserPasskeyStore::Save(const VirtualAuthenticator* authenticator,
++                                     const base::FilePath& profile_dir) {
++  if (!authenticator || profile_dir.empty()) {
++    return;
++  }
++
++  base::ListValue credentials;
++  for (const auto& [credential_id, registration] :
++       authenticator->registrations()) {
++    base::DictValue entry;
++    entry.Set(kCredentialId, base::Base64Encode(credential_id));
++    entry.Set(kPrivateKey,
++              base::Base64Encode(registration.private_key->GetPKCS8PrivateKey()));
++    entry.Set(kRpIdHash, base::Base64Encode(registration.application_parameter));
++    // The signature counter must survive restarts: relying parties treat a
++    // counter that goes backwards as evidence of a cloned authenticator.
++    entry.Set(kCounter, static_cast<int>(registration.counter));
++    entry.Set(kIsResident, registration.is_resident);
++    if (registration.rp) {
++      entry.Set(kRpId, registration.rp->id);
++      if (registration.rp->name) {
++        entry.Set(kRpName, *registration.rp->name);
++      }
++    }
++    if (registration.user) {
++      entry.Set(kUserId, base::Base64Encode(registration.user->id));
++      if (registration.user->name) {
++        entry.Set(kUserName, *registration.user->name);
++      }
++      if (registration.user->display_name) {
++        entry.Set(kUserDisplayName, *registration.user->display_name);
++      }
++    }
++    credentials.Append(std::move(entry));
++  }
++
++  base::DictValue root;
++  root.Set(kCredentials, std::move(credentials));
++  std::string json;
++  if (!base::JSONWriter::Write(root, &json)) {
++    return;
++  }
++  std::string encrypted;
++  if (!EncryptForStorage(json, &encrypted)) {
++    LOG(ERROR) << "FingerBrowser: refusing to persist passkeys without "
++                  "encryption support on this platform.";
++    return;
++  }
++  // Serialization and encryption happen here, on the caller's thread, because
++  // they read the authenticator's live state. Only the write is handed off --
++  // the blob is self-contained, so nothing dangles if the authenticator goes
++  // away before the task runs.
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++      base::BindOnce(&WriteStoreOnBlockingSequence, PathFor(profile_dir),
++                     std::move(encrypted)));
++}
++
++// static
++void FingerBrowserPasskeyStore::Load(VirtualAuthenticator* authenticator,
++                                     const base::FilePath& profile_dir) {
++  if (!authenticator || profile_dir.empty()) {
++    return;
++  }
++  const base::FilePath path = PathFor(profile_dir);
++  std::string encrypted;
++  {
++    // Read synchronously: the authenticator is being created right now and must
++    // come up already holding this environment's passkeys, otherwise the first
++    // sign-in attempt would see an empty authenticator. The file is small (a
++    // handful of credentials) and this happens once per environment, on the
++    // first WebAuthn call.
++    base::ScopedAllowBlocking allow_blocking;
++    if (!base::ReadFileToString(path, &encrypted) || encrypted.empty()) {
++      return;  // No passkeys stored yet; a fresh environment looks like this.
++    }
++  }
++  std::string json;
++  if (!DecryptFromStorage(encrypted, &json)) {
++    LOG(ERROR) << "FingerBrowser: passkey store could not be decrypted.";
++    return;
++  }
++  std::optional<base::DictValue> root =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  if (!root) {
++    return;
++  }
++  const base::ListValue* credentials = root->FindList(kCredentials);
++  if (!credentials) {
++    return;
++  }
++
++  for (const base::Value& value : *credentials) {
++    const base::DictValue* entry = value.GetIfDict();
++    if (!entry) {
++      continue;
++    }
++    const std::string* id_b64 = entry->FindString(kCredentialId);
++    const std::string* key_b64 = entry->FindString(kPrivateKey);
++    const std::string* rp_id_hash_b64 = entry->FindString(kRpIdHash);
++    if (!id_b64 || !key_b64 || !rp_id_hash_b64) {
++      continue;
++    }
++    std::optional<std::vector<uint8_t>> credential_id =
++        base::Base64Decode(*id_b64);
++    std::optional<std::vector<uint8_t>> pkcs8 = base::Base64Decode(*key_b64);
++    std::optional<std::vector<uint8_t>> rp_id_hash =
++        base::Base64Decode(*rp_id_hash_b64);
++    if (!credential_id || !pkcs8 || !rp_id_hash ||
++        rp_id_hash->size() != device::kRpIdHashLength) {
++      continue;
++    }
++    std::optional<std::unique_ptr<device::VirtualFidoDevice::PrivateKey>> key =
++        device::VirtualFidoDevice::PrivateKey::FromPKCS8(*pkcs8);
++    if (!key) {
++      continue;
++    }
++
++    device::VirtualFidoDevice::RegistrationData registration(
++        std::move(*key),
++        base::span<const uint8_t, device::kRpIdHashLength>(*rp_id_hash),
++        static_cast<uint32_t>(entry->FindInt(kCounter).value_or(0)));
++    registration.is_resident = entry->FindBool(kIsResident).value_or(false);
++
++    if (const std::string* rp_id = entry->FindString(kRpId)) {
++      device::PublicKeyCredentialRpEntity rp;
++      rp.id = *rp_id;
++      if (const std::string* rp_name = entry->FindString(kRpName)) {
++        rp.name = *rp_name;
++      }
++      registration.rp = std::move(rp);
++    }
++    if (const std::string* user_id_b64 = entry->FindString(kUserId)) {
++      if (std::optional<std::vector<uint8_t>> user_id =
++              base::Base64Decode(*user_id_b64)) {
++        device::PublicKeyCredentialUserEntity user;
++        user.id = std::move(*user_id);
++        if (const std::string* user_name = entry->FindString(kUserName)) {
++          user.name = *user_name;
++        }
++        if (const std::string* display = entry->FindString(kUserDisplayName)) {
++          user.display_name = *display;
++        }
++        registration.user = std::move(user);
++      }
++    }
++
++    authenticator->registrations().emplace(std::move(*credential_id),
++                                           std::move(registration));
++  }
++}
++
++}  // namespace content
+diff --git a/content/browser/webauth/fingerbrowser_passkey_store.h b/content/browser/webauth/fingerbrowser_passkey_store.h
+new file mode 100644
+index 0000000000..b4eb66fce4
+--- /dev/null
++++ b/content/browser/webauth/fingerbrowser_passkey_store.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_WEBAUTH_FINGERBROWSER_PASSKEY_STORE_H_
++#define CONTENT_BROWSER_WEBAUTH_FINGERBROWSER_PASSKEY_STORE_H_
++
++#include "base/files/file_path.h"
++#include "content/common/content_export.h"
++
++namespace content {
++
++class VirtualAuthenticator;
++
++// FingerBrowser: persists the per-environment software authenticator's passkeys
++// inside that environment's profile directory.
++//
++// Without this the credentials live only in memory, so a passkey registered in
++// one session disappears when the environment is closed -- the account would
++// then be unrecoverable through that route. Storing them under the profile is
++// also what keeps environments isolated: each environment already has its own
++// user-data-dir, so credentials cannot leak across store accounts, and an
++// environment that is exported or handed to a teammate carries its passkeys
++// with it.
++//
++// The file is encrypted at rest (OSCrypt / DPAPI on Windows), the same
++// protection the profile's cookies get. A passkey private key IS the account
++// credential: anyone holding it can sign in, so it must never be written in
++// the clear.
++class CONTENT_EXPORT FingerBrowserPasskeyStore {
++ public:
++  // Restores previously stored credentials into |authenticator|. Missing or
++  // unreadable state is not an error: the environment simply starts with no
++  // passkeys, exactly as a fresh one would.
++  static void Load(VirtualAuthenticator* authenticator,
++                   const base::FilePath& profile_dir);
++
++  // Writes |authenticator|'s current credentials back to the profile. Called
++  // whenever a credential is created, updated (the signature counter changes on
++  // every assertion) or deleted.
++  static void Save(const VirtualAuthenticator* authenticator,
++                   const base::FilePath& profile_dir);
++
++  // Absolute path of the store for |profile_dir|. Exposed for tests.
++  static base::FilePath PathFor(const base::FilePath& profile_dir);
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_WEBAUTH_FINGERBROWSER_PASSKEY_STORE_H_
+diff --git a/content/browser/webauth/virtual_authenticator.cc b/content/browser/webauth/virtual_authenticator.cc
+index 9932ffe936..cac2efebd6 100644
+--- a/content/browser/webauth/virtual_authenticator.cc
++++ b/content/browser/webauth/virtual_authenticator.cc
+@@ -44,6 +44,12 @@ VirtualAuthenticator::VirtualAuthenticator(const Options& options)
+   state_->fingerprints_enrolled = has_user_verification_;
+   state_->default_backup_eligibility = options.default_backup_eligibility;
+   state_->default_backup_state = options.default_backup_state;
++  if (options.zero_aaguid) {
++    // Self attestation with a zero AAGUID: the authenticator signs with the
++    // credential key and identifies no vendor. See Options::zero_aaguid.
++    state_->self_attestation = true;
++    state_->non_zero_aaguid_with_self_attestation = false;
++  }
+   observation_.Observe(state_.get());
+   SetUserPresence(true);
+ }
+diff --git a/content/browser/webauth/virtual_authenticator.h b/content/browser/webauth/virtual_authenticator.h
+index ae9ba3530c..4ac957f9b0 100644
+--- a/content/browser/webauth/virtual_authenticator.h
++++ b/content/browser/webauth/virtual_authenticator.h
+@@ -74,6 +74,18 @@ class CONTENT_EXPORT VirtualAuthenticator
+     bool has_hmac_secret_mc = false;
+     bool default_backup_eligibility = false;
+     bool default_backup_state = false;
++    // FingerBrowser: force a zeroed AAGUID regardless of what attestation the
++    // relying party asks for.
++    //
++    // The spec only zeroes the AAGUID when the RP requests attestation "none";
++    // an RP asking for "direct"/"indirect" still receives kDeviceAaguid, which
++    // is a published constant that AAGUID directories resolve to "Chromium
++    // Virtual Authenticator (browser dev tools)". Measured: Amazon displayed
++    // exactly that string next to a passkey registered this way -- an obvious
++    // anomaly on a seller's account. Zeroing at the authenticator level is the
++    // honest posture for a software authenticator (it declines to identify a
++    // vendor); it must never be used to impersonate another vendor's AAGUID.
++    bool zero_aaguid = false;
+   };
+ 
+   using GetLargeBlobCallback =

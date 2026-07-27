@@ -28,6 +28,21 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0005 | fingerbrowser-screen-geolocation | 屏幕/定位 | screen.*、geolocation |
 | 0006 | fingerbrowser-webrtc-ip-handling | WebRTC | peer_connection（IP 策略枚举化）|
 | 0007 | fingerbrowser-brand | 品牌 | user_agent_utils（brands 报 Chrome）|
+| 0008 | fingerbrowser-passkey-authenticator | **每环境 passkey 认证器** | content/browser/webauth（策略驱动挂载、AAGUID 归零、加密持久化）、base/threading（ScopedAllowBlocking 白名单）|
+
+### 0008 说明：亚马逊安全密钥（passkey）支持
+
+解决亚马逊上线 WebAuthn 风控后**客户完全无法完成验证**的问题：指纹浏览器里平台认证器（Windows Hello）会把多个店铺账号绑到同一台机器，手机 hybrid 路径对无 Google 服务的国产 Android 不可用，USB 密钥又需硬件且共用即关联——三条路同时堵死，实测表现为 `navigator.credentials.create()` **无限挂起**。
+
+本补丁给每个环境提供**独立的软件 CTAP2 认证器**：
+- **策略驱动**：policy 的 `passkeyAuthenticator` → `--fp-passkey`（策略字段在 0003 中），WebAuthn 请求到来时自动挂载，**不依赖 CDP**。
+- **AAGUID 归零**：`VirtualAuthenticator::Options::zero_aaguid` 强制 self attestation。**必须在认证器层强制**——规范只在 RP 请求 `attestation=none` 时归零，RP 请求 `direct/indirect` 时仍会发出 Chromium 虚拟认证器的公开 AAGUID，实测被亚马逊显示为 "Chromium Virtual Authenticator (browser dev tools)"。**绝不借用其它厂商 AAGUID 冒充硬件。**
+- **加密持久化**：凭据（含私钥、**签名计数器**）经 DPAPI 加密后存入环境 profile 目录。counter 必须持久化——RP 把计数器回退视作认证器被克隆。
+- **环境隔离**：凭据随 profile 走，跨环境不可见。
+
+实测（`probe/run-p1-persistence.cjs`）：注册→关闭浏览器→重开仅登录成功（凭据跨重启存活）；另一 profile 仅登录失败（隔离生效）；存储文件扫不到明文字段名。
+
+> 实现注记：写盘经线程池异步执行（凭据变更在 UI 线程上报，同步 I/O 会触发 DCHECK 崩溃）；读取需同步（认证器创建时即须持有凭据），故在 `base/threading/thread_restrictions.h` 的 `ScopedAllowBlocking` 白名单中加了 friend。这是本补丁集**唯一改动 `base/` 之处**，rebase 时需留意。
 
 ## 实测验证（151 chrome.exe）
 
