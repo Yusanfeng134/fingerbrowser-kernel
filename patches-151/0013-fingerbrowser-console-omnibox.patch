@@ -1,0 +1,400 @@
+From 0f7cbd0ae9af4257eca421a6102948cc7b43e970 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 02:35:48 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E7=AE=A1=E7=90=86=E5=8F=B0?=
+ =?UTF-8?q?=E5=9C=B0=E5=9D=80=E6=A0=8F=E6=98=BE=E7=A4=BA=E4=BA=A7=E5=93=81?=
+ =?UTF-8?q?=E5=90=8D=E8=80=8C=E9=9D=9E=E6=9C=AC=E5=9C=B0=E6=9C=8D=E5=8A=A1?=
+ =?UTF-8?q?=20URL?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+客户端把管理台（环境列表、代理、设置）交给内核作为启动页打开，页面由本地
+HTTP 服务提供，端口是 listen(0) 由系统分配。地址栏因此显示
+http://127.0.0.1:53483/#/yunlogin-environments —— 一个用户用不上、每次启动
+还都不一样的实现细节。改为显示产品名，与 Chromium 对待自身内部页面的做法
+一致。
+
+新增受控命令行参数 --fp-console-title=<显示名>。URL 复用客户端已在下发的
+--fp-pinned-url，无需新参数。显示名走参数而非写死在内核里：这个字段天然
+跟着白标走，届时改的是客户端的品牌配置，不必重编内核。
+
+实现顺着上游已有的形状：LocationBarModelImpl::GetFormattedFullURL 与
+GetURLForDisplay 的第一行本就是 if (IsContextualTasksPage()) return
+GetContextualTasksDisplayURL()，即 Chromium 自己就为特殊页面替换 omnibox
+显示文本。图标用委托层现成的官方钩子 GetVectorIconOverride()。
+
+分层刻意做薄：components/omnibox 只加一个默认返回空串的虚函数
+GetDisplayTextOverride() 与两处转发（共 14 行），判断「这是不是管理台」的
+产品逻辑全在 chrome/ 下。本补丁集已在 base/ 欠了一处（passkey 的
+ScopedAllowBlocking 白名单），不宜再欠一处 components/。
+
+三个决定：
+
+- 按 origin 相等匹配，而非整串 URL。管理台是单页应用，路由在 fragment 里
+  （#/yunlogin-environments），整串比对一换路由即失效。
+- 不改 GetSecurityLevel()，只换图标与文字。安全等级还喂给权限决策与页面
+  信息气泡，改动会有连带影响。
+- 挂锁用 vector_icons::kLockIcon 而非 SECURE 图标。自 M117 起 SECURE 的
+  字形是 page-info 控件，摆在产品名旁边像个按钮而不像陈述。
+
+安全边界：改写 omnibox 显示正是浏览器严防的欺骗行为，故规则绑死三件事
+——只匹配启动时传入的那个 origin、强制 loopback、只作用于顶层框架（沿用
+LocationBarModel 本身只看主导航条目的性质）。放松成「任意 127.0.0.1」的话，
+本机任何进程起个服务就能取得一个带锁的可信外观。
+
+需要说明的取舍：管理台是明文 HTTP，本机任意进程可连，挂锁在严格意义上高于
+实际保证。这是有意识的取舍——origin 由我们自己在启动时传入、强制 loopback、
+且安全等级未被篡改，暴露面可控。
+
+地址栏在显示产品名时置为只读。否则用户可以覆盖掉产品名把管理台标签导航到
+别处，而端口是本次启动随机分配的，他无法重新输入回来。popup_window_mode_
+本就无条件只读，不覆盖它。
+
+验证（三次启动，端口分别为 49871 / 52250 / 62419，均由 listen(0) 分配）：
+- 地址栏显示「YunLogin 管理中心」而非 127.0.0.1:<端口>
+- 左侧为挂锁，而非 http 的灰色信息图标
+- 点击地址栏不露出真实 URL，且无法输入
+- 切换 #/yunlogin-environments、#/proxies 后仍显示产品名
+- 访问 /settings 子路径仍显示产品名
+- 反例：新标签页访问 example.com 正常显示域名
+
+反例一条是验收重点：前五条只证明「能改」，第六条才证明「不会乱改」——
+匹配规则若放松，前五条照样全过，而用户会发现访问任何网站地址栏都变成产品名。
+
+不传 --fp-console-title 时行为完全不变（显示名为空即不改写），故客户端可
+自行决定何时下发。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/browser/fingerbrowser/BUILD.gn         |  4 +
+ .../fingerbrowser/fingerbrowser_console.cc    | 78 +++++++++++++++++++
+ .../fingerbrowser/fingerbrowser_console.h     | 40 ++++++++++
+ chrome/browser/ui/BUILD.gn                    |  1 +
+ .../chrome_location_bar_model_delegate.cc     | 22 ++++++
+ .../chrome_location_bar_model_delegate.h      |  1 +
+ .../ui/views/omnibox/omnibox_view_views.cc    | 11 +++
+ .../browser/location_bar_model_delegate.cc    |  4 +
+ .../browser/location_bar_model_delegate.h     |  6 ++
+ .../browser/location_bar_model_impl.cc        | 11 +++
+ 10 files changed, 178 insertions(+)
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_console.cc
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_console.h
+
+diff --git a/chrome/browser/fingerbrowser/BUILD.gn b/chrome/browser/fingerbrowser/BUILD.gn
+index 4d8d18b6e3..7d901d8732 100644
+--- a/chrome/browser/fingerbrowser/BUILD.gn
++++ b/chrome/browser/fingerbrowser/BUILD.gn
+@@ -2,6 +2,8 @@ import("//testing/test.gni")
+ 
+ source_set("fingerbrowser") {
+   sources = [
++    "fingerbrowser_console.cc",
++    "fingerbrowser_console.h",
+     "fingerbrowser_policy.cc",
+     "fingerbrowser_policy.h",
+   ]
+@@ -11,8 +13,10 @@ source_set("fingerbrowser") {
+     "//chrome/common",
+     "//components/permissions",
+     "//content/public/common",
++    "//net",
+     "//third_party/icu",
+     "//ui/base",
++    "//url",
+   ]
+ }
+ 
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.cc b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+new file mode 100644
+index 0000000000..c445526547
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
++
++#include "base/command_line.h"
++#include "base/no_destructor.h"
++#include "base/strings/utf_string_conversions.h"
++#include "build/build_config.h"
++#include "net/base/url_util.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace fingerbrowser {
++
++namespace {
++
++// Already passed by the client (shell-launcher.ts) to pin the console tab.
++constexpr char kConsoleUrlSwitch[] = "fp-pinned-url";
++constexpr char kConsoleTitleSwitch[] = "fp-console-title";
++
++// Parsed once: the command line does not change over the process lifetime, and
++// this is consulted on every omnibox update.
++const url::Origin& ConsoleOrigin() {
++  static const base::NoDestructor<url::Origin> origin([] {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    const GURL url(cmd->GetSwitchValueASCII(kConsoleUrlSwitch));
++    // Loopback-only. Without this check a --fp-pinned-url pointing at a public
++    // site would let that site render under the product's own name.
++    if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() ||
++        !net::IsLocalhost(url)) {
++      return url::Origin();
++    }
++    return url::Origin::Create(url);
++  }());
++  return *origin;
++}
++
++}  // namespace
++
++bool IsConsoleUrl(const GURL& url) {
++  const url::Origin& console = ConsoleOrigin();
++  // An opaque origin means the console was never configured; it must not
++  // compare equal to anything.
++  if (console.opaque()) {
++    return false;
++  }
++  if (!url.is_valid()) {
++    return false;
++  }
++  // Origin rather than whole-URL equality: the console is a single-page app
++  // whose routes live in the fragment (#/yunlogin-environments), so the URL
++  // changes as the user moves around while the origin stays put.
++  return url::Origin::Create(url) == console;
++}
++
++std::u16string GetConsoleOmniboxTitle(const GURL& url) {
++  if (!IsConsoleUrl(url)) {
++    return std::u16string();
++  }
++  // Native, not ASCII: the title is a product name and will normally be
++  // non-Latin ("YunLogin 管理中心"). GetSwitchValueASCII silently returns an
++  // empty string for anything outside ASCII.
++  const base::CommandLine::StringType title =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueNative(
++          kConsoleTitleSwitch);
++  if (title.empty()) {
++    return std::u16string();
++  }
++#if BUILDFLAG(IS_WIN)
++  return base::WideToUTF16(title);
++#else
++  return base::UTF8ToUTF16(title);
++#endif
++}
++
++}  // namespace fingerbrowser
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.h b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+new file mode 100644
+index 0000000000..fe1e0aba1b
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_CONSOLE_H_
++#define CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_CONSOLE_H_
++
++#include <string>
++
++class GURL;
++
++namespace fingerbrowser {
++
++// The client serves its management console (environment list, proxies,
++// settings) from a local HTTP server on an OS-assigned port and hands the
++// kernel that URL at launch. Showing "http://127.0.0.1:53483/#/..." in the
++// omnibox exposes an implementation detail the user has no use for, so the
++// console is presented under a product name instead -- the same treatment
++// Chromium gives its own internal pages.
++//
++// This is deliberately narrow. Rewriting what the omnibox shows is exactly the
++// spoofing browsers exist to prevent, so the rule matches only the one origin
++// passed on the command line at launch, and only when that origin is loopback.
++// A page cannot navigate its way into the trusted presentation: it would have
++// to be served from the port our own server is holding.
++//
++// Returns true if `url` belongs to the management console origin.
++bool IsConsoleUrl(const GURL& url);
++
++// The name to show in place of the console URL, e.g. "YunLogin 管理中心".
++// Empty when the console is not configured or `url` is not the console --
++// callers treat empty as "no override, format the URL normally".
++//
++// The title comes from the command line rather than being baked in so that
++// rebranding does not require rebuilding the kernel.
++std::u16string GetConsoleOmniboxTitle(const GURL& url);
++
++}  // namespace fingerbrowser
++
++#endif  // CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_CONSOLE_H_
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 908fb9b024..3abf658130 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -517,6 +517,7 @@ static_library("ui") {
+     "//chrome/browser/file_system_access",
+     "//chrome/browser/finds",
+     "//chrome/browser/finds/core",
++    "//chrome/browser/fingerbrowser",
+     "//chrome/browser/first_run",
+     "//chrome/browser/first_run:impl",
+     "//chrome/browser/gcm",
+diff --git a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
+index e910edab13..708f393585 100644
+--- a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
++++ b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_ui_interface.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_utils.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search/search.h"
+@@ -186,12 +187,33 @@ ChromeLocationBarModelDelegate::GetCertificate() const {
+   return entry->GetSSL().certificate;
+ }
+ 
++std::u16string ChromeLocationBarModelDelegate::GetDisplayTextOverride() const {
++  GURL url;
++  if (!GetURL(&url)) {
++    return std::u16string();
++  }
++  return fingerbrowser::GetConsoleOmniboxTitle(url);
++}
++
+ const gfx::VectorIcon* ChromeLocationBarModelDelegate::GetVectorIconOverride()
+     const {
+ #if !BUILDFLAG(IS_ANDROID)
+   GURL url;
+   GetURL(&url);
+ 
++  // The management console is served over plain HTTP on loopback, which would
++  // otherwise draw the neutral "info" icon next to a product name -- reading as
++  // if the product itself were untrusted. Only the icon is overridden; the
++  // security level is left alone, since it feeds permission decisions and the
++  // page info bubble.
++  // A padlock rather than the SECURE icon: since M117 upstream's "secure" glyph
++  // is the page-info control, which next to a product name reads as a button
++  // rather than a statement about the page.
++  if (fingerbrowser::IsConsoleUrl(url)) {
++    return &(features::IsRoundedIconsEnabled() ? vector_icons::kLockFilledIcon
++                                               : vector_icons::kLockIcon);
++  }
++
+   if (IsContextualTasksPage()) {
+     return &vector_icons::kGoogleColorIcon;
+   }
+diff --git a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.h b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.h
+index b4d971dbff..ae1001c352 100644
+--- a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.h
++++ b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.h
+@@ -43,6 +43,7 @@ class ChromeLocationBarModelDelegate : public LocationBarModelDelegate {
+   std::unique_ptr<security_state::VisibleSecurityState>
+   GetVisibleSecurityState() const override;
+   scoped_refptr<net::X509Certificate> GetCertificate() const override;
++  std::u16string GetDisplayTextOverride() const override;
+   const gfx::VectorIcon* GetVectorIconOverride() const override;
+   bool IsOfflinePage() const override;
+   bool IsNewTabPage() const override;
+diff --git a/chrome/browser/ui/views/omnibox/omnibox_view_views.cc b/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+index 46cc4d9111..51de5df3cb 100644
+--- a/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/autocomplete/aim_eligibility_service_factory.h"
+ #include "chrome/browser/command_updater.h"
+ #include "chrome/browser/external_protocol/external_protocol_handler.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
+ #include "chrome/browser/history_clusters/history_clusters_tab_helper.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search_engines/ai_mode_button_service_factory.h"
+@@ -466,6 +467,16 @@ void OmniboxViewViews::EmphasizeURLComponents() {
+ 
+ void OmniboxViewViews::Update() {
+   TRACE_EVENT("omnibox", "OmniboxViewViews::Update");
++
++  // The management console shows a product name in place of its URL. Leaving
++  // the field editable would let the user type over that name and navigate the
++  // console tab elsewhere, stranding them with no way back -- the port is
++  // assigned at startup and is not something they can retype.
++  // popup_window_mode_ is already unconditionally read-only; don't undo it.
++  if (!popup_window_mode_) {
++    SetReadOnly(fingerbrowser::IsConsoleUrl(controller()->client()->GetURL()));
++  }
++
+   if (controller()->edit_model()->ResetDisplayTexts()) {
+     RevertAll();
+ 
+diff --git a/components/omnibox/browser/location_bar_model_delegate.cc b/components/omnibox/browser/location_bar_model_delegate.cc
+index ec0eddc10f..97d7b81e1a 100644
+--- a/components/omnibox/browser/location_bar_model_delegate.cc
++++ b/components/omnibox/browser/location_bar_model_delegate.cc
+@@ -35,6 +35,10 @@ scoped_refptr<net::X509Certificate> LocationBarModelDelegate::GetCertificate()
+   return nullptr;
+ }
+ 
++std::u16string LocationBarModelDelegate::GetDisplayTextOverride() const {
++  return std::u16string();
++}
++
+ const gfx::VectorIcon* LocationBarModelDelegate::GetVectorIconOverride() const {
+   return nullptr;
+ }
+diff --git a/components/omnibox/browser/location_bar_model_delegate.h b/components/omnibox/browser/location_bar_model_delegate.h
+index d5c6d18f92..aa0c428d40 100644
+--- a/components/omnibox/browser/location_bar_model_delegate.h
++++ b/components/omnibox/browser/location_bar_model_delegate.h
+@@ -66,6 +66,12 @@ class LocationBarModelDelegate {
+   // Returns the certificate for the current navigation entry.
+   virtual scoped_refptr<net::X509Certificate> GetCertificate() const;
+ 
++  // Returns a string to show in the omnibox in place of the formatted URL, or
++  // empty to format the URL normally. Used by the embedder to present its own
++  // first-party pages under a product name instead of their real (and, for a
++  // locally-served console, meaningless) URL.
++  virtual std::u16string GetDisplayTextOverride() const;
++
+   // Returns the id of the icon to show to the left of the address, or nullptr
+   // if the icon should be selected by the caller. This is useful for
+   // associating particular URLs with particular schemes without importing
+diff --git a/components/omnibox/browser/location_bar_model_impl.cc b/components/omnibox/browser/location_bar_model_impl.cc
+index 884e042c5a..09c7d05747 100644
+--- a/components/omnibox/browser/location_bar_model_impl.cc
++++ b/components/omnibox/browser/location_bar_model_impl.cc
+@@ -53,6 +53,12 @@ std::u16string LocationBarModelImpl::GetFormattedFullURL() const {
+   if (IsContextualTasksPage()) {
+     return GetContextualTasksDisplayURL();
+   }
++  // Checked here as well as in GetURLForDisplay so that focusing the omnibox
++  // does not reveal the URL the display text was standing in for.
++  if (std::u16string override = delegate_->GetDisplayTextOverride();
++      !override.empty()) {
++    return override;
++  }
+   return GetFormattedURL(url_formatter::kFormatUrlOmitDefaults);
+ }
+ 
+@@ -63,6 +69,11 @@ std::u16string LocationBarModelImpl::GetURLForDisplay() const {
+     return GetContextualTasksDisplayURL();
+   }
+ 
++  if (std::u16string override = delegate_->GetDisplayTextOverride();
++      !override.empty()) {
++    return override;
++  }
++
+   url_formatter::FormatUrlTypes format_types =
+       url_formatter::kFormatUrlOmitDefaults;
+   if (delegate_->ShouldTrimDisplayUrlAfterHostName()) {
+-- 
+2.52.0.windows.1
+

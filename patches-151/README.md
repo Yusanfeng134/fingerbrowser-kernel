@@ -32,8 +32,41 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0009 | rename-kernel-executable | 产物改名 | chrome/BUILD.gn 等（chrome.exe → yunbrowser.exe）|
 | 0010 | fingerbrowser-window-icon | 环境级图标 | browser_view.cc（`--yunlogin-window-icon`，窗口与任务栏双路接线）|
 | 0011 | fingerbrowser-capabilities-manifest | 能力清单 | chrome/BUILD.gn + generate_capabilities.py（构建产出 `yunbrowser.capabilities.json`）|
+| 0012 | build-blink-generators-utf8 | 构建环境 | blink 代码生成器显式 UTF-8 读写（中文 Windows）|
+| 0013 | fingerbrowser-console-omnibox | 管理台地址栏 | location_bar_model（显示产品名而非本地服务 URL、挂锁、只读）|
+
+> **⚠ 本补丁集尚不能完整复现分支。** 将 0001–0013 应用到纯净 151 后与分支 HEAD
+> 比对，仍有 **210 个文件**不一致——全部是尚未导出成补丁的客户端外壳工作：
+> Voyager 侧栏（WebUI、coordinator、资源）、垂直标签栏（`--fp-vertical-tabs`）、
+> `--fp-pinned-url` 的钉标签实现，以及约 190 个品牌翻译 `.xtb`。
+> 已导出的 13 个补丁各自**逐字节完整**，缺的是尚未导出的部分。补齐前，
+> 不要把「补丁全部干净应用」当作「内核可从纯净 151 重建」。
 
 > **0009 为何单独成一个补丁**：0011 的清单产物名依赖改名，而 `chrome/BUILD.gn` 里改名与清单两处改动在同一文件、无法按文件拆分，故按提交顺序分层导出。0009 必须在 0011 之前应用。
+
+### 0013 说明：管理台地址栏
+
+客户端把管理台交给内核作为启动页打开，页面由本地 HTTP 服务提供，端口是 `listen(0)` 由系统分配，因此地址栏显示 `http://127.0.0.1:53483/#/yunlogin-environments`——一个用户用不上、每次启动还都不一样的实现细节。改为显示 `--fp-console-title` 指定的产品名。URL 复用客户端已在下发的 `--fp-pinned-url`。
+
+**分层刻意做薄**：`components/omnibox` 只加一个默认返回空串的虚函数 `GetDisplayTextOverride()` 与两处转发（共 14 行），产品逻辑全在 `chrome/` 下。本补丁集已在 `base/` 欠了一处（0008 的 `ScopedAllowBlocking` 白名单），不宜再欠一处 `components/`。
+
+**顺着上游已有形状**：`LocationBarModelImpl` 那两个函数的第一行本就是 `if (IsContextualTasksPage()) return GetContextualTasksDisplayURL()`，即 Chromium 自己就为特殊页面替换 omnibox 显示文本；图标用委托层现成的 `GetVectorIconOverride()`。
+
+- **按 origin 相等匹配，不是整串 URL**——管理台是单页应用，路由在 fragment 里（`#/yunlogin-environments`），整串比对一换路由即失效。**勿"优化"成整串比对。**
+- **不改 `GetSecurityLevel()`**，只换图标与文字。安全等级还喂给权限决策与页面信息气泡。
+- **挂锁用 `vector_icons::kLockIcon` 而非 SECURE 图标**——自 M117 起 SECURE 的字形是 page-info 控件，摆在产品名旁边像个按钮而不像陈述。
+
+> **安全边界**：改写 omnibox 显示正是浏览器严防的欺骗行为，故规则绑死三件事——只匹配启动时传入的那个 origin、强制 loopback、只作用于顶层框架。放松成「任意 127.0.0.1」的话，本机任何进程起个服务就能取得一个带锁的可信外观。
+>
+> **需要说明的取舍**：管理台是明文 HTTP，本机任意进程可连，挂锁在严格意义上**高于实际保证**。这是有意识的取舍——origin 由我们自己在启动时传入、强制 loopback、且安全等级未被篡改，暴露面可控。
+
+地址栏在显示产品名时**置为只读**：否则用户可覆盖产品名把管理台标签导航走，而端口是本次启动随机分配的，他无法重新输入回来。
+
+验证（三次启动，端口 49871 / 52250 / 62419 均由 `listen(0)` 分配）：显示产品名 ✅ 挂锁 ✅ 点击不露出 URL 且不可输入 ✅ 换 hash 路由仍显示产品名 ✅ `/settings` 子路径仍显示产品名 ✅ **反例：新标签页 `example.com` 正常显示域名 ✅**
+
+> 反例是验收重点：前五条只证明「能改」，第六条才证明「不会乱改」——匹配规则若放松，前五条照样全过，而用户会发现访问任何网站地址栏都变成产品名。
+
+不传 `--fp-console-title` 时行为完全不变，客户端可自行决定何时下发。
 
 ### 0008 说明：亚马逊安全密钥（passkey）支持
 

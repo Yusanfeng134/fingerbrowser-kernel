@@ -1,0 +1,96 @@
+From a28ba69638e6d117fd09912253ef74d601927f9e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 02:34:54 +0800
+Subject: [PATCH] =?UTF-8?q?=E6=9E=84=E5=BB=BA=EF=BC=9Ablink=20=E4=BB=A3?=
+ =?UTF-8?q?=E7=A0=81=E7=94=9F=E6=88=90=E5=99=A8=E6=98=BE=E5=BC=8F=E4=BD=BF?=
+ =?UTF-8?q?=E7=94=A8=20UTF-8=20=E8=AF=BB=E5=86=99=EF=BC=8C=E4=BF=AE?=
+ =?UTF-8?q?=E4=B8=AD=E6=96=87=20Windows=20=E4=B8=8A=E7=9A=84=E6=9E=84?=
+ =?UTF-8?q?=E5=BB=BA=E4=B8=AD=E6=96=AD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+json5_generator.py 与 in_generator.py 在写生成文件前会先读回旧内容做比对
+（内容未变则不写，好让 ninja 跳过下游重建）。这个 open() 没有指定 encoding，
+于是使用宿主 locale：中文 Windows 上是 GBK，而生成的源码是 UTF-8，读取即抛
+UnicodeDecodeError，构建中断。
+
+这个缺陷会潜伏很久才发作：首次生成时文件不存在，只写不读，不触发；只有当
+生成器再次运行（改动任一 *.json5 输入，或上一次构建失败被 ninja 标脏重试）
+且文件已存在时才会撞上。本次是被一次内存不足导致的重试翻出来的。
+
+实测症状：
+  make_computed_style_base.py -> json5_generator.py:316 _write_file_if_changed
+  UnicodeDecodeError: 'gbk' codec can't decode byte 0x9d in position 118917
+
+除显式 encoding 外，读取失败时按「内容有变」处理并重写，而不是让构建挂掉：
+磁盘上可能残留任何历史编码写下的文件，而这次读取的唯一目的只是省一次写。
+重写前 seek(0)，避免 truncate 后位置非零留下空洞。
+
+同族问题此前已修过一次（patches-151 的 0001，中文 Windows 的 ACL 解码），
+但那次只覆盖了 testing/scripts。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../renderer/build/scripts/in_generator.py     | 13 +++++++++++--
+ .../renderer/build/scripts/json5_generator.py  | 18 ++++++++++++++++--
+ 2 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/third_party/blink/renderer/build/scripts/in_generator.py b/third_party/blink/renderer/build/scripts/in_generator.py
+index b8155805ea..ff8d55b8db 100644
+--- a/third_party/blink/renderer/build/scripts/in_generator.py
++++ b/third_party/blink/renderer/build/scripts/in_generator.py
+@@ -57,9 +57,18 @@ class GenericWriter(object):
+ 
+         # Only write the file if the contents have changed. This allows ninja to
+         # skip rebuilding targets which depend on the output.
+-        with open(path, "a+") as output_file:
++        # FingerBrowser: see the matching comment in json5_generator.py --
++        # without an explicit encoding this reads generated UTF-8 sources using
++        # the host locale (GBK on a Chinese Windows machine) and fails the build
++        # on the second run.
++        with open(path, "a+", encoding="utf-8") as output_file:
+             output_file.seek(0)
+-            if output_file.read() != contents:
++            try:
++                unchanged = output_file.read() == contents
++            except UnicodeDecodeError:
++                unchanged = False
++            if not unchanged:
++                output_file.seek(0)
+                 output_file.truncate(0)
+                 output_file.write(contents)
+ 
+diff --git a/third_party/blink/renderer/build/scripts/json5_generator.py b/third_party/blink/renderer/build/scripts/json5_generator.py
+index fa11cd0941..dd15a5f64a 100644
+--- a/third_party/blink/renderer/build/scripts/json5_generator.py
++++ b/third_party/blink/renderer/build/scripts/json5_generator.py
+@@ -311,9 +311,23 @@ class Writer(object):
+ 
+         # Only write the file if the contents have changed. This allows ninja to
+         # skip rebuilding targets which depend on the output.
+-        with open(path, "a+", newline='') as output_file:
++        # FingerBrowser: encoding must be explicit. Without it Python uses the
++        # locale encoding, which on a Chinese Windows host is GBK -- generated
++        # sources are UTF-8, so reading one back to compare raises
++        # UnicodeDecodeError and fails the build. This only surfaces on a
++        # re-run, since the first generation writes without reading, which is
++        # why it can lie dormant for weeks.
++        with open(path, "a+", encoding="utf-8", newline='') as output_file:
+             output_file.seek(0)
+-            if output_file.read() != contents:
++            try:
++                unchanged = output_file.read() == contents
++            except UnicodeDecodeError:
++                # A file left behind by a build under a different locale is not
++                # decodable here. Rewrite it rather than failing: the goal of
++                # the read is only to skip needless writes.
++                unchanged = False
++            if not unchanged:
++                output_file.seek(0)
+                 output_file.truncate(0)
+                 output_file.write(contents)
+ 
+-- 
+2.52.0.windows.1
+
