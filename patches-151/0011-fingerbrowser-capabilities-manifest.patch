@@ -1,0 +1,118 @@
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index e87a7934ed..1b6cdea0fc 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -156,6 +156,29 @@ if (!is_android && !is_mac) {
+     if (is_win) {
+       public_deps += [ ":reorder_imports" ]
+       data_deps += [ ":reorder_imports" ]
++      public_deps += [ ":fingerbrowser_capabilities" ]
++      data_deps += [ ":fingerbrowser_capabilities" ]
++    }
++  }
++
++  if (is_win) {
++    # FingerBrowser：把这份内核支持的能力写成 exe 旁边的一份清单，供客户端判断
++    # 该开放哪些设置。
++    #
++    # 之所以不是让内核自报（例如 --yunlogin-capabilities）：老内核不认识新开关，
++    # Chromium 会忽略未知开关并照常启动，于是客户端每探测一次就弹出一个浏览器
++    # 窗口。读文件不启动任何进程；老内核天然没有这份文件，能力全判 false，正是
++    # 需要的降级方向。
++    action("fingerbrowser_capabilities") {
++      script = "//chrome/browser/fingerbrowser/generate_capabilities.py"
++      inputs = [ "//chrome/VERSION" ]
++      outputs = [ "$root_out_dir/yunbrowser.capabilities.json" ]
++      args = [
++        "--version-file",
++        rebase_path("//chrome/VERSION", root_build_dir),
++        "--output",
++        rebase_path(outputs[0], root_build_dir),
++      ]
+     }
+   }
+ 
+diff --git a/chrome/browser/fingerbrowser/generate_capabilities.py b/chrome/browser/fingerbrowser/generate_capabilities.py
+new file mode 100644
+index 0000000000..6d4bb67dc8
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/generate_capabilities.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++"""生成内核能力清单，供客户端判断这份内核支持哪些特性。
++
++为什么是旁挂文件而不是让内核自报（例如 --yunlogin-capabilities）：老内核不认识
++新开关，Chromium 对未知开关的处理是忽略并照常启动，于是客户端每探测一次就会
++弹出一个浏览器窗口。加超时再杀进程树是在跟已经发生的副作用赛跑——窗口仍会闪现，
++还得处理 profile 目录与锁文件残留。读一个静态文件不启动任何进程，而且老内核
++天然没有这份文件，能力全部判为 false，降级方向正好是对的。
++
++约定：
++  schema        本文件的格式版本，不是内核版本。结构变更时递增，客户端按 schema
++                分支解析；读到不认识的 schema 应整体判为不支持。
++  kernel        仅供日志与排查，客户端不得据此判断能力。
++  capabilities  布尔表示「有没有」，数字表示「第几版」。
++                **未列出的键一律视为 false** —— 因此新增能力时只需在此追加一行，
++                不必回头修改历史文件。
++"""
++
++import argparse
++import json
++import os
++import sys
++
++
++def read_kernel_version(version_file):
++    """从 chrome/VERSION 读出 MAJOR.MINOR.BUILD.PATCH。"""
++    parts = {}
++    with open(version_file, encoding='utf-8') as handle:
++        for line in handle:
++            line = line.strip()
++            if not line or '=' not in line:
++                continue
++            key, _, value = line.partition('=')
++            parts[key.strip()] = value.strip()
++    try:
++        return '.'.join(
++            parts[key] for key in ('MAJOR', 'MINOR', 'BUILD', 'PATCH'))
++    except KeyError as missing:
++        raise SystemExit(
++            f'{version_file} 缺少字段 {missing}，无法确定内核版本') from missing
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--version-file', required=True,
++                        help='chrome/VERSION 的路径')
++    parser.add_argument('--output', required=True, help='输出的 json 路径')
++    args = parser.parse_args()
++
++    manifest = {
++        'schema': 1,
++        'kernel': read_kernel_version(args.version_file),
++        # 只列出「已实现且经过验证」的能力。宣称一项尚未落地的能力，会让客户端
++        # 把开关开给用户，而设置完全不生效——那比暂时不提供更难排查。
++        'capabilities': {
++            # 环境级窗口/任务栏图标：--yunlogin-window-icon=<ico 路径>
++            'windowIcon': True,
++            # 每环境软件 passkey 认证器：policy 的 passkeyAuthenticator
++            'passkeyAuthenticator': True,
++            # --fingerbrowser-policy 所接受的 schemaVersion
++            'fingerprintPolicy': 1,
++        },
++    }
++
++    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
++    # 固定 newline，避免在不同平台上产出内容相同但字节不同的文件。
++    with open(args.output, 'w', encoding='utf-8', newline='\n') as handle:
++        json.dump(manifest, handle, indent=2, ensure_ascii=False)
++        handle.write('\n')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

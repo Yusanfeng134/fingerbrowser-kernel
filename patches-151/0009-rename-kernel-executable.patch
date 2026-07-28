@@ -1,0 +1,109 @@
+diff --git a/build/win/reorder-imports.py b/build/win/reorder-imports.py
+index 88851609d4..7344508754 100755
+--- a/build/win/reorder-imports.py
++++ b/build/win/reorder-imports.py
+@@ -15,17 +15,24 @@ sys.path.insert(
+                  'pefile_py3'))
+ import pefile
+ 
+-def reorder_imports(input_dir, output_dir, architecture):
++def reorder_imports(input_dir, output_dir, architecture,
++                    output_name='chrome.exe'):
+   """Swap chrome_elf.dll to be the first import of chrome.exe.
+   Also copy over any related files that might be needed
+   (pdbs, manifests etc.).
++
++  output_name lets a fork ship the browser under its own executable name
++  (FingerBrowser/云登 uses yunbrowser.exe). Only the final image is renamed:
++  the intermediate initialexe/chrome.exe and the side files copied below keep
++  their original names, because the .pdb name is recorded inside the image and
++  renaming the file would break symbol lookup.
+   """
+   # TODO(thakis): See if there is a reliable way to write the
+   # correct executable in the first place, so that this script
+   # only needs to verify that and not write a whole new exe.
+ 
+   input_image = os.path.join(input_dir, 'chrome.exe')
+-  output_image = os.path.join(output_dir, 'chrome.exe')
++  output_image = os.path.join(output_dir, output_name)
+ 
+   # pefile mmap()s the whole executable, and then parses parts of
+   # it into python data structures for ease of processing.
+@@ -87,11 +94,15 @@ def main(argv):
+       metavar='DIR')
+   parser.add_option('-a', '--arch', help='architecture of build (optional)',
+       default='ia32')
++  parser.add_option('-n', '--output-name',
++      help='file name of the final executable (default chrome.exe)',
++      default='chrome.exe')
+   opts, args = parser.parse_args()
+ 
+   if not opts.input or not opts.output:
+     parser.error('Please provide and input and output directory')
+-  return reorder_imports(opts.input, opts.output, opts.arch)
++  return reorder_imports(opts.input, opts.output, opts.arch,
++                         opts.output_name)
+ 
+ if __name__ == "__main__":
+   sys.exit(main(sys.argv[1:]))
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 973a46b2a3..e87a7934ed 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -89,8 +89,17 @@ if (is_win) {
+       "$root_out_dir/initialexe/chrome.exe",
+       "$root_out_dir/initialexe/chrome.exe.pdb",
+     ]
++    # FingerBrowser：最终可执行文件改名为 yunbrowser.exe。
++    #
++    # 动机不是品牌，是安全：内核叫 chrome.exe 时，任务管理器里它和用户真实的
++    # Google Chrome 完全同名，一个店铺环境又是十几个进程。用户想关浏览器时
++    # 「结束任务树」，会连所有店铺环境一起杀掉。
++    #
++    # 只改最终产物：中间产物 initialexe/chrome.exe 和下面 glob 复制的
++    # chrome.exe.pdb 保持原名 —— pdb 的文件名是编进 exe 里的，跟着改会让
++    # 符号查找失效。
+     outputs = [
+-      "$root_out_dir/chrome.exe",
++      "$root_out_dir/yunbrowser.exe",
+       "$root_out_dir/chrome.exe.pdb",
+     ]
+     args = [
+@@ -100,6 +109,8 @@ if (is_win) {
+       rebase_path("$root_out_dir", root_build_dir),
+       "-a",
+       current_cpu,
++      "-n",
++      "yunbrowser.exe",
+     ]
+     deps = [ ":chrome_initial" ]
+   }
+diff --git a/chrome/app/chrome_exe.ver b/chrome/app/chrome_exe.ver
+index a2d39013f5..a9f6453ab2 100644
+--- a/chrome/app/chrome_exe.ver
++++ b/chrome/app/chrome_exe.ver
+@@ -1,2 +1,2 @@
+ INTERNAL_NAME=chrome_exe
+-ORIGINAL_FILENAME=chrome.exe
++ORIGINAL_FILENAME=yunbrowser.exe
+diff --git a/chrome/installer/mini_installer/BUILD.gn b/chrome/installer/mini_installer/BUILD.gn
+index 7128e8164e..b913ac046e 100644
+--- a/chrome/installer/mini_installer/BUILD.gn
++++ b/chrome/installer/mini_installer/BUILD.gn
+@@ -148,7 +148,15 @@ action("mini_installer_archive") {
+   inputs = [
+     "$root_out_dir/chrome.dll",
+     "$root_out_dir/chrome_elf.dll",
+-    "$root_out_dir/chrome.exe",
++
++    # FingerBrowser：可执行文件已改名（见 //chrome/BUILD.gn 的 reorder_imports）。
++    # 这里必须跟着改，否则 GN 校验整个构建图时会报「输入没有任何目标生成」，
++    # 连 chrome 目标都 gen 不出来 —— 即使我们从不构建 mini_installer。
++    #
++    # 注意：mini_installer 本身并未适配改名（chrome.release 等清单里仍写
++    # chrome.exe），我们不使用 Windows 安装包，发布走自有客户端分发。
++    # 若将来要用 mini_installer，这条链需要完整适配。
++    "$root_out_dir/yunbrowser.exe",
+     "$root_out_dir/locales/en-US.pak",
+     "$root_out_dir/setup.exe",
+     "//chrome/tools/build/win/makecab.py",

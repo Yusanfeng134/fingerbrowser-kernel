@@ -29,6 +29,11 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0006 | fingerbrowser-webrtc-ip-handling | WebRTC | peer_connection（IP 策略枚举化）|
 | 0007 | fingerbrowser-brand | 品牌 | user_agent_utils（brands 报 Chrome）|
 | 0008 | fingerbrowser-passkey-authenticator | **每环境 passkey 认证器** | content/browser/webauth（策略驱动挂载、AAGUID 归零、加密持久化）、base/threading（ScopedAllowBlocking 白名单）|
+| 0009 | rename-kernel-executable | 产物改名 | chrome/BUILD.gn 等（chrome.exe → yunbrowser.exe）|
+| 0010 | fingerbrowser-window-icon | 环境级图标 | browser_view.cc（`--yunlogin-window-icon`，窗口与任务栏双路接线）|
+| 0011 | fingerbrowser-capabilities-manifest | 能力清单 | chrome/BUILD.gn + generate_capabilities.py（构建产出 `yunbrowser.capabilities.json`）|
+
+> **0009 为何单独成一个补丁**：0011 的清单产物名依赖改名，而 `chrome/BUILD.gn` 里改名与清单两处改动在同一文件、无法按文件拆分，故按提交顺序分层导出。0009 必须在 0011 之前应用。
 
 ### 0008 说明：亚马逊安全密钥（passkey）支持
 
@@ -41,6 +46,8 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 - **环境隔离**：凭据随 profile 走，跨环境不可见。
 
 实测（`probe/run-p1-persistence.cjs`）：注册→关闭浏览器→重开仅登录成功（凭据跨重启存活）；另一 profile 仅登录失败（隔离生效）；存储文件扫不到明文字段名。
+
+真实站点实测（amazon.com，授权测试账号）：买家端与卖家中心均接受注册与登录；AAGUID 归零后，账号页**不再出现 "Chromium 虚拟身份验证器（浏览器开发工具）"**，该条目按平台回退显示为 "Windows Hello"——即与一台普通 Windows 电脑的系统级 passkey 无从区分。（该归属为推断：列表中仅此条可能来自本 Windows 内核，且落盘时间吻合。）
 
 > 实现注记：写盘经线程池异步执行（凭据变更在 UI 线程上报，同步 I/O 会触发 DCHECK 崩溃）；读取需同步（认证器创建时即须持有凭据），故在 `base/threading/thread_restrictions.h` 的 `ScopedAllowBlocking` 白名单中加了 friend。这是本补丁集**唯一改动 `base/` 之处**，rebase 时需留意。
 
