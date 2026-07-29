@@ -1,0 +1,118 @@
+From f82f2cf741d55bb1c6c5ee44f896828f23e6baec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 11:49:06 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E7=A6=81=E7=94=A8=E5=8E=9F?=
+ =?UTF-8?q?=E7=94=9F=20profile=20=E7=9A=84=E5=88=9B=E5=BB=BA=E5=85=A5?=
+ =?UTF-8?q?=E5=8F=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+本产品里「环境」已经占据了 profile 这个位置：环境由客户端创建、带指纹策略、
+在管理台里可见、受隔离管辖。而 IDC_ADD_NEW_PROFILE / IDC_OPEN_GUEST_PROFILE /
+IDC_MANAGE_CHROME_PROFILES 创建的是**原生** profile —— 管理台里看不见、没有
+指纹策略、不受环境隔离管辖，却能上网能登账号。用户点一下就得到一个完全在
+产品管理面之外的浏览环境。
+
+在命令层禁用，而不是在菜单里隐藏。这三个命令至少有三条可达路径：
+
+  1. 头像气泡 ProfileMenuView
+  2. 三点菜单（app_menu_model.cc 的 ProfileSubMenuModel）
+  3. chrome://profile-picker 直接导航
+
+逐个隐藏入口只会让洞更难被看见 —— 菜单里看不见和做不到是两回事。菜单项遵从
+命令启用状态，禁掉命令则现有与将来的入口一并失效。第 3 条不走命令，故单独
+在 fp-shell 下不注册 ProfilePickerUIConfig：不注册即导航失败。两者是同一件事
+的两半。
+
+这两个命令没有绑定快捷键（accelerator_table.cc 中无对应项），故无第四条路径。
+
+门控用 --fp-shell 而非 --fp-active：日常浏览器只带 fp-shell，工作环境两者都带
+（见 fingerbrowser_policy.cc），fp-shell 覆盖两种形态。不传时行为完全不变。
+
+验证（probe/run-profile-hole.cjs + 人工）：
+
+  带 --fp-shell：chrome://profile-picker 被挡
+      profile-picker-app=false，正文 83 字（错误页），标题为 URL
+  不带（反例）：chrome://profile-picker 仍可达
+      profile-picker-app=true，标题「欢迎使用 Yunbrowser 个人资料」
+  人工：三点菜单与头像气泡中该三项均为灰色不可点
+
+验页面内容而非标题：Chromium 在页面加载失败时把 URL 当标题，「标题非空」对
+失败页同样成立，用标题判断会把「被挡住」读成「可达」——初版判据即因此误报。
+
+反例一条不可省：只验「堵住了」而不验「该通的仍通」，无法区分精确堵洞与把
+普通 Chromium 用法一并砸掉。人工两处都要看：改动在命令层，两处同时失效才
+证明这条路走对，只有一处失效说明另一处不走命令、需单独处理。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../browser/ui/browser_command_controller.cc  | 24 ++++++++++++++++---
+ .../browser/ui/webui/chrome_web_ui_configs.cc |  9 ++++++-
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index a457075948..31d812492f 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -1873,9 +1873,27 @@ void BrowserCommandController::InitCommandState() {
+   command_updater_->UpdateCommandEnabled(IDC_CUSTOMIZE_CHROME, true);
+   command_updater_->UpdateCommandEnabled(IDC_CLOSE_PROFILE, true);
+   command_updater_->UpdateCommandEnabled(IDC_MANAGE_GOOGLE_ACCOUNT, true);
+-  command_updater_->UpdateCommandEnabled(IDC_OPEN_GUEST_PROFILE, true);
+-  command_updater_->UpdateCommandEnabled(IDC_ADD_NEW_PROFILE, true);
+-  command_updater_->UpdateCommandEnabled(IDC_MANAGE_CHROME_PROFILES, true);
++  // FingerBrowser：本产品里「环境」已经占据了 profile 这个位置——环境由客户端
++  // 创建、带指纹策略、在管理台里可见、受隔离管辖。而这三个命令创建的是**原生**
++  // profile：管理台里看不见、没有指纹策略、不受环境隔离管辖，却能上网能登账号。
++  // 用户点一下就得到一个完全在产品管理面之外的浏览环境。
++  //
++  // 在命令层禁用，而不是在菜单里隐藏。这两个命令至少有三条可达路径：头像气泡
++  // ProfileMenuView、三点菜单（app_menu_model.cc 的 ProfileSubMenuModel）、以及
++  // chrome://profile-picker 直接导航。逐个隐藏入口只是让洞更难被看见——菜单项
++  // 遵从命令启用状态，禁掉命令则现有与将来的入口一并失效。
++  //
++  // 门控用 --fp-shell 而非 --fp-active：日常浏览器只带 fp-shell，工作环境两者
++  // 都带（见 fingerbrowser_policy.cc），因此 fp-shell 覆盖两种形态。不传时行为
++  // 完全不变，普通 Chromium 用法不受影响。
++  const bool fb_manages_profiles =
++      base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell");
++  command_updater_->UpdateCommandEnabled(IDC_OPEN_GUEST_PROFILE,
++                                         !fb_manages_profiles);
++  command_updater_->UpdateCommandEnabled(IDC_ADD_NEW_PROFILE,
++                                         !fb_manages_profiles);
++  command_updater_->UpdateCommandEnabled(IDC_MANAGE_CHROME_PROFILES,
++                                         !fb_manages_profiles);
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+   if (profile()->IsIncognitoProfile()) {
+diff --git a/chrome/browser/ui/webui/chrome_web_ui_configs.cc b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+index 57666a9740..d3fb382ea2 100644
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/webui/chrome_web_ui_configs.h"
+ 
++#include "base/command_line.h"
+ #include "build/android_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+@@ -486,7 +487,13 @@ void RegisterChromeWebUIConfigs() {
+   map.AddWebUIConfig(std::make_unique<ManagedUserProfileNoticeUIConfig>());
+   map.AddWebUIConfig(std::make_unique<IntroUIConfig>());
+   map.AddWebUIConfig(std::make_unique<ProfileCustomizationUIConfig>());
+-  map.AddWebUIConfig(std::make_unique<ProfilePickerUIConfig>());
++  // FingerBrowser：不注册个人资料选择器。它是原生 profile 的第三条入口——前两条
++  // （头像气泡、三点菜单）已在 browser_command_controller 用命令禁用挡住，但那两条
++  // 都走命令，而地址栏直接输入 chrome://profile-picker 不走命令，会绕过去。
++  // 不注册即导航失败，与禁用命令是同一件事的两半。
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell")) {
++    map.AddWebUIConfig(std::make_unique<ProfilePickerUIConfig>());
++  }
+   map.AddWebUIConfig(std::make_unique<SigninErrorUIConfig>());
+   map.AddWebUIConfig(std::make_unique<SigninEmailConfirmationUIConfig>());
+ #endif  //  !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(IS_ANDROID)
+-- 
+2.52.0.windows.1
+

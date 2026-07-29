@@ -42,6 +42,26 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0018 | fingerbrowser-no-google-signin | 账号 | 工作环境禁登 Google |
 | 0019 | fingerbrowser-stale-console-tabs | 标签清理 | 清掉上次启动遗留的管理台固定标签（依赖 0017）|
 | 0020 | fingerbrowser-newtab-url | 新标签页 | `--fp-newtab-url` 让新标签页打开客户端的 AI 新标签页 |
+| 0021 | fingerbrowser-block-native-profiles | 堵洞 | 禁用原生 profile 的创建入口（命令层 + profile-picker）|
+| 0022 | fingerbrowser-newtab-blank-omnibox | 新标签页 | 新标签页地址栏留空但保持可用（依赖 0020）|
+
+### 0021 说明：为什么在命令层禁而不在菜单里藏
+
+本产品里「环境」已经占据了 profile 这个位置。而 `IDC_ADD_NEW_PROFILE` / `IDC_OPEN_GUEST_PROFILE` / `IDC_MANAGE_CHROME_PROFILES` 创建的是**原生** profile —— 管理台里看不见、没有指纹策略、不受环境隔离管辖，却能上网能登账号。
+
+这三个命令至少有三条可达路径:头像气泡 `ProfileMenuView`、三点菜单（`app_menu_model.cc` 的 `ProfileSubMenuModel`）、以及 `chrome://profile-picker` 直接导航。
+
+> **逐个隐藏入口只会让洞更难被看见。** 菜单里看不见和做不到是两回事。菜单项遵从命令启用状态，禁掉命令则现有与将来的入口一并失效；`chrome://profile-picker` 不走命令，故另在 `--fp-shell` 下不注册它的 WebUIConfig。两者是同一件事的两半。
+
+### 0022 说明：与 0013 语义相反，不可套用
+
+管理台是**产品名 + 挂锁 + 只读**；新标签页**必须能输入**。两者同源（同一份产物、同一个本地服务）而语义相反。
+
+走 `ShouldDisplayURL()`（原生 NTP 用的机制）而非显示文本覆盖：前者给出空地址栏 + 占位文案**且保持可聚焦、可输入、可导航**，后者只能做到「看起来是空的」。该函数逐次按当前 URL 求值，故导航到真实网站后立刻显示真实域名。
+
+> **只取「不显示 URL」一条、沿用 0013 的只读，就会把 0020 修掉的那个回归重新造出来。**
+>
+> 判定统一在 `IsNewTabUrl()`，不再内联：0013 的规则要**排除**它，0022 要**命中**它——同一条规则散在两处迟早只被改一处，而漂移后的症状是静默的。
 
 ### 0020 说明：与 0013 的同源冲突
 

@@ -1,0 +1,137 @@
+From dc0722e9f93c82b113a88b0c39b098ca60d52668 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 11:49:33 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20AI=20=E6=96=B0=E6=A0=87?=
+ =?UTF-8?q?=E7=AD=BE=E9=A1=B5=E7=9A=84=E5=9C=B0=E5=9D=80=E6=A0=8F=E7=95=99?=
+ =?UTF-8?q?=E7=A9=BA=EF=BC=8C=E4=B8=8E=E5=8E=9F=E7=94=9F=E6=96=B0=E6=A0=87?=
+ =?UTF-8?q?=E7=AD=BE=E9=A1=B5=E4=B8=80=E8=87=B4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+新标签页的真实地址是 http://127.0.0.1:<每次启动都变的端口>/newtab#/ai-newtab。
+复制给同事、存书签、下次手输全是死的 —— 一个天然无法被引用的地址，却摆在最
+适合复制引用的位置。用户需要知道的是「这是新标签页」，不是本机某服务的某条
+路由。原生 NTP 的地址栏本就是空的，换了实现不该连带把外观降级。
+
+走 ShouldDisplayURL() 而不是 GetDisplayTextOverride()：前者正是原生 NTP 用的
+机制，返回 false 即空地址栏加占位文案，**且地址栏保持可聚焦、可输入、可导航**
+—— 用户开新标签本来就是为了敲网址。显示文本覆盖只能做到「看起来是空的」，做
+不到这一点，两者的差别恰好是这个需求的要害。
+
+该函数逐次按当前 URL 求值，故导航到真实网站后立刻显示真实域名，不会出现「对
+这个标签永远显示空」那种真正的地址栏欺骗。
+
+不能沿用管理台那条规则。管理台是产品名 + 挂锁 + 只读，那是对的：那个标签就是
+应用本身，且端口随机导致导航走之后输不回来。新标签页恰恰相反，它必须能输入。
+两者同源（同一份产物、同一个本地服务）而语义相反 —— 只取「不显示 URL」一条、
+沿用只读，就会把 0020 修掉的那个回归重新造出来。
+
+同时把「这是不是新标签页」的判定抽成 IsNewTabUrl()，不再内联在 IsConsoleUrl()
+里。两个调用方要的是相反的东西：管理台规则要排除它（地址栏必须可用），本改动
+要命中它（地址栏留空）。同一条规则散在两处迟早只被改一处，而漂移后的症状是
+静默的 —— 可能同时「地址栏空着」又「只读」，也可能两条都不生效。
+
+验证（人工，地址栏是原生 UI，CDP 读不到）：
+- Ctrl+T 后地址栏为空且有占位文案 ✓
+- 在其中输入网址回车可正常导航 ✓
+- 导航到真实网站后地址栏显示真实域名 ✓（反例，防「永远显示空」）
+- 管理台标签仍显示产品名 + 挂锁 + 只读 ✓（防排除写宽）
+
+第三条是本需求的反例验收点：只验「地址栏不再显示 127.0.0.1」，一个对该标签
+永远显示空的实现照样通过。第四条与之成对，缺一不可。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser/fingerbrowser_console.cc     | 13 ++++++++-----
+ .../fingerbrowser/fingerbrowser_console.h      | 13 +++++++++++++
+ .../chrome_location_bar_model_delegate.cc      | 18 ++++++++++++++++++
+ 3 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.cc b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+index 99279a0f41..8273a0ee4a 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+@@ -57,6 +57,12 @@ const GURL& GetNewTabUrl() {
+   return *url;
+ }
+ 
++bool IsNewTabUrl(const GURL& url) {
++  const GURL& newtab = GetNewTabUrl();
++  return newtab.is_valid() && url.is_valid() && url.path() == newtab.path() &&
++         url::Origin::Create(url) == url::Origin::Create(newtab);
++}
++
+ bool IsConsoleUrl(const GURL& url) {
+   const url::Origin& console = ConsoleOrigin();
+   // An opaque origin means the console was never configured; it must not
+@@ -70,11 +76,8 @@ bool IsConsoleUrl(const GURL& url) {
+   // The AI new tab page comes off the same local server, so it shares the
+   // console's origin -- but it is a browsing surface. Treating it as the
+   // console would rewrite its address bar and make that bar read-only, leaving
+-  // the user unable to type a URL in a new tab. Matched by path because both
+-  // are hash-routed: the console lives at "/" with routes in the fragment,
+-  // the new tab page at "/newtab".
+-  if (const GURL& newtab = GetNewTabUrl();
+-      newtab.is_valid() && url.path() == newtab.path()) {
++  // the user unable to type a URL in a new tab.
++  if (IsNewTabUrl(url)) {
+     return false;
+   }
+ 
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.h b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+index 4a779980e6..abb9e6b2f4 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+@@ -46,6 +46,19 @@ bool IsConsoleUrl(const GURL& url);
+ // granting privileges here would hand every new tab the console's API surface.
+ const GURL& GetNewTabUrl();
+ 
++// Returns true if `url` is the AI new tab page.
++//
++// Matched by path, not by whole URL: the page is hash-routed, so the fragment
++// changes as the user moves inside it while the path stays put. The console is
++// hash-routed at "/" and this page at "/newtab" -- that difference is the only
++// thing separating them, since they share an origin.
++//
++// Single definition on purpose. Two callers depend on it and they want opposite
++// things: the console rules must exclude this page (its address bar has to stay
++// usable), while the omnibox must blank the address for it. Two copies of the
++// rule would drift, and the drift would be silent.
++bool IsNewTabUrl(const GURL& url);
++
+ // Returns true if `url` looks like a management console left over from an
+ // earlier launch: a loopback http(s) origin that is not this launch's console.
+ //
+diff --git a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
+index 708f393585..ef9be03075 100644
+--- a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
++++ b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
+@@ -103,6 +103,24 @@ bool ChromeLocationBarModelDelegate::ShouldDisplayURL() const {
+     return true;
+   }
+ 
++  // FingerBrowser：AI 新标签页的地址栏留空，与原生新标签页一致。
++  //
++  // 它的真实地址是 http://127.0.0.1:<每次启动都变的端口>/newtab#/ai-newtab ——
++  // 复制给别人、存书签、下次手输全是死的，是一个天然无法被引用的地址，却摆在
++  // 最适合复制引用的位置。用户需要知道的是「这是新标签页」，不是本机某服务的
++  // 某条路由。
++  //
++  // 走 ShouldDisplayURL 而不是 GetDisplayTextOverride：这正是原生 NTP 用的那条
++  // 机制，返回 false 即空地址栏加占位文案，**且地址栏保持可聚焦、可输入、可导航**
++  // —— 用户开新标签本来就是为了敲网址。用显示文本覆盖只能做到「看起来是空的」，
++  // 做不到这一点。
++  //
++  // 逐次按当前 URL 求值，所以导航到真实网站后立刻显示真实域名：不会出现「对这个
++  // 标签永远显示空」那种真正的地址栏欺骗。
++  if (GURL url; GetURL(&url) && fingerbrowser::IsNewTabUrl(url)) {
++    return false;
++  }
++
+   security_interstitials::SecurityInterstitialTabHelper*
+       security_interstitial_tab_helper =
+           security_interstitials::SecurityInterstitialTabHelper::
+-- 
+2.52.0.windows.1
+
