@@ -1,0 +1,679 @@
+diff --git a/chrome/browser/resources/BUILD.gn b/chrome/browser/resources/BUILD.gn
+index 11c3e254f5..678d13b99b 100644
+--- a/chrome/browser/resources/BUILD.gn
++++ b/chrome/browser/resources/BUILD.gn
+@@ -90,6 +90,7 @@ group("resources") {
+       "side_panel/reading_list:resources",
+       "side_panel/shared:resources",
+       "side_panel/tabs_from_other_devices:resources",
++      "side_panel/voyager:resources",
+       "signin:resources",
+       "suggest_internals:resources",
+       "support_tool:resources",
+@@ -230,6 +231,7 @@ if (enable_webui_generate_code_cache) {
+       "side_panel/reading_list:code_cache_resources",
+       "side_panel/shared:code_cache_resources",
+       "side_panel/tabs_from_other_devices:code_cache_resources",
++      "side_panel/voyager:code_cache_resources",
+       "webui_toolbar:code_cache_resources",
+     ]
+   }
+diff --git a/chrome/browser/resources/side_panel/voyager/BUILD.gn b/chrome/browser/resources/side_panel/voyager/BUILD.gn
+new file mode 100644
+index 0000000000..b750694d37
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/voyager/BUILD.gn
+@@ -0,0 +1,27 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//ui/webui/resources/tools/build_webui.gni")
++import("//ui/webui/webui_features.gni")
++
++assert(!is_android)
++
++build_webui("build") {
++  grd_prefix = "side_panel_voyager"
++
++  static_files = [ "voyager.html" ]
++
++  ts_files = [
++    "app.html.ts",
++    "app.ts",
++  ]
++
++  ts_deps = [
++    "//third_party/lit/v3_0:build_ts",
++    "//ui/webui/resources/js:build_ts",
++  ]
++
++  webui_context_type = "trusted"
++  generate_code_cache = enable_webui_generate_code_cache
++}
+diff --git a/chrome/browser/resources/side_panel/voyager/app.html.ts b/chrome/browser/resources/side_panel/voyager/app.html.ts
+new file mode 100644
+index 0000000000..4f5dc0c751
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/voyager/app.html.ts
+@@ -0,0 +1,15 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {VoyagerAppElement} from './app.js';
++
++export function getHtml(this: VoyagerAppElement) {
++  return html`<!--_html_template_start_-->
++<div style="padding: 16px; font-size: 13px;">
++  Voyager 侧栏探针
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/side_panel/voyager/app.ts b/chrome/browser/resources/side_panel/voyager/app.ts
+new file mode 100644
+index 0000000000..d1011d0572
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/voyager/app.ts
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import '/strings.m.js';
++
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import {getHtml} from './app.html.js';
++
++// 最小侧栏：只渲染一行文字，不接 mojo。用途是量 WebUI 这条链路的接线成本与
++// 迭代速度，不是产品形态。真正的环境列表要接主进程数据后再谈。
++export class VoyagerAppElement extends CrLitElement {
++  static get is() {
++    return 'voyager-app';
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'voyager-app': VoyagerAppElement;
++  }
++}
++
++customElements.define(VoyagerAppElement.is, VoyagerAppElement);
+diff --git a/chrome/browser/resources/side_panel/voyager/voyager.html b/chrome/browser/resources/side_panel/voyager/voyager.html
+new file mode 100644
+index 0000000000..6ae4fce839
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/voyager/voyager.html
+@@ -0,0 +1,28 @@
++<!doctype html>
++<html dir="$i18n{textdirection}" lang="$i18n{language}">
++<head>
++  <meta charset="utf-8">
++  <title>$i18n{title}</title>
++  <meta name="color-scheme" content="light dark">
++  <link rel="stylesheet" href="chrome://resources/css/text_defaults_md.css">
++  <link rel="stylesheet" href="chrome://theme/colors.css?sets=ui,chrome">
++  <style>
++    html,
++    body {
++      height: 100%;
++      margin: 0;
++      padding: 0;
++      width: 100%;
++    }
++
++    body {
++      background: var(--color-side-panel-content-background);
++      overflow: hidden;
++    }
++  </style>
++  <script type="module" src="app.js"></script>
++</head>
++<body>
++  <voyager-app></voyager-app>
++</body>
++</html>
+diff --git a/chrome/browser/ui/actions/chrome_action_id.h b/chrome/browser/ui/actions/chrome_action_id.h
+index 1a6acad48b..3862c3dacb 100644
+--- a/chrome/browser/ui/actions/chrome_action_id.h
++++ b/chrome/browser/ui/actions/chrome_action_id.h
+@@ -573,7 +573,8 @@
+   E(kActionSidePanelShowSideSearch) \
+   E(kActionSidePanelShowMerchantTrust) \
+   E(kActionSidePanelShowTabsFromOtherDevices, \
+-    IDC_SHOW_TABS_FROM_OTHER_DEVICES_SIDE_PANEL)
++    IDC_SHOW_TABS_FROM_OTHER_DEVICES_SIDE_PANEL) \
++  E(kActionSidePanelShowVoyager)
+ 
+ #define TOOLBAR_PINNABLE_ACTION_IDS \
+   E(kActionHome, IDC_HOME) \
+diff --git a/chrome/browser/ui/browser_actions.cc b/chrome/browser/ui/browser_actions.cc
+index 812961aed2..9550915e07 100644
+--- a/chrome/browser/ui/browser_actions.cc
++++ b/chrome/browser/ui/browser_actions.cc
+@@ -147,6 +147,7 @@
+ #include "chrome/browser/ui/views/side_panel/history/history_side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/history_clusters/history_clusters_side_panel_utils.h"
+ #include "chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_coordinator.h"
++#include "chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/tabs/groups/recent_activity_bubble_dialog_view.h"
+ #include "chrome/browser/ui/views/toolbar/ai_overlay_toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/chrome_labs/chrome_labs_coordinator.h"
+@@ -359,6 +360,16 @@ void BrowserActions::InitializeSidePanelActions() {
+                         kActionSidePanelShowTabsFromOtherDevices, bwi, true)
+             .Build());
+   }
++  if (VoyagerSidePanelCoordinator::IsSupported(profile)) {
++    root_action_item_->AddChild(
++        SidePanelAction(SidePanelEntryId::kVoyager, IDS_SIDE_PANEL_VOYAGER_TITLE,
++                        IDS_SIDE_PANEL_VOYAGER_TITLE,
++                        features::IsRoundedIconsEnabled()
++                            ? kDevicesIcon
++                            : kDevicesChromeRefreshOldIcon,
++                        kActionSidePanelShowVoyager, bwi, true)
++            .Build());
++  }
+   root_action_item_->AddChild(
+       SidePanelAction(SidePanelEntryId::kAboutThisSite,
+                       IDS_PAGE_INFO_ABOUT_THIS_PAGE_TITLE,
+diff --git a/chrome/browser/ui/side_panel/side_panel_entry_id.h b/chrome/browser/ui/side_panel/side_panel_entry_id.h
+index f77bd9c8db..e3033c4c31 100644
+--- a/chrome/browser/ui/side_panel/side_panel_entry_id.h
++++ b/chrome/browser/ui/side_panel/side_panel_entry_id.h
+@@ -43,6 +43,7 @@
+   V(kTabsFromOtherDevices, kActionSidePanelShowTabsFromOtherDevices,          \
+     "TabsFromOtherDevices")                                                   \
+   V(kSidePanelDev, std::nullopt, "SidePanelDev")                              \
++  V(kVoyager, kActionSidePanelShowVoyager, "Voyager")                         \
+   /* Extensions (nothing more should be added below here) */                  \
+   V(kExtension, std::nullopt, "Extension")
+ 
+diff --git a/chrome/browser/ui/tabs/features.cc b/chrome/browser/ui/tabs/features.cc
+index 483be333e7..19c66eac37 100644
+--- a/chrome/browser/ui/tabs/features.cc
++++ b/chrome/browser/ui/tabs/features.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/features.h"
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -103,9 +104,26 @@ BASE_FEATURE(kMigrateEverythingMenuPinnedToTabstrip,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ bool IsVerticalTabsFeatureEnabled() {
++  // 垂直标签栏由 fp-vertical-tabs 单独门控，不跟 fp-shell 绑在一起。三个开关职责：
++  //   fp-active         —— 指纹伪装。只有工作环境该带；日常 profile 绝不能带，否则
++  //                        用户登自己的邮箱、银行会一直触发风控。
++  //   fp-shell          —— 外壳能力（AI 侧栏、固定管理台标签）。日常与工作都要 ——
++  //                        侧栏恰恰在工作环境里最有用（读店铺页面）。
++  //   fp-vertical-tabs  —— 垂直标签栏默认开。只有日常外壳带。
++  //
++  // 为什么把垂直标签栏从 fp-shell 里拆出来：工作环境窗口通常只有 1~5 个标签，而侧栏
++  // 要占约 230px（1366 宽的屏上是 17%），而且卖家后台自己就有左侧菜单，叠起来是两条
++  // 竖栏压着宽表格。垂直标签栏的收益要到 20+ 标签才显现，那是管理台那边的场景。
++  //
++  // 这只是改默认值：pref 按 profile 存，用户在工作环境里手动开一次就会一直保留。
++  //
++  // 刻意不改 kVerticalTabs 自身的默认值：那会让普通 Chromium 构建也一起变，
++  // 与上游的差异越大，rebase 时越容易冲突。挂在自家开关上，上游怎么演进都不碰。
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("fp-vertical-tabs")) {
++    return true;
++  }
+   return base::FeatureList::IsEnabled(kVerticalTabs) ||
+          base::FeatureList::IsEnabled(kVerticalTabsLaunch);
+-  ;
+ }
+ 
+ bool IsVerticalTabsExpandOnHoverFeatureEnabled() {
+diff --git a/chrome/browser/ui/tabs/tab_strip_prefs.cc b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+index 642edd40ab..c0257705cb 100644
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+ 
++#include "base/command_line.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -30,7 +31,14 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+           tabs::kMigrateEverythingMenuPinnedToTabstrip));
+   registry->RegisterBooleanPref(
+       prefs::kEverythingMenuPinnedToTabstripMigrationComplete, false);
+-  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabled, false);
++  // feature 只决定「能不能用」，这个 pref 决定「默认开不开」。两个都要，缺一个
++  // 就是启动后仍是水平标签、只多出一个切换按钮（实测过）。
++  //
++  // 用默认值而不是强制写入：用户在浏览器里手动切回水平标签后，选择会被保存并
++  // 覆盖默认值，下次启动仍然生效。
++  registry->RegisterBooleanPref(
++      prefs::kVerticalTabsEnabled,
++      base::CommandLine::ForCurrentProcess()->HasSwitch("fp-vertical-tabs"));
+   registry->RegisterBooleanPref(
+       prefs::kVerticalTabsExpandOnHoverEnabled,
+       tabs::kVerticalTabsExpandOnHoverDefaultEnabled.Get());
+diff --git a/chrome/browser/ui/views/side_panel/BUILD.gn b/chrome/browser/ui/views/side_panel/BUILD.gn
+index 7fcad1f062..72d96e5209 100644
+--- a/chrome/browser/ui/views/side_panel/BUILD.gn
++++ b/chrome/browser/ui/views/side_panel/BUILD.gn
+@@ -58,6 +58,8 @@ source_set("side_panel") {
+     "tabs_from_other_devices/tabs_from_other_devices_side_panel_coordinator.h",
+     "tabs_from_other_devices/tabs_from_other_devices_side_panel_metrics.cc",
+     "tabs_from_other_devices/tabs_from_other_devices_side_panel_metrics.h",
++    "voyager/voyager_side_panel_coordinator.cc",
++    "voyager/voyager_side_panel_coordinator.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -137,6 +139,7 @@ source_set("side_panel") {
+     "//chrome/browser/ui/webui/side_panel/history",
+     "//chrome/browser/ui/webui/side_panel/history_clusters",
+     "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices",
++    "//chrome/browser/ui/webui/side_panel/voyager",
+     "//chrome/browser/ui/webui/top_chrome",
+     "//chrome/browser/ui/webui_browser:headers",
+     "//chrome/common",
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_helper.cc b/chrome/browser/ui/views/side_panel/side_panel_helper.cc
+index 414f120c64..cbd2bdfcdd 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_helper.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel_helper.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/ui/views/side_panel/history_clusters/history_clusters_side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/reading_list/reading_list_side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_coordinator.h"
++#include "chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "components/history_clusters/core/features.h"
+ #include "components/history_clusters/core/history_clusters_service.h"
+@@ -63,6 +64,12 @@ void SidePanelHelper::PopulateGlobalEntries(
+         window_registry);
+   }
+ 
++  // Add Voyager.
++  if (VoyagerSidePanelCoordinator::IsSupported(browser->GetProfile())) {
++    VoyagerSidePanelCoordinator::CreateAndRegisterEntry(browser,
++                                                        window_registry);
++  }
++
+   // Add comments.
+   if (CommentsSidePanelCoordinator::IsSupported()) {
+     CommentsSidePanelCoordinator::From(browser)->CreateAndRegisterEntry(
+diff --git a/chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.cc b/chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.cc
+new file mode 100644
+index 0000000000..8210b8ef37
+--- /dev/null
++++ b/chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.h"
++
++#include <memory>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/side_panel/side_panel_entry.h"
++#include "chrome/browser/ui/side_panel/side_panel_entry_scope.h"
++#include "chrome/browser/ui/side_panel/side_panel_content_proxy.h"
++#include "chrome/browser/ui/side_panel/side_panel_registry.h"
++#include "chrome/browser/ui/side_panel/side_panel_util.h"
++#include "chrome/browser/ui/views/side_panel/side_panel_web_ui_view.h"
++#include "chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h"
++#include "chrome/browser/ui/webui/top_chrome/webui_contents_wrapper.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++
++using SidePanelWebUIViewT_VoyagerSidePanelUI =
++    SidePanelWebUIViewT<VoyagerSidePanelUI>;
++BEGIN_TEMPLATE_METADATA(SidePanelWebUIViewT_VoyagerSidePanelUI,
++                        SidePanelWebUIViewT)
++END_METADATA
++
++namespace {
++
++std::unique_ptr<views::View> CreateVoyagerWebView(Profile* profile,
++                                                  SidePanelEntryScope& scope) {
++  auto contents_wrapper =
++      std::make_unique<WebUIContentsWrapperT<VoyagerSidePanelUI>>(
++          GURL(chrome::kChromeUIVoyagerSidePanelURL), profile,
++          IDS_SIDE_PANEL_VOYAGER_TITLE,
++          /*esc_closes_ui=*/false,
++          /*supports_draggable_regions=*/false);
++
++  auto view = std::make_unique<SidePanelWebUIViewT<VoyagerSidePanelUI>>(
++      scope, base::RepeatingClosure(), base::RepeatingClosure(),
++      std::move(contents_wrapper));
++
++  // 探针捷径，不是产品写法。
++  //
++  // SidePanelWebUIView 构造时 SetVisible(is_ready_to_show)，而 ready_to_show
++  // 只有在 WebUI 通过 mojo 反向调用 ShowUI() 之后才为真。也就是说，一个不接
++  // mojo 的侧栏永远不会显示 —— 「最小 WebUI 侧栏」在 Chromium 里并不存在，
++  // mojo 通道是必需项而非可选项。
++  //
++  // 这里直接置位只是为了让探针产出可见结果、完成成本测量。真正要做的面板必须
++  // 补齐 mojom + PageHandler + binder 注册 + TS 侧 api proxy。
++  view->SetVisible(true);
++  SidePanelUtil::GetSidePanelContentProxy(view.get())->SetAvailable(true);
++
++  return view;
++}
++
++}  // namespace
++
++// static
++bool VoyagerSidePanelCoordinator::IsSupported(Profile* profile) {
++  // 与 WebUIConfig::IsWebUIEnabled 保持同一条件：两处不一致会出现「入口在但
++  // 打开是空白」或反过来的情况。
++  return profile->IsRegularProfile() &&
++         base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell");
++}
++
++// static
++void VoyagerSidePanelCoordinator::CreateAndRegisterEntry(
++    BrowserWindowInterface* browser,
++    SidePanelRegistry* global_registry) {
++  Profile* profile = browser->GetProfile();
++  global_registry->Register(std::make_unique<SidePanelEntry>(
++      SidePanelEntry::Key(SidePanelEntry::Id::kVoyager),
++      base::BindRepeating(&CreateVoyagerWebView, profile),
++      /*default_content_width_callback=*/base::NullCallback()));
++}
+diff --git a/chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.h b/chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.h
+new file mode 100644
+index 0000000000..4cbeb3c916
+--- /dev/null
++++ b/chrome/browser/ui/views/side_panel/voyager/voyager_side_panel_coordinator.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_VOYAGER_VOYAGER_SIDE_PANEL_COORDINATOR_H_
++#define CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_VOYAGER_VOYAGER_SIDE_PANEL_COORDINATOR_H_
++
++class BrowserWindowInterface;
++class Profile;
++class SidePanelRegistry;
++
++// 创建并注册 Voyager 侧栏的 SidePanelEntry。
++//
++// 无状态，所以做成静态方法而不是像 TabsFromOtherDevices 那样挂在
++// BrowserWindowFeatures 上 —— 那需要额外改两个文件来存放实例，而这个探针
++// 没有需要跨调用保持的状态。
++class VoyagerSidePanelCoordinator {
++ public:
++  VoyagerSidePanelCoordinator() = delete;
++
++  static bool IsSupported(Profile* profile);
++
++  static void CreateAndRegisterEntry(BrowserWindowInterface* browser,
++                                     SidePanelRegistry* global_registry);
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_VOYAGER_VOYAGER_SIDE_PANEL_COORDINATOR_H_
+diff --git a/chrome/browser/ui/webui/chrome_web_ui_configs.cc b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+index 184305a45a..57666a9740 100644
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -130,6 +130,7 @@
+ #include "chrome/browser/ui/webui/side_panel/history_clusters/history_clusters_side_panel_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/reading_list/reading_list_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_ui.h"
++#include "chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h"
+ #include "chrome/browser/ui/webui/signin/sync_confirmation_ui.h"
+ #include "chrome/browser/ui/webui/suggest_internals/suggest_internals_ui.h"
+ #include "chrome/browser/ui/webui/support_tool/support_tool_ui.h"
+@@ -394,6 +395,7 @@ void RegisterChromeWebUIConfigs() {
+   map.AddWebUIConfig(std::make_unique<TabsFromOtherDevicesUIConfig>());
+   map.AddWebUIConfig(std::make_unique<TermsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<UserEducationInternalsUIConfig>());
++  map.AddWebUIConfig(std::make_unique<VoyagerSidePanelUIConfig>());
+   map.AddWebUIConfig(std::make_unique<WebAppInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<WebNNInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<IndigoInternalsUIConfig>());
+diff --git a/chrome/browser/ui/webui/side_panel/voyager/BUILD.gn b/chrome/browser/ui/webui/side_panel/voyager/BUILD.gn
+new file mode 100644
+index 0000000000..b313147e33
+--- /dev/null
++++ b/chrome/browser/ui/webui/side_panel/voyager/BUILD.gn
+@@ -0,0 +1,25 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++assert(!is_android)
++
++source_set("voyager") {
++  public = [ "voyager_side_panel_ui.h" ]
++  public_deps = [
++    "//chrome/browser:browser_public_dependencies",
++    "//chrome/browser/ui/webui/top_chrome",
++    "//content/public/browser",
++  ]
++}
++
++source_set("impl") {
++  sources = [ "voyager_side_panel_ui.cc" ]
++  public_deps = [ ":voyager" ]
++  deps = [
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/resources/side_panel/voyager:resources",
++    "//chrome/common",
++    "//ui/webui",
++  ]
++}
+diff --git a/chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.cc b/chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.cc
+new file mode 100644
+index 0000000000..c0ca42b3b7
+--- /dev/null
++++ b/chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h"
++
++#include "base/command_line.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/generated_resources.h"
++#include "chrome/grit/side_panel_voyager_resources.h"
++#include "chrome/grit/side_panel_voyager_resources_map.h"
++#include "content/public/browser/web_ui.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "content/public/common/url_constants.h"
++#include "ui/webui/webui_util.h"
++
++VoyagerSidePanelUIConfig::VoyagerSidePanelUIConfig()
++    : DefaultTopChromeWebUIConfig(content::kChromeUIScheme,
++                                  chrome::kChromeUIVoyagerSidePanelHost) {}
++
++bool VoyagerSidePanelUIConfig::IsWebUIEnabled(
++    content::BrowserContext* browser_context) {
++  // 与垂直标签栏同一个门控 fp-shell（浏览器外壳），不是 fp-active（指纹伪装）：
++  // 侧栏在用户日常浏览时也该有，而日常 profile 不带 fp-active。
++  return base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell");
++}
++
++VoyagerSidePanelUI::VoyagerSidePanelUI(content::WebUI* web_ui)
++    : TopChromeWebUIController(web_ui) {
++  Profile* profile = Profile::FromWebUI(web_ui);
++  content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
++      profile, chrome::kChromeUIVoyagerSidePanelHost);
++
++  static constexpr webui::LocalizedString kStrings[] = {
++      {"title", IDS_SIDE_PANEL_VOYAGER_TITLE},
++  };
++  source->AddLocalizedStrings(kStrings);
++
++  webui::SetupWebUIDataSource(source, kSidePanelVoyagerResources,
++                              IDR_SIDE_PANEL_VOYAGER_VOYAGER_HTML);
++}
++
++VoyagerSidePanelUI::~VoyagerSidePanelUI() = default;
++
++WEB_UI_CONTROLLER_TYPE_IMPL(VoyagerSidePanelUI)
+diff --git a/chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h b/chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h
+new file mode 100644
+index 0000000000..c9024069c6
+--- /dev/null
++++ b/chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SIDE_PANEL_VOYAGER_VOYAGER_SIDE_PANEL_UI_H_
++#define CHROME_BROWSER_UI_WEBUI_SIDE_PANEL_VOYAGER_VOYAGER_SIDE_PANEL_UI_H_
++
++#include <string_view>
++
++#include "chrome/browser/ui/webui/top_chrome/top_chrome_web_ui_controller.h"
++#include "chrome/browser/ui/webui/top_chrome/top_chrome_webui_config.h"
++
++class VoyagerSidePanelUI;
++
++class VoyagerSidePanelUIConfig
++    : public DefaultTopChromeWebUIConfig<VoyagerSidePanelUI> {
++ public:
++  VoyagerSidePanelUIConfig();
++
++  // DefaultTopChromeWebUIConfig:
++  bool IsWebUIEnabled(content::BrowserContext* browser_context) override;
++};
++
++// 最小 WebUI 侧栏。不绑 mojo、不持有 BrowserWindowInterface —— 这个探针只用来
++// 量「新增一个 WebUI 侧栏」要接多少线、编译一轮多久。
++class VoyagerSidePanelUI : public TopChromeWebUIController {
++ public:
++  explicit VoyagerSidePanelUI(content::WebUI* web_ui);
++  VoyagerSidePanelUI(const VoyagerSidePanelUI&) = delete;
++  VoyagerSidePanelUI& operator=(const VoyagerSidePanelUI&) = delete;
++  ~VoyagerSidePanelUI() override;
++
++  static constexpr std::string_view GetWebUIName() {
++    return "VoyagerSidePanel";
++  }
++
++  WEB_UI_CONTROLLER_TYPE_DECL();
++};
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SIDE_PANEL_VOYAGER_VOYAGER_SIDE_PANEL_UI_H_
+diff --git a/chrome/chrome_paks.gni b/chrome/chrome_paks.gni
+index 2bd694fc07..3f91098522 100644
+--- a/chrome/chrome_paks.gni
++++ b/chrome/chrome_paks.gni
+@@ -256,6 +256,7 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/side_panel_reading_list_resources.pak",
+         "$root_gen_dir/chrome/side_panel_shared_resources.pak",
+         "$root_gen_dir/chrome/side_panel_tabs_from_other_devices_resources.pak",
++        "$root_gen_dir/chrome/side_panel_voyager_resources.pak",
+         "$root_gen_dir/chrome/signin_resources.pak",
+         "$root_gen_dir/chrome/suggest_internals_resources.pak",
+         "$root_gen_dir/chrome/support_tool_resources.pak",
+@@ -613,6 +614,7 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/side_panel_reading_list_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_shared_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_tabs_from_other_devices_code_cache_resources.pak",
++        "$root_gen_dir/chrome/side_panel_voyager_code_cache_resources.pak",
+         "$root_gen_dir/chrome/webui_toolbar_code_cache_resources.pak",
+         "$root_gen_dir/ui/webui/resources/webui_code_cache_resources.pak",
+       ]
+diff --git a/chrome/common/webui_url_constants.h b/chrome/common/webui_url_constants.h
+index 497865b225..a7950e6df8 100644
+--- a/chrome/common/webui_url_constants.h
++++ b/chrome/common/webui_url_constants.h
+@@ -463,6 +463,10 @@ inline constexpr char kChromeUIUntrustedReadAnythingSidePanelHost[] =
+     "read-anything-side-panel.top-chrome";
+ inline constexpr char kChromeUIUntrustedReadAnythingSidePanelURL[] =
+     "chrome-untrusted://read-anything-side-panel.top-chrome/";
++inline constexpr char kChromeUIVoyagerSidePanelHost[] =
++    "voyager.top-chrome";
++inline constexpr char kChromeUIVoyagerSidePanelURL[] =
++    "chrome://voyager.top-chrome/";
+ inline constexpr char kChromeUIWebAppInternalsHost[] = "web-app-internals";
+ inline constexpr char kChromeUIWebuiBrowserHost[] = "webui-browser";
+ inline constexpr char kChromeUIWebuiBrowserURL[] = "chrome://webui-browser/";
+diff --git a/third_party/lit/v3_0/BUILD.gn b/third_party/lit/v3_0/BUILD.gn
+index e58a9be161..e0ca47f8c0 100644
+--- a/third_party/lit/v3_0/BUILD.gn
++++ b/third_party/lit/v3_0/BUILD.gn
+@@ -101,6 +101,7 @@ ts_library("build_ts") {
+     "//chrome/browser/resources/side_panel/reading_list:build_ts",
+     "//chrome/browser/resources/side_panel/shared:build_ts",
+     "//chrome/browser/resources/side_panel/tabs_from_other_devices:build_ts",
++    "//chrome/browser/resources/side_panel/voyager:build_ts",
+     "//chrome/browser/resources/signin:build_ts",
+     "//chrome/browser/resources/signin/batch_upload:build_ts",
+     "//chrome/browser/resources/signin/history_sync_optin:build_ts",
+diff --git a/tools/gritsettings/resource_ids.spec b/tools/gritsettings/resource_ids.spec
+index e1f3030f0c..2aed452f2d 100644
+--- a/tools/gritsettings/resource_ids.spec
++++ b/tools/gritsettings/resource_ids.spec
+@@ -793,6 +793,14 @@
+     "META": {"sizes": {"includes": [10],}},
+     "includes": [4935],
+   },
++  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/side_panel/voyager/code_cache_resources.grd": {
++    "META": {"sizes": {"includes": [10],}},
++    "includes": [4936],
++  },
++  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/side_panel/voyager/resources.grd": {
++    "META": {"sizes": {"includes": [10],}},
++    "includes": [4937],
++  },
+   "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/signin/batch_upload/resources.grd": {
+     "META": {"sizes": {"includes": [10]}},
+     "includes": [4940],
+diff --git a/tools/metrics/histograms/metadata/page/histograms.xml b/tools/metrics/histograms/metadata/page/histograms.xml
+index 74ad88f57c..963b717e9f 100644
+--- a/tools/metrics/histograms/metadata/page/histograms.xml
++++ b/tools/metrics/histograms/metadata/page/histograms.xml
+@@ -643,6 +643,7 @@ chromium-metrics-reviews@google.com.
+   <variant name=".TabSearch"/>
+   <variant name=".TabsFromOtherDevicesSidePanel"/>
+   <variant name=".UserEducation"/>
++  <variant name=".VoyagerSidePanel"/>
+ </variants>
+ 
+ <!-- LINT.ThenChange(//tools/metrics/histograms/metadata/ui/histograms.xml:TopChromeWebUIName) -->
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 884dadf..3abf658 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1860,6 +1860,7 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/settings",
+       "//chrome/browser/ui/webui/settings:impl",
+       "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices:impl",
++      "//chrome/browser/ui/webui/side_panel/voyager:impl",
+       "//chrome/browser/ui/webui/signin",
+       "//chrome/browser/ui/webui/signin:login_ui_service",
+       "//chrome/browser/ui/webui/signin:login_ui_service_impl",
+@@ -2008,6 +2009,7 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/side_panel/history_clusters",
+       "//chrome/browser/ui/webui/side_panel/read_anything",
+       "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices",
++      "//chrome/browser/ui/webui/side_panel/voyager",
+       "//chrome/browser/ui/webui/suggest_internals",
+       "//chrome/browser/ui/webui/util",
+       "//chrome/browser/ui/webui/webnn_internals",

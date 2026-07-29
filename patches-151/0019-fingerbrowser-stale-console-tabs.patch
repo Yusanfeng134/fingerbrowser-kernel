@@ -1,0 +1,177 @@
+From 9b19f852af52d5c6f9d565d10148a990ece04cac Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 09:06:15 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E6=B8=85=E7=90=86=E4=B8=8A?=
+ =?UTF-8?q?=E6=AC=A1=E5=90=AF=E5=8A=A8=E9=81=97=E7=95=99=E7=9A=84=E7=AE=A1?=
+ =?UTF-8?q?=E7=90=86=E5=8F=B0=E5=9B=BA=E5=AE=9A=E6=A0=87=E7=AD=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+用户报告：客户端每启动一次，标签栏就多一个打不开的标签，点开是
+ERR_CONNECTION_REFUSED，单调累积。实测在一个 profile 的会话文件里同时存在
+四次不同启动的管理台地址，端口互不相同，只有最后一个是活的。
+
+成因是两个各自都合理的决定撞在一起：管理台标签必须固定（关掉它用户就只剩
+一个没有入口的浏览器），而管理台 URL 每次启动必然失效（本地服务 listen(0)，
+端口由系统分配）。固定/恢复的语义是「这个标签值得跨会话保留」，而这个 URL
+恰恰是下次启动一定打不开的——凡是被保留下来的管理台标签，按构造必然是死的。
+
+会话恢复由 exit_type=Crashed 触发（实测该 profile 中确为 Crashed），而非
+pinned_tabs 那条 pref 路径：Preferences 里 pinned_tabs 为 null、
+session.restore_on_startup 键不存在。客户端在某些路径上是杀进程而不是让内核
+正常关闭，退出类型便停在 Crashed，下次按崩溃恢复处理。改成优雅关闭只能降低
+触发频率——真崩溃时照样恢复出一批死标签，故此处的清理是兜底。
+
+判据要求「已固定」而不只是「loopback」：用户自己开的本地页面（例如一个开发
+服务器）同样是 loopback，关掉它是在删用户的东西。而遗留的管理台之所以是固定
+状态，正是因为上次是我们固定的——这一条几乎是白送的，且把误伤面从「所有本地
+页面」缩到「用户手动固定过的本地页面」。
+
+未配置 --fp-pinned-url 时不做任何清理：那时无法把遗留管理台与任何本地页面
+区分开，宁可不动。
+
+两处实现细节：
+- 倒序遍历。关闭会让其后索引前移，正序会漏掉紧跟其后的那个，而本缺陷恰是
+  连续多个死标签，正序会漏掉一半。
+- 绝不关到只剩零个标签，那会连浏览器窗口一起关掉，用户直接失去客户端。
+
+清理放在固定之前，因为关闭会改变索引。位置与固定逻辑同处，即
+RestoreOrCreateBrowser 之后，故同时覆盖会话恢复与命令行两条标签创建路径。
+
+验证（probe/run-stale-console-tabs.cjs，独立 profile）：连做三轮「启动 →
+杀进程 → 关闭本地服务」，再启动第四次。
+
+  【前提检查】会话文件里出现过的管理台端口: 59704, 65463, 53127
+  ✓ 累积确已发生：3 个旧启动的管理台被会话保留
+  【结果】当前标签数: 1
+     http://127.0.0.1:60411/
+  本次管理台 1，遗留死标签 0
+
+前提检查不是装饰：若复现失败、累积压根没发生，「只剩一个标签」与真的修好
+长得一模一样。该检查不通过时脚本直接失败退出，不给结论。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser/fingerbrowser_console.cc    | 13 ++++++++
+ .../fingerbrowser/fingerbrowser_console.h     | 15 +++++++++
+ chrome/browser/ui/startup/BUILD.gn            |  1 +
+ .../startup/startup_browser_creator_impl.cc   | 33 +++++++++++++++++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.cc b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+index c445526547..4ba9547368 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+@@ -55,6 +55,19 @@ bool IsConsoleUrl(const GURL& url) {
+   return url::Origin::Create(url) == console;
+ }
+ 
++bool IsStaleConsoleUrl(const GURL& url) {
++  // With no console configured we cannot tell a stale console tab from any
++  // other loopback page, so claim nothing.
++  if (ConsoleOrigin().opaque()) {
++    return false;
++  }
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || !net::IsLocalhost(url)) {
++    return false;
++  }
++  // This launch's console is live; only earlier ones are stale.
++  return !IsConsoleUrl(url);
++}
++
+ std::u16string GetConsoleOmniboxTitle(const GURL& url) {
+   if (!IsConsoleUrl(url)) {
+     return std::u16string();
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.h b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+index fe1e0aba1b..aa4dc08d6c 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+@@ -27,6 +27,21 @@ namespace fingerbrowser {
+ // Returns true if `url` belongs to the management console origin.
+ bool IsConsoleUrl(const GURL& url);
+ 
++// Returns true if `url` looks like a management console left over from an
++// earlier launch: a loopback http(s) origin that is not this launch's console.
++//
++// The console's port is assigned by the OS at startup (listen(0)), so a console
++// tab that survives into the next launch is dead by construction -- its server
++// is gone. Session restore brings those tabs back, and because they were
++// pinned, they come back pinned, so they accumulate one per launch.
++//
++// This is only half a predicate on purpose. Loopback alone would also match a
++// page the user opened themselves (a local dev server, say), and closing that
++// would be destroying their work. Callers must additionally require that the
++// tab is pinned: a stale console tab is pinned because we pinned it last time,
++// whereas a user's own loopback tab is not unless they pinned it by hand.
++bool IsStaleConsoleUrl(const GURL& url);
++
+ // The name to show in place of the console URL, e.g. "YunLogin 管理中心".
+ // Empty when the console is not configured or `url` is not the console --
+ // callers treat empty as "no override, format the URL normally".
+diff --git a/chrome/browser/ui/startup/BUILD.gn b/chrome/browser/ui/startup/BUILD.gn
+index 8ad9e15ad1..604d2ef78c 100644
+--- a/chrome/browser/ui/startup/BUILD.gn
++++ b/chrome/browser/ui/startup/BUILD.gn
+@@ -221,6 +221,7 @@ source_set("impl") {
+       "//chrome/browser/apps/platform_apps",
+       "//chrome/browser/custom_handlers",
+       "//chrome/browser/extensions",
++      "//chrome/browser/fingerbrowser",
+       "//chrome/browser/headless:command_processor",
+       "//chrome/browser/lifetime",
+       "//chrome/browser/obsolete_system",
+diff --git a/chrome/browser/ui/startup/startup_browser_creator_impl.cc b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+index b89f8ead0c..ef6993a083 100644
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/custom_handlers/protocol_handler_registry_factory.h"
+ #include "chrome/browser/defaults.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
+ #include "chrome/browser/first_run/first_run.h"
+ #include "chrome/browser/headless/headless_command_processor.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+@@ -570,6 +571,38 @@ void StartupBrowserCreatorImpl::DetermineURLsAndLaunch(
+         command_line_->GetSwitchValueASCII("fp-pinned-url");
+     if (!pinned_url.empty()) {
+       TabStripModel* const model = browser->tab_strip_model();
++
++      // FingerBrowser：先清掉上次启动遗留的管理台标签。
++      //
++      // 管理台的端口由系统在启动时分配（listen(0)），所以活过一次启动的管理台
++      // 标签按构造必然是死的 —— 它的服务已经没了。而上面把它固定了，固定状态
++      // 又会随会话恢复一起回来，于是每启动一次就多积一个死标签。实测在一个
++      // profile 里同时恢复出四次不同启动的管理台地址，只有最后一个是活的。
++      //
++      // 会话恢复本身是被 exit_type=Crashed 触发的（客户端在某些路径上是杀进程
++      // 而非正常关闭）。改成优雅关闭只能降低触发频率：真崩溃时照样恢复出一批
++      // 死标签，所以这里的清理是兜底，不能省。
++      //
++      // 判据要求「已固定」而不只是「loopback」：用户自己开的本地页面（比如一个
++      // 开发服务器）同样是 loopback，关掉它是在删用户的东西。而遗留的管理台
++      // 之所以固定，正是因为上次是我们固定的。
++      //
++      // 倒序遍历：关闭会让其后的索引前移，正序会漏掉紧跟其后的那个。
++      for (int i = model->count() - 1; i >= 0; --i) {
++        // 绝不关到只剩零个标签 —— 那会连浏览器窗口一起关掉。
++        if (model->count() <= 1) {
++          break;
++        }
++        if (!model->IsTabPinned(i)) {
++          continue;
++        }
++        content::WebContents* const contents = model->GetWebContentsAt(i);
++        if (contents &&
++            fingerbrowser::IsStaleConsoleUrl(contents->GetVisibleURL())) {
++          model->CloseWebContentsAt(i, TabCloseTypes::CLOSE_NONE);
++        }
++      }
++
+       for (int i = 0; i < model->count(); ++i) {
+         content::WebContents* const contents = model->GetWebContentsAt(i);
+         if (contents && contents->GetVisibleURL().spec() == pinned_url) {
+-- 
+2.52.0.windows.1
+

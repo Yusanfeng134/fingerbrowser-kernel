@@ -1,0 +1,24 @@
+diff --git a/chrome/browser/signin/account_consistency_mode_manager.cc b/chrome/browser/signin/account_consistency_mode_manager.cc
+index f11db47c92..83c4f5177c 100644
+--- a/chrome/browser/signin/account_consistency_mode_manager.cc
++++ b/chrome/browser/signin/account_consistency_mode_manager.cc
+@@ -131,6 +131,19 @@ AccountConsistencyModeManager::AccountConsistencyModeManager(Profile* profile)
+     signin_allowed = false;
+   }
+ 
++  // FingerBrowser：工作环境（带 fp-active）里禁止登录 Google 账号。
++  //
++  // 这是安全需求，不是偏好。工作环境是店铺人设，profile 里的书签/密码/历史一旦
++  // 同步到用户真实的 Google 身份，两个方向都出问题：真实身份的数据流进店铺
++  // profile，而多个店铺环境登同一个 Google 账号会让平台侧能把它们关联起来 ——
++  // 那是实打实的封号路径。而用户不会觉得自己做错了什么，登录按钮就摆在工具栏上。
++  //
++  // 门控用 fp-active（指纹伪装）而不是 fp-shell（浏览器外壳）：日常浏览器该保留
++  // Google 登录，用户自己的密码与书签同步正是「能当日常浏览器用」的一部分。
++  if (command_line->HasSwitch("fp-active")) {
++    signin_allowed = false;
++  }
++
+   prefs->SetBoolean(prefs::kSigninAllowed, signin_allowed);
+ 
+   UMA_HISTOGRAM_BOOLEAN("Signin.SigninAllowed", signin_allowed);

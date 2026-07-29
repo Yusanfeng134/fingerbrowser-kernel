@@ -1,0 +1,76 @@
+diff --git a/chrome/browser/ui/startup/startup_browser_creator_impl.cc b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+index a1d71b78b0..b89f8ead0c 100644
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -551,6 +551,35 @@ void StartupBrowserCreatorImpl::DetermineURLsAndLaunch(
+   Browser* browser = RestoreOrCreateBrowser(
+       tabs, behavior, restore_options, process_startup, is_post_crash_launch);
+ 
++  // FingerBrowser：把 --fp-pinned-url 指定的标签设为固定。
++  //
++  // 客户端的形态就是浏览器，管理台是它的第一个标签页 —— 那个标签就是这个应用。
++  // 关掉它用户只剩一个没有入口的浏览器，环境列表、指纹配置、Cookie 全都进不去，
++  // 而且没有恢复路径，只能杀进程重启。固定之后 web_app::HasPinnedHomeTab 会把它
++  // 当首页标签处理，标签上的关闭按钮、右键关闭、Ctrl+W、拖出成窗口一并禁掉。
++  //
++  // 放在这里而不是在创建标签时给 StartupTab::Type::kPinned：标签有多条创建路径
++  // （会话恢复走 SessionRestore::RestoreSession，命令行走 OpenTabsInBrowser），
++  // 在其中一条上打标记，另一条就漏掉 —— 最初改在 GetCommandLineTabs 里，实测
++  // 那条路径压根没被走到。在浏览器已经建好之后按 URL 找，与创建方式无关。
++  //
++  // 用显式的 URL 开关而不是「固定第一个标签」：启动参数里可能带多个地址（例如
++  // 用户从系统里用它打开一个链接），只有管理台那个该被固定。
++  if (browser) {
++    const std::string pinned_url =
++        command_line_->GetSwitchValueASCII("fp-pinned-url");
++    if (!pinned_url.empty()) {
++      TabStripModel* const model = browser->tab_strip_model();
++      for (int i = 0; i < model->count(); ++i) {
++        content::WebContents* const contents = model->GetWebContentsAt(i);
++        if (contents && contents->GetVisibleURL().spec() == pinned_url) {
++          model->SetTabPinned(i, true);
++          break;
++        }
++      }
++    }
++  }
++
+   tab_groups::MaybeShowSharedTabGroupVersionOutOfDateModal(browser);
+   tab_groups::MaybeShowSharedTabGroupVersionUpToDateToast(browser);
+ 
+diff --git a/chrome/browser/ui/web_applications/web_app_tabbed_utils.cc b/chrome/browser/ui/web_applications/web_app_tabbed_utils.cc
+index 672a7e2d32..5dc82fa2c4 100644
+--- a/chrome/browser/ui/web_applications/web_app_tabbed_utils.cc
++++ b/chrome/browser/ui/web_applications/web_app_tabbed_utils.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
+ 
++#include "base/command_line.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+@@ -15,8 +16,21 @@ bool HasPinnedHomeTab(const TabStripModel* tab_strip_model) {
+   if (!tab_strip_model->ContainsIndex(0)) {
+     return false;
+   }
+-  return tab_strip_model->delegate()->IsForWebApp() &&
+-         tab_strip_model->IsTabPinned(0);
++  if (!tab_strip_model->IsTabPinned(0)) {
++    return false;
++  }
++  // FingerBrowser：外壳（--fp-shell）的第 0 个标签是管理台，语义上和 PWA 的
++  // 「固定首页标签」完全一致 —— 它就是这个应用本身，不该能被关掉。
++  //
++  // 复用上游这套机制而不是自己做「关闭即重开」：这一个判断会同时让标签上的 ×
++  // 消失、右键菜单里的「关闭」隐藏、Ctrl+W 失效、且标签不能被拖出成独立窗口
++  // （IsTabDetachable 也走这里）。补救式的重开只能盖住其中一条路径。
++  //
++  // 用户关掉整个窗口仍然可以：IsTabClosable 在 count()==1 时返回 true。
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell")) {
++    return true;
++  }
++  return tab_strip_model->delegate()->IsForWebApp();
+ }
+ 
+ bool IsPinnedHomeTab(const TabStripModel* tab_strip_model, int index) {

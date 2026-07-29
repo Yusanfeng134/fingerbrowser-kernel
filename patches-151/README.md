@@ -35,12 +35,28 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0012 | build-blink-generators-utf8 | 构建环境 | blink 代码生成器显式 UTF-8 读写（中文 Windows）|
 | 0013 | fingerbrowser-console-omnibox | 管理台地址栏 | location_bar_model（显示产品名而非本地服务 URL、挂锁、只读）|
 
-> **⚠ 本补丁集尚不能完整复现分支。** 将 0001–0013 应用到纯净 151 后与分支 HEAD
-> 比对，仍有 **210 个文件**不一致——全部是尚未导出成补丁的客户端外壳工作：
-> Voyager 侧栏（WebUI、coordinator、资源）、垂直标签栏（`--fp-vertical-tabs`）、
-> `--fp-pinned-url` 的钉标签实现，以及约 190 个品牌翻译 `.xtb`。
-> 已导出的 13 个补丁各自**逐字节完整**，缺的是尚未导出的部分。补齐前，
-> 不要把「补丁全部干净应用」当作「内核可从纯净 151 重建」。
+| 0014 | brand-ui-strings | 品牌文案 | `.grd` / `.grdp` / 162 份 `.xtb` / BRANDING（182 个文件）|
+| 0015 | brand-exe-icon | 可执行文件图标 | `chromium.ico`（二进制补丁，须 `--binary` 生成）|
+| 0016 | fingerbrowser-shell-ui | 外壳 UI | Voyager 侧栏、垂直标签栏、`--fp-shell`/`--fp-active` 拆分（24 个文件）|
+| 0017 | fingerbrowser-pinned-console-tab | 钉标签 | `--fp-pinned-url` 把管理台标签设为固定 |
+| 0018 | fingerbrowser-no-google-signin | 账号 | 工作环境禁登 Google |
+| 0019 | fingerbrowser-stale-console-tabs | 标签清理 | 清掉上次启动遗留的管理台固定标签（依赖 0017）|
+
+> **✅ 已验证可完整重建。** 将 0001–0019 依序应用到纯净 151（`git apply --cached`
+> 到临时索引后 `write-tree`），得到的树与分支 HEAD 的树**哈希完全相同**，
+> 265 个文件逐字节一致。
+>
+> **必须做全树比对，不能只看「补丁全部干净应用」。** 实测过一次 19 个补丁
+> 全部 ✓ 应用、却仍漏掉 `chrome/browser/ui/BUILD.gn` 两行 Voyager 依赖的情况：
+> 该文件同时被外壳工作与 0013 改过，而生成规则是「同一文件只归一个补丁」，
+> 文件被 0013 认领后，外壳那两行掉出了整个补丁集。两边各自都对，合起来漏了
+> 一块，且是静默的。其症状与代码写错完全一致（链接期报
+> `VoyagerSidePanelUIConfig` 未定义），足以让人去查代码而不是查补丁集。
+>
+> **由此得到的规则**：分配文件前先看它是否被多方改过；是的话不能整文件归属，
+> 只能由后应用的一方生成增量 hunk。详见 `SHELL-PATCHES-NOTE.md` 第 5 节。
+>
+> 顺序不可打乱，存在三处硬依赖：0009 先于 0011、0013 先于 0016、0017 先于 0019。
 
 > **0009 为何单独成一个补丁**：0011 的清单产物名依赖改名，而 `chrome/BUILD.gn` 里改名与清单两处改动在同一文件、无法按文件拆分，故按提交顺序分层导出。0009 必须在 0011 之前应用。
 
