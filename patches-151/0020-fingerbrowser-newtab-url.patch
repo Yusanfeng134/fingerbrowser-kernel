@@ -1,0 +1,175 @@
+From 154b800671d69757c863809d6666b395e2f53afb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 09:46:48 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E6=96=B0=E6=A0=87=E7=AD=BE?=
+ =?UTF-8?q?=E9=A1=B5=E6=89=93=E5=BC=80=E5=AE=A2=E6=88=B7=E7=AB=AF=E7=9A=84?=
+ =?UTF-8?q?=20AI=20=E6=96=B0=E6=A0=87=E7=AD=BE=E9=A1=B5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+客户端外壳希望「新建标签页」落在自己的 AI 新标签页上，而不是 Chromium 原生
+NTP。新增受控命令行参数 --fp-newtab-url=<URL>，接在 Browser::GetNewTabURL()
+上 —— 所有新标签创建都经由该函数（browser_tabstrip.cc 的 AddAndReturnTabAt
+在 url 为空时取它），且已有先例：web app controller 会在此覆盖新标签地址。
+
+只有外壳传这个参数。启动店铺环境的那条路径不传，因此工作环境仍是原生 NTP：
+对用户而言外壳和店铺环境是两个不同的东西。不传即行为不变，故客户端可自行
+决定何时下发。
+
+该页面是普通 http 页面，且必须保持如此：不注册 WebUI、不给 chrome.* 绑定。
+客户端在服务端就没有向它注入桥（与管理台同产物但不同响应），内核这边若再
+授予特权，等于让每一个新标签都带上管理台那套能删环境、读 Cookie、读代理
+凭据的接口。
+
+强制 loopback：这个 URL 每次 Ctrl+T 都会打开，填入公网地址即成为用户从未
+要求过的常驻外连。
+
+同时修掉一处由 0013 与本改动叠加产生的回归。AI 新标签页由客户端同一个本地
+服务提供，因而与管理台**同源**（/newtab 对 /）——这是客户端为复用同一份
+产物有意做的设计。而 0013 的地址栏改写按 origin 判定，不加排除的话新标签页
+会被认成管理台：地址栏显示产品名并置为只读，用户按 Ctrl+T 后无法输入网址。
+基本浏览功能就此丢失。
+
+按 path 排除（两者都是 hash 路由：管理台在 "/"，新标签页在 "/newtab"，
+fragment 不参与判定），与客户端在服务端切分两者的依据一致。
+
+该回归容易躲过验收：0013 那六条实测全在管理台页面上做，碰不到新标签页；
+而本改动若只验「AI 页面打开了」，看到页面出现也就过了 —— 除非有人恰好去点
+一下新标签页的地址栏。
+
+验证（probe/run-newtab.cjs）：
+- 程序验：Ctrl+T 后标签为 /newtab#/ai-newtab，无 chrome://newtab ✓
+- 人工验：新标签页地址栏可正常输入 ✓
+- 人工验：管理台标签地址栏仍显示产品名且只读 ✓
+
+后两条必须一起看：只验其一，过与不过都说明不了问题 —— 排除做得过宽会把
+管理台也放过去，过窄则新标签页仍被锁死。地址栏是浏览器原生 UI，CDP 读不到
+其内容，故这两条只能人工确认，脚本中已标明，未以「无报错」冒充通过。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser/fingerbrowser_console.cc    | 29 +++++++++++++++++++
+ .../fingerbrowser/fingerbrowser_console.h     | 19 ++++++++++++
+ chrome/browser/ui/browser.cc                  | 12 ++++++++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.cc b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+index 4ba9547368..99279a0f41 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+@@ -19,6 +19,7 @@ namespace {
+ // Already passed by the client (shell-launcher.ts) to pin the console tab.
+ constexpr char kConsoleUrlSwitch[] = "fp-pinned-url";
+ constexpr char kConsoleTitleSwitch[] = "fp-console-title";
++constexpr char kNewTabUrlSwitch[] = "fp-newtab-url";
+ 
+ // Parsed once: the command line does not change over the process lifetime, and
+ // this is consulted on every omnibox update.
+@@ -39,6 +40,23 @@ const url::Origin& ConsoleOrigin() {
+ 
+ }  // namespace
+ 
++const GURL& GetNewTabUrl() {
++  static const base::NoDestructor<GURL> url([] {
++    const GURL candidate(
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            kNewTabUrlSwitch));
++    // Loopback-only, same as the console: this URL is opened on every Ctrl+T,
++    // so a public address here would be a standing outbound request the user
++    // never asked for.
++    if (!candidate.is_valid() || !candidate.SchemeIsHTTPOrHTTPS() ||
++        !net::IsLocalhost(candidate)) {
++      return GURL();
++    }
++    return candidate;
++  }());
++  return *url;
++}
++
+ bool IsConsoleUrl(const GURL& url) {
+   const url::Origin& console = ConsoleOrigin();
+   // An opaque origin means the console was never configured; it must not
+@@ -49,6 +67,17 @@ bool IsConsoleUrl(const GURL& url) {
+   if (!url.is_valid()) {
+     return false;
+   }
++  // The AI new tab page comes off the same local server, so it shares the
++  // console's origin -- but it is a browsing surface. Treating it as the
++  // console would rewrite its address bar and make that bar read-only, leaving
++  // the user unable to type a URL in a new tab. Matched by path because both
++  // are hash-routed: the console lives at "/" with routes in the fragment,
++  // the new tab page at "/newtab".
++  if (const GURL& newtab = GetNewTabUrl();
++      newtab.is_valid() && url.path() == newtab.path()) {
++    return false;
++  }
++
+   // Origin rather than whole-URL equality: the console is a single-page app
+   // whose routes live in the fragment (#/yunlogin-environments), so the URL
+   // changes as the user moves around while the origin stays put.
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.h b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+index aa4dc08d6c..4a779980e6 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+@@ -25,8 +25,27 @@ namespace fingerbrowser {
+ // to be served from the port our own server is holding.
+ //
+ // Returns true if `url` belongs to the management console origin.
++//
++// The AI new tab page (see GetNewTabUrl) is served by the same local server and
++// therefore shares this origin, but is deliberately excluded: it is a browsing
++// surface, not the console.
+ bool IsConsoleUrl(const GURL& url);
+ 
++// The page to open for a new tab, or an empty URL to keep the native new tab
++// page. Supplied by the client via --fp-newtab-url.
++//
++// Only the browser shell passes this; environment (store) kernels do not, so
++// they keep the native new tab page. Do not "helpfully" extend it to them --
++// the shell and an environment are different products to the user.
++//
++// Like the console URL, the port is assigned at startup and differs every run,
++// so this is read from the command line on each launch and never persisted.
++//
++// This is an ordinary http page and must stay one: no WebUI registration, no
++// chrome.* bindings. The client serves it without injecting its bridge, so
++// granting privileges here would hand every new tab the console's API surface.
++const GURL& GetNewTabUrl();
++
+ // Returns true if `url` looks like a management console left over from an
+ // earlier launch: a loopback http(s) origin that is not this launch's console.
+ //
+diff --git a/chrome/browser/ui/browser.cc b/chrome/browser/ui/browser.cc
+index 0777bf7143..c0424d0b0a 100644
+--- a/chrome/browser/ui/browser.cc
++++ b/chrome/browser/ui/browser.cc
+@@ -63,6 +63,7 @@
+ #include "chrome/browser/extensions/extension_util.h"
+ #include "chrome/browser/extensions/tab_helper.h"
+ #include "chrome/browser/file_select_helper.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
+ #include "chrome/browser/first_run/first_run.h"
+ #include "chrome/browser/glic/public/glic_enabling.h"
+ #include "chrome/browser/glic/public/glic_keyed_service.h"
+@@ -696,6 +697,17 @@ GURL Browser::GetNewTabURL() const {
+           web_app::AppBrowserController::From(this)) {
+     return app_browser_controller->GetAppNewTabUrl();
+   }
++  // FingerBrowser：客户端外壳用自己的新标签页（AI 新标签页）替代原生 NTP。
++  // 只有外壳会传 --fp-newtab-url，店铺环境不传，因此环境仍是原生 NTP —— 对
++  // 用户而言外壳和店铺环境是两个不同的东西，不要"顺手"给环境也加上。
++  //
++  // 这个页面由客户端的本地服务提供，是**普通 http 页面**：不注册 WebUI、不给
++  // chrome.* 绑定。客户端在服务端就没给它注入桥，内核这边再授予特权，等于让
++  // 每一个新标签都带上管理台那套能删环境、读 Cookie、读代理凭据的接口。
++  if (const GURL& fb_newtab = fingerbrowser::GetNewTabUrl();
++      fb_newtab.is_valid()) {
++    return fb_newtab;
++  }
+   return chrome::ChromeUINewTabURLAsGURL();
+ }
+ 
+-- 
+2.52.0.windows.1
+
