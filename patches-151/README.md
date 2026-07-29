@@ -46,6 +46,7 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0022 | fingerbrowser-newtab-blank-omnibox | 新标签页 | 新标签页地址栏留空但保持可用（依赖 0020）|
 | 0023 | fingerbrowser-account-panel | 账号面板 | `--fp-account-panel` 用云登账号面板替换原生头像菜单（22 个文件）|
 | 0024 | fingerbrowser-aumid-prefix | 品牌 | AUMID 前缀 `Chromium.` → `Yunbrowser.`（任务栏分组键）|
+| 0025 | fingerbrowser-account-panel-login-entry | 账号面板 | 顶部账号行可点，指向管理台 `#/account`（依赖 0023）|
 
 ### 0024 说明：只改 `base_app_id`
 
@@ -89,7 +90,9 @@ prof-aumid-b  Yunbrowser.U4KBPE2AZLGVDTK5V6VY.profaumidb.Default
 
 > **链接由宿主接管，不给页面 mojo 方法。** 上游 `WebUIContentsWrapper::Host::OpenURLFromTab` 默认返回 `nullptr`，气泡里的链接点了不会有任何反应，所以「面板项就是几个 `<a href>`」在上游走不通。`AccountPanelBubbleView` 重写它并只放行管理台 origin ——**能去哪由 C++ 决定，不由页面决定**，比给页面一个打开 URL 的方法收得更紧。这个面天生是特权面（跑在 `chrome://` 上），而这类接口「加一个方法几乎零成本、减一个方法要改两边」，故在还没有第一个方法时就卡住。
 >
-> **未验证**：白名单的**拒绝**路径。面板当前不含非管理台链接，「非管理台 URL 会被拦下」只有代码保证，没有实测。
+> **白名单拒绝路径已验**（0025）：把要新增的链接先故意指向 `https://example.com`，实测点击**无任何反应**，而同面板下方三项照常打开；确认后改成正确地址。同一次改动里既做功能又验反例，不留临时代码。
+>
+> **两条必须成对。** 只验「拦住了」，全拦死也会通过；只验「能打开」，全放行也会通过 —— 面板里若没有会被拒的链接，「链接都能打开」与「白名单形同虚设」表现完全一致。0023 提交时把这条记成「未验证的待办」是**归类错误**：它不是「有一项待验」，而是「这项验收必然通过，且与实现是否正确无关」。
 
 ### 0021 说明：为什么在命令层禁而不在菜单里藏
 

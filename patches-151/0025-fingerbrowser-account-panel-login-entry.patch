@@ -1,0 +1,86 @@
+From 50342babcf36c3e715d75a71ef76abeaefe4e58b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 15:03:53 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E8=B4=A6=E5=8F=B7=E9=9D=A2?=
+ =?UTF-8?q?=E6=9D=BF=E9=A1=B6=E9=83=A8=E4=B8=80=E8=A1=8C=E5=8F=AF=E7=82=B9?=
+ =?UTF-8?q?=EF=BC=8C=E6=8C=87=E5=90=91=E7=AE=A1=E7=90=86=E5=8F=B0=E8=B4=A6?=
+ =?UTF-8?q?=E5=8F=B7=E9=A1=B5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+用户看到第一期后的要求：点头像要能登录。管理台新增了 #/account 路由（登录/
+注册/找回的 UI 一直存在，只是从来没有任何路由指向它 —— 写完没接线，等于不存在），
+面板顶部那一行改为链接指向它。
+
+无需放宽任何规则：目标就是管理台 origin，走已有的 OpenURLFromTab 白名单，
+不新增 Mojo 方法，页面能调用的面仍然是零。
+
+顺带补上了 0023 遗留的那条未验项：白名单的**拒绝**路径。
+
+做法是把这次要加的链接先故意写错 —— 指向 https://example.com，构建、实测点击
+无任何反应，再改成正确的管理台地址。同一次改动里既做功能又验反例，不留临时代码。
+
+实测两条一起看：
+  点账号行（指向 example.com 时）→ 无任何反应，未开标签、未在气泡内跳转
+  同一面板下方三项            → 照常开出标签页至管理台
+
+两条必须成对。只验「拦住了」，全拦死也会通过；只验「能打开」，全放行也会通过 ——
+当前面板里若没有会被拒的链接，「链接都能打开」与「白名单形同虚设」表现完全一致。
+0023 提交时我把这条记成「未验证的待办」，那个归类是错的：它不是「有一项待验」，
+而是「这项验收必然通过，且与实现是否正确无关」。
+
+改后复验：点账号行开出新标签页至 #/account。
+
+已知限制（有了登录入口后会被真实触发，而非停留在理论）：第一期登录态是启动
+快照，用户从面板点进去登录成功后，面板仍显示未登录直到下次启动 —— 容易被当成
+登录失败。要跟上需要内核与客户端之间的状态通道。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/browser/resources/account_panel/app.html.ts | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/resources/account_panel/app.html.ts b/chrome/browser/resources/account_panel/app.html.ts
+index bfc28d9b39..593ea79c00 100644
+--- a/chrome/browser/resources/account_panel/app.html.ts
++++ b/chrome/browser/resources/account_panel/app.html.ts
+@@ -16,9 +16,15 @@ export function getHtml(this: AccountPanelAppElement) {
+ 
+   .account {
+     align-items: center;
++    color: inherit;
+     display: flex;
+     gap: 12px;
+     padding: 16px 16px 12px;
++    text-decoration: none;
++  }
++
++  .account:hover {
++    background: var(--color-sys-state-hover-on-subtle, rgba(0, 0, 0, .06));
+   }
+ 
+   .avatar {
+@@ -67,13 +73,17 @@ export function getHtml(this: AccountPanelAppElement) {
+   }
+ </style>
+ 
+-<div class="account">
++<!-- 账号那一行指向管理台的账号页（登录/注册/找回）。
++     此处曾临时指向 https://example.com 以验证白名单的拒绝路径：实测点击无任何
++     反应，而同面板下方三项照常打开 —— 两条一起看才能区分「白名单在工作」与
++     「白名单形同虚设」，只验其一，全拦死与全放行都会通过。 -->
++<a class="account" href="${this.route_('account')}">
+   <div class="avatar">${(this.displayName_ || '?').slice(0, 1)}</div>
+   <div>
+     <div class="name">${this.displayName_ || '未登录'}</div>
+     <div class="sub">云登账号</div>
+   </div>
+-</div>
++</a>
+ 
+ <hr>
+ 
+-- 
+2.52.0.windows.1
+
