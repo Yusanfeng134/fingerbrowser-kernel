@@ -45,6 +45,22 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0021 | fingerbrowser-block-native-profiles | 堵洞 | 禁用原生 profile 的创建入口（命令层 + profile-picker）|
 | 0022 | fingerbrowser-newtab-blank-omnibox | 新标签页 | 新标签页地址栏留空但保持可用（依赖 0020）|
 | 0023 | fingerbrowser-account-panel | 账号面板 | `--fp-account-panel` 用云登账号面板替换原生头像菜单（22 个文件）|
+| 0024 | fingerbrowser-aumid-prefix | 品牌 | AUMID 前缀 `Chromium.` → `Yunbrowser.`（任务栏分组键）|
+
+### 0024 说明：只改 `base_app_id`
+
+链路：`GetAppUserModelIdForBrowser()` → `ShellUtil::GetBrowserModelId()` → `install_static::GetBaseAppId()` → `chromium_install_modes.h` 的 `base_app_id`。
+
+同一张表里还有几个品牌串，**均保持原样**：`base_app_name`、`browser_prog_id_prefix`、`pdf_prog_id_prefix` 是安装器与文件关联注册用的（本产品不走安装器）；**`kProductPathName` 尤其不能顺手改** —— 它是默认用户数据目录的路径成分，改了会让所有未显式指定 `--user-data-dir` 的场景换目录。「都是品牌泄漏，一起改掉」听起来合理，但影响面完全不同。
+
+验证（`probe/check-aumid.ps1`，程序读 `System.AppUserModel.ID`，非肉眼）：
+
+```
+prof-aumid-a  Yunbrowser.U4KBPE2AZLGVDTK5V6VY.profaumida.Default
+prof-aumid-b  Yunbrowser.U4KBPE2AZLGVDTK5V6VY.profaumidb.Default
+```
+
+> **两条必须一起验。** 第二条是反例：AUMID 里的 profile 哈希决定任务栏分组，只顾改前缀而弄丢哈希，会让所有店铺环境合并成同一个任务栏按钮 —— 比留着 `Chromium` 严重得多，而只验第一条完全看不出来。
 
 ### 0023 说明：新增一个 top-chrome WebUI 要接的九处线
 

@@ -1,0 +1,91 @@
+From a382bad52ec95f493335c928a1a2b5b9681f1de7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 14:32:22 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20AUMID=20=E5=89=8D=E7=BC=80?=
+ =?UTF-8?q?=E6=94=B9=E4=B8=BA=20Yunbrowser=EF=BC=8C=E5=8E=BB=E6=8E=89?=
+ =?UTF-8?q?=E4=BB=BB=E5=8A=A1=E6=A0=8F=E4=B8=8A=E7=9A=84=E5=93=81=E7=89=8C?=
+ =?UTF-8?q?=E6=B3=84=E6=BC=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+任务栏按钮的分组键是 AUMID，用户在任务栏上右键属性即可看到，此前是
+"Chromium.<哈希>.<profile>.Default"。产物、窗口标题、文件属性早已是
+Yunbrowser，唯独这里还是 Chromium。
+
+链路：GetAppUserModelIdForBrowser() -> ShellUtil::GetBrowserModelId()
+      -> install_static::GetBaseAppId() -> chromium_install_modes.h 的
+      base_app_id。
+
+只改这一个常量。同一张表里还有几个品牌串，都保持原样：
+
+- base_app_name / browser_prog_id_prefix / pdf_prog_id_prefix：安装器与文件
+  关联注册用，本产品不走安装器。
+- kProductPathName：**默认用户数据目录的路径成分**。「都是品牌泄漏，一起改掉」
+  听起来合理，但它的影响面完全不同——改了会让所有未显式指定 --user-data-dir
+  的场景换目录。
+
+同时更新 install_util_unittest.cc 中硬编码的期望值。留着不改就是一个永远失败
+的测试，而一个永远失败的测试与没有测试等价。
+
+验证（probe/check-aumid.ps1）：程序读窗口属性存储里的
+System.AppUserModel.ID（SHGetPropertyStoreForWindow + PKEY_AppUserModel_ID），
+不是肉眼确认——这一项与地址栏那类原生 UI 不同，程序拿得到，不该退化成人工。
+
+  prof-aumid-a  Yunbrowser.U4KBPE2AZLGVDTK5V6VY.profaumida.Default
+  prof-aumid-b  Yunbrowser.U4KBPE2AZLGVDTK5V6VY.profaumidb.Default
+
+  前缀已不是 Chromium : ✓
+  两 profile 各不相同 : ✓
+
+两条必须一起验。第二条是反例：AUMID 里的 profile 哈希决定任务栏分组，只顾改
+前缀而把哈希弄丢，会让所有店铺环境合并成同一个任务栏按钮——那比留着
+Chromium 严重得多，而只验第一条完全看不出来。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/install_static/chromium_install_modes.h | 12 ++++++++++--
+ chrome/install_static/install_util_unittest.cc |  3 ++-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/install_static/chromium_install_modes.h b/chrome/install_static/chromium_install_modes.h
+index f29a8228fe..241d53fe8a 100644
+--- a/chrome/install_static/chromium_install_modes.h
++++ b/chrome/install_static/chromium_install_modes.h
+@@ -45,8 +45,16 @@ inline constexpr auto kInstallModes = std::to_array<InstallConstants>({
+         .logo_suffix = L"",  // No logo suffix for the primary install mode.
+         .app_guid =
+             L"",  // Empty app_guid since no integration with Google Update.
+-        .base_app_name = L"Chromium",              // A distinct base_app_name.
+-        .base_app_id = L"Chromium",                // A distinct base_app_id.
++        .base_app_name = L"Chromium",  // A distinct base_app_name.
++        // FingerBrowser：AUMID 的前缀。任务栏按钮的分组键是
++        // GetAppUserModelIdForBrowser() → ShellUtil::GetBrowserModelId() →
++        // 这个常量，用户在任务栏上右键属性即可看到，留着 "Chromium" 是品牌泄漏。
++        //
++        // 只改这一个。同一张表里的 base_app_name、browser_prog_id_prefix、
++        // kProductPathName 都还是 Chromium，那些是安装器与文件关联注册用的，
++        // 本产品不走安装器；kProductPathName 尤其不能顺手改——它是默认用户数据
++        // 目录的路径成分，改了会让所有未显式指定 --user-data-dir 的场景换目录。
++        .base_app_id = L"Yunbrowser",  // A distinct base_app_id.
+         .browser_prog_id_prefix = L"ChromiumHTM",  // Browser ProgID prefix.
+         .browser_prog_id_description =
+             L"Chromium HTML Document",  // Browser ProgID description.
+diff --git a/chrome/install_static/install_util_unittest.cc b/chrome/install_static/install_util_unittest.cc
+index 93599417b3..7f0ef58766 100644
+--- a/chrome/install_static/install_util_unittest.cc
++++ b/chrome/install_static/install_util_unittest.cc
+@@ -524,8 +524,9 @@ TEST_P(InstallStaticUtilTest, GetBaseAppId) {
+   };
+ #else
+   // The base app ids for the brand's install modes; parallel to kInstallModes.
++  // FingerBrowser：跟随 chromium_install_modes.h 里的 base_app_id。
+   static constexpr const wchar_t* kBaseAppIds[] = {
+-      L"Chromium",
++      L"Yunbrowser",
+   };
+ #endif
+   static_assert(std::size(kBaseAppIds) == NUM_INSTALL_MODES,
+-- 
+2.52.0.windows.1
+
