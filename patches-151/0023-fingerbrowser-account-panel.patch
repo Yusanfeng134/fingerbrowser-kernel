@@ -1,0 +1,914 @@
+From b767155e500129bf8270fb95f06d1342e81862da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Wed, 29 Jul 2026 13:58:58 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E7=94=A8=E4=BA=91=E7=99=BB?=
+ =?UTF-8?q?=E8=B4=A6=E5=8F=B7=E9=9D=A2=E6=9D=BF=E6=9B=BF=E6=8D=A2=E5=8E=9F?=
+ =?UTF-8?q?=E7=94=9F=E5=A4=B4=E5=83=8F=E8=8F=9C=E5=8D=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原生 ProfileMenuView 写着「您的 Chromium」，且其「添加/打开访客/管理个人资料」
+操作的是原生 Chromium profile —— 而本产品里 profile 这个位置已被「环境」占据。
+不过那个洞是靠命令层禁用堵住的（见 browser_command_controller.cc 那一处），
+不靠换掉菜单：菜单里看不见和做不到是两回事，那三项还能从三点菜单与
+chrome://profile-picker 走到。本改动是品牌与体验，不是安全边界。
+
+新增受控开关 --fp-account-panel（布尔）与 --fp-account-initial=<显示名>。
+不传即完全走原生 ProfileMenuView，可随时回退。隐身分支不动：那条走
+IncognitoMenuView，讲的是隐身窗口本身，与账号无关。
+
+面板被有意做成**没有任何可调用接口**：不绑 mojo，不注册 message handler。
+页面拿到的只有两个只读字符串（显示名、管理台地址），能做的只是渲染 <a href>。
+
+WebUI 跑在 chrome:// 上，天生带 WebUI 绑定，是真正的特权面 —— AI 新标签页是
+普通 http 页面，能做到一个字节的桥都不注入，这里做不到。而这类接口的成本特征
+是「加一个方法几乎零成本、减一个方法要改两边」，故在还没有第一个方法时就卡住。
+
+链接由气泡宿主接管，而不是给页面一个打开 URL 的方法：
+
+  AccountPanelBubbleView 重写 OpenURLFromTab。上游 WebUIContentsWrapper::Host
+  的默认实现返回 nullptr —— 气泡里的链接点了什么都不会发生，所以「面板项就是
+  几个 <a href>」这个形态在上游走不通，必须由宿主把导航接过来。接过来之后
+  **能去哪由 C++ 白名单决定，不由页面决定**，比给页面一个 mojo 方法收得更紧。
+  白名单复用 fingerbrowser::IsConsoleUrl，管理台的判定只能有一处定义。
+
+不使用 WebUIBubbleManager：它把 WebUIBubbleDialogView 写死在模板里，而本改动
+的全部要点就是替换那个 View 的 OpenURLFromTab。代价是要自己复刻 manager 做的
+每一步，其中两步不复刻就会出问题（见下）。
+
+三处非显然的接线，都是实测撞出来的：
+
+- 锚点必须直接取头像按钮的 View。GetAvatarToolbarButton() 优先返回
+  BubbleAnchor(TrackedElement)，不是 View；取不到 View 则气泡既无 anchor_widget
+  又无 parent_window，CreateBubble 里
+  DCHECK(bubble_params.parent || !bubble->has_parent()) 当场失败 —— 表现为
+  点头像闪退。原生 ProfileMenuView 接受 BubbleAnchor，故无此问题。
+- ShouldAutoResizeHost() 必须返回 true。默认 false 对侧栏是对的（尺寸由侧栏
+  决定），气泡没有外部尺寸来源，关掉自动伸缩就停在最小尺寸 —— 表现为弹出一个
+  空白小气泡，看起来像页面没加载，实际页面完好（实测内容已渲染成 288x186，
+  而视口只有 26px）。
+- WebUIContentsWrapper 的所有权在 coordinator。气泡视图只持 WeakPtr。
+
+WebUI 侧的接线共九处，其中只有 histograms.xml 是静默的（漏了不会失败，症状是
+运行时埋点打出未知的 WebUI 名），其余均会在 gn 或链接期报错。
+
+验证：
+- 面板替换原生菜单、内容与显示名正确（显示名由 --fp-account-initial 传入）
+- 点「环境管理」开出新标签页至管理台对应路由，面板收起
+- 先单独在标签页里打开 chrome://account-panel.top-chrome/ 验过资源打包，
+  故后续气泡空白时可确定不是资源问题
+
+未验证：白名单的**拒绝**路径。面板当前不含任何非管理台链接，因此
+「非管理台 URL 会被拦下」只有代码保证，没有实测。补一条断言需要临时加一个
+指向外部地址的链接，未做。
+
+第一期登录态是启动时快照：用户在管理台登录/登出后面板不跟着变。这是已知限制，
+要跟着变需要内核与客户端之间的状态通道。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/app/generated_resources.grd            |  3 +
+ .../fingerbrowser/fingerbrowser_console.cc    |  8 ++
+ .../fingerbrowser/fingerbrowser_console.h     |  7 ++
+ chrome/browser/resources/BUILD.gn             |  2 +
+ .../browser/resources/account_panel/BUILD.gn  | 27 ++++++
+ .../account_panel/account_panel.html          | 27 ++++++
+ .../resources/account_panel/app.html.ts       | 88 +++++++++++++++++++
+ chrome/browser/resources/account_panel/app.ts | 56 ++++++++++++
+ chrome/browser/ui/BUILD.gn                    |  4 +
+ .../profiles/account_panel_bubble_view.cc     | 54 ++++++++++++
+ .../profiles/account_panel_bubble_view.h      | 47 ++++++++++
+ .../profiles/profile_menu_coordinator.cc      | 51 +++++++++++
+ .../views/profiles/profile_menu_coordinator.h |  7 ++
+ .../browser/ui/webui/account_panel/BUILD.gn   | 26 ++++++
+ .../webui/account_panel/account_panel_ui.cc   | 77 ++++++++++++++++
+ .../ui/webui/account_panel/account_panel_ui.h | 52 +++++++++++
+ .../browser/ui/webui/chrome_web_ui_configs.cc |  2 +
+ chrome/chrome_paks.gni                        |  2 +
+ chrome/common/webui_url_constants.h           |  4 +
+ third_party/lit/v3_0/BUILD.gn                 |  1 +
+ tools/gritsettings/resource_ids.spec          |  8 ++
+ .../histograms/metadata/page/histograms.xml   |  1 +
+ 22 files changed, 554 insertions(+)
+ create mode 100644 chrome/browser/resources/account_panel/BUILD.gn
+ create mode 100644 chrome/browser/resources/account_panel/account_panel.html
+ create mode 100644 chrome/browser/resources/account_panel/app.html.ts
+ create mode 100644 chrome/browser/resources/account_panel/app.ts
+ create mode 100644 chrome/browser/ui/views/profiles/account_panel_bubble_view.cc
+ create mode 100644 chrome/browser/ui/views/profiles/account_panel_bubble_view.h
+ create mode 100644 chrome/browser/ui/webui/account_panel/BUILD.gn
+ create mode 100644 chrome/browser/ui/webui/account_panel/account_panel_ui.cc
+ create mode 100644 chrome/browser/ui/webui/account_panel/account_panel_ui.h
+
+diff --git a/chrome/app/generated_resources.grd b/chrome/app/generated_resources.grd
+index 73e3702890..4477045f7e 100644
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -9380,6 +9380,9 @@ Keep your key file in a safe place. You will need it to create new versions of y
+       <message name="IDS_SIDE_PANEL_VOYAGER_TITLE" desc="Title of the Voyager side panel entry.">
+         Voyager
+       </message>
++      <message name="IDS_ACCOUNT_PANEL_TITLE" desc="Title of the account panel bubble opened from the avatar button.">
++        账号
++      </message>
+       <message name="IDS_SIDE_PANEL_TOOLBAR_BUTTON_CXMENU_UNPIN" desc="The label of the context menu item for unpinning a side panel toolbar button.">
+         Unpin
+       </message>
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.cc b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+index 8273a0ee4a..925a4f3fb8 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.cc
+@@ -57,6 +57,14 @@ const GURL& GetNewTabUrl() {
+   return *url;
+ }
+ 
++const GURL& GetConsoleUrl() {
++  static const base::NoDestructor<GURL> url([] {
++    const url::Origin& o = ConsoleOrigin();
++    return o.opaque() ? GURL() : o.GetURL();
++  }());
++  return *url;
++}
++
+ bool IsNewTabUrl(const GURL& url) {
+   const GURL& newtab = GetNewTabUrl();
+   return newtab.is_valid() && url.is_valid() && url.path() == newtab.path() &&
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_console.h b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+index abb9e6b2f4..97f7bc92c1 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_console.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_console.h
+@@ -24,6 +24,13 @@ namespace fingerbrowser {
+ // A page cannot navigate its way into the trusted presentation: it would have
+ // to be served from the port our own server is holding.
+ //
++// The management console's base URL (scheme + host + port, path "/"), or an
++// empty URL when no console is configured. Callers append their own hash route.
++//
++// Derived from the same switch as IsConsoleUrl so the two can never disagree
++// about which origin is the console.
++const GURL& GetConsoleUrl();
++
+ // Returns true if `url` belongs to the management console origin.
+ //
+ // The AI new tab page (see GetNewTabUrl) is served by the same local server and
+diff --git a/chrome/browser/resources/BUILD.gn b/chrome/browser/resources/BUILD.gn
+index 678d13b99b..538449be14 100644
+--- a/chrome/browser/resources/BUILD.gn
++++ b/chrome/browser/resources/BUILD.gn
+@@ -90,6 +90,7 @@ group("resources") {
+       "side_panel/reading_list:resources",
+       "side_panel/shared:resources",
+       "side_panel/tabs_from_other_devices:resources",
++      "account_panel:resources",
+       "side_panel/voyager:resources",
+       "signin:resources",
+       "suggest_internals:resources",
+@@ -231,6 +232,7 @@ if (enable_webui_generate_code_cache) {
+       "side_panel/reading_list:code_cache_resources",
+       "side_panel/shared:code_cache_resources",
+       "side_panel/tabs_from_other_devices:code_cache_resources",
++      "account_panel:code_cache_resources",
+       "side_panel/voyager:code_cache_resources",
+       "webui_toolbar:code_cache_resources",
+     ]
+diff --git a/chrome/browser/resources/account_panel/BUILD.gn b/chrome/browser/resources/account_panel/BUILD.gn
+new file mode 100644
+index 0000000000..18b5713a7c
+--- /dev/null
++++ b/chrome/browser/resources/account_panel/BUILD.gn
+@@ -0,0 +1,27 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//ui/webui/resources/tools/build_webui.gni")
++import("//ui/webui/webui_features.gni")
++
++assert(!is_android)
++
++build_webui("build") {
++  grd_prefix = "account_panel"
++
++  static_files = [ "account_panel.html" ]
++
++  ts_files = [
++    "app.html.ts",
++    "app.ts",
++  ]
++
++  ts_deps = [
++    "//third_party/lit/v3_0:build_ts",
++    "//ui/webui/resources/js:build_ts",
++  ]
++
++  webui_context_type = "trusted"
++  generate_code_cache = enable_webui_generate_code_cache
++}
+diff --git a/chrome/browser/resources/account_panel/account_panel.html b/chrome/browser/resources/account_panel/account_panel.html
+new file mode 100644
+index 0000000000..8a29109fa6
+--- /dev/null
++++ b/chrome/browser/resources/account_panel/account_panel.html
+@@ -0,0 +1,27 @@
++<!doctype html>
++<html dir="$i18n{textdirection}" lang="$i18n{language}">
++<head>
++  <meta charset="utf-8">
++  <title>$i18n{title}</title>
++  <meta name="color-scheme" content="light dark">
++  <link rel="stylesheet" href="chrome://resources/css/text_defaults_md.css">
++  <link rel="stylesheet" href="chrome://theme/colors.css?sets=ui,chrome">
++  <style>
++    html,
++    body {
++      margin: 0;
++      padding: 0;
++    }
++
++    body {
++      background: var(--color-bubble-background, Canvas);
++      /* 气泡按内容自适应高度，不要撑满也不要滚动条 */
++      overflow: hidden;
++    }
++  </style>
++  <script type="module" src="app.js"></script>
++</head>
++<body>
++  <account-panel-app></account-panel-app>
++</body>
++</html>
+diff --git a/chrome/browser/resources/account_panel/app.html.ts b/chrome/browser/resources/account_panel/app.html.ts
+new file mode 100644
+index 0000000000..bfc28d9b39
+--- /dev/null
++++ b/chrome/browser/resources/account_panel/app.html.ts
+@@ -0,0 +1,88 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {AccountPanelAppElement} from './app.js';
++
++export function getHtml(this: AccountPanelAppElement) {
++  return html`<!--_html_template_start_-->
++<style>
++  :host {
++    display: block;
++    min-width: 288px;
++  }
++
++  .account {
++    align-items: center;
++    display: flex;
++    gap: 12px;
++    padding: 16px 16px 12px;
++  }
++
++  .avatar {
++    align-items: center;
++    background: var(--color-sys-tonal-container, #d3e3fd);
++    border-radius: 50%;
++    color: var(--color-sys-on-tonal-container, #001d35);
++    display: flex;
++    flex: none;
++    font-size: 16px;
++    height: 36px;
++    justify-content: center;
++    width: 36px;
++  }
++
++  .name {
++    font-size: 13px;
++    font-weight: 500;
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++  }
++
++  .sub {
++    color: var(--color-sys-on-surface-subtle, #444746);
++    font-size: 11px;
++  }
++
++  hr {
++    background: var(--color-sys-divider, #c4c7c5);
++    border: 0;
++    height: 1px;
++    margin: 4px 0;
++  }
++
++  a.item {
++    color: inherit;
++    display: block;
++    font-size: 13px;
++    padding: 10px 16px;
++    text-decoration: none;
++  }
++
++  a.item:hover {
++    background: var(--color-sys-state-hover-on-subtle, rgba(0, 0, 0, .06));
++  }
++</style>
++
++<div class="account">
++  <div class="avatar">${(this.displayName_ || '?').slice(0, 1)}</div>
++  <div>
++    <div class="name">${this.displayName_ || '未登录'}</div>
++    <div class="sub">云登账号</div>
++  </div>
++</div>
++
++<hr>
++
++<!--
++  一律用普通 <a href>，不用任何脚本发起导航：能去哪由 C++ 白名单决定。
++  面板本身没有可调用的接口，加一项只是加一个链接，减一项只是删一个链接。
++-->
++<a class="item" href="${this.route_('yunlogin-environments')}">环境管理</a>
++<a class="item" href="${this.route_('proxies')}">代理管理</a>
++<a class="item" href="${this.route_('settings')}">设置</a>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/account_panel/app.ts b/chrome/browser/resources/account_panel/app.ts
+new file mode 100644
+index 0000000000..b849208d44
+--- /dev/null
++++ b/chrome/browser/resources/account_panel/app.ts
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import '/strings.m.js';
++
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++
++import {getHtml} from './app.html.js';
++
++// 云登账号面板。替换原生 ProfileMenuView —— 后者的「添加/管理个人资料」操作的是
++// 原生 Chromium profile，而本产品里 profile 这个位置已经被「环境」占了。
++//
++// 这个面板**没有任何可调用的接口**：不接 mojo，也没有 RPC 面。它能做的全部事情
++// 就是渲染几个 <a href>，去哪由 C++ 侧的白名单决定（见 account_panel_ui.cc 的
++// OpenURLFromTab）。页面拿到的只有下面这几个只读字符串。
++//
++// 第一期登录态是**启动时的快照**：显示名由 --fp-account-initial 传入，用户在
++// 管理台里登录/登出后这里不会跟着变。这是已知限制，不是缺陷——要跟着变需要
++// 内核与客户端之间的状态通道，那是第二期。
++export class AccountPanelAppElement extends CrLitElement {
++  static get is() {
++    return 'account-panel-app';
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      displayName_: {type: String},
++      consoleUrl_: {type: String},
++    };
++  }
++
++  protected accessor displayName_: string =
++      loadTimeData.getString('accountDisplayName');
++  protected accessor consoleUrl_: string =
++      loadTimeData.getString('consoleUrl');
++
++  // 面板项对应的管理台路由。拼接放在这里而不是 C++ 里，是因为它们是产品导航结构
++  // 的一部分，改动频繁；而「允许去哪个 origin」在 C++ 白名单里，改动罕见。
++  protected route_(hash: string): string {
++    return this.consoleUrl_ ? `${this.consoleUrl_}#/${hash}` : '';
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'account-panel-app': AccountPanelAppElement;
++  }
++}
++
++customElements.define(AccountPanelAppElement.is, AccountPanelAppElement);
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 3abf658130..eb313fdb1f 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1860,6 +1860,7 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/settings",
+       "//chrome/browser/ui/webui/settings:impl",
+       "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices:impl",
++      "//chrome/browser/ui/webui/account_panel:impl",
+       "//chrome/browser/ui/webui/side_panel/voyager:impl",
+       "//chrome/browser/ui/webui/signin",
+       "//chrome/browser/ui/webui/signin:login_ui_service",
+@@ -2009,6 +2010,7 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/side_panel/history_clusters",
+       "//chrome/browser/ui/webui/side_panel/read_anything",
+       "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices",
++      "//chrome/browser/ui/webui/account_panel",
+       "//chrome/browser/ui/webui/side_panel/voyager",
+       "//chrome/browser/ui/webui/suggest_internals",
+       "//chrome/browser/ui/webui/util",
+@@ -3225,6 +3227,8 @@ static_library("ui") {
+       "views/external_protocol_dialog.h",
+       "views/hats/hats_next_web_dialog.cc",
+       "views/hats/hats_next_web_dialog.h",
++      "views/profiles/account_panel_bubble_view.cc",
++      "views/profiles/account_panel_bubble_view.h",
+       "views/profiles/incognito_menu_view.cc",
+       "views/profiles/incognito_menu_view.h",
+       "views/profiles/profile_menu_coordinator.cc",
+diff --git a/chrome/browser/ui/views/profiles/account_panel_bubble_view.cc b/chrome/browser/ui/views/profiles/account_panel_bubble_view.cc
+new file mode 100644
+index 0000000000..1c800d3de5
+--- /dev/null
++++ b/chrome/browser/ui/views/profiles/account_panel_bubble_view.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/profiles/account_panel_bubble_view.h"
++
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/window_open_disposition.h"
++
++AccountPanelBubbleView::AccountPanelBubbleView(
++    views::View* anchor_view,
++    base::WeakPtr<WebUIContentsWrapper> contents_wrapper,
++    Browser* browser)
++    : WebUIBubbleDialogView(anchor_view, std::move(contents_wrapper)),
++      browser_(browser) {}
++
++AccountPanelBubbleView::~AccountPanelBubbleView() = default;
++
++content::WebContents* AccountPanelBubbleView::OpenURLFromTab(
++    content::WebContents* source,
++    const content::OpenURLParams& params,
++    base::OnceCallback<void(content::NavigationHandle&)>
++        navigation_handle_callback) {
++  // 白名单：只放行管理台。这里是这个面板唯一的安全边界 —— 面板本身没有可调用
++  // 接口，它能造成的全部影响就是让宿主导航到某个 URL，而 URL 去哪由这一行决定。
++  //
++  // 用 IsConsoleUrl 而不是自己再写一遍匹配：管理台的判定只能有一处定义，否则
++  // 两份规则迟早漂移，而漂移出来的口子是静默的。
++  if (!browser_ || !fingerbrowser::IsConsoleUrl(params.url)) {
++    return nullptr;
++  }
++
++  // 在浏览器里开标签页，而不是在气泡内部导航：气泡是个临时浮层，把管理台加载
++  // 到里面既没有标签栏也无法返回。
++  NavigateParams nav_params(browser_, params.url,
++                            ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  nav_params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  Navigate(&nav_params);
++
++  // 选完就收起来，与原生头像菜单点任一项后的行为一致。
++  if (GetWidget()) {
++    GetWidget()->CloseWithReason(views::Widget::ClosedReason::kAcceptButtonClicked);
++  }
++
++  return nav_params.navigated_or_inserted_contents;
++}
++
++BEGIN_METADATA(AccountPanelBubbleView)
++END_METADATA
+diff --git a/chrome/browser/ui/views/profiles/account_panel_bubble_view.h b/chrome/browser/ui/views/profiles/account_panel_bubble_view.h
+new file mode 100644
+index 0000000000..53c831396d
+--- /dev/null
++++ b/chrome/browser/ui/views/profiles/account_panel_bubble_view.h
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_PROFILES_ACCOUNT_PANEL_BUBBLE_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_PROFILES_ACCOUNT_PANEL_BUBBLE_VIEW_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/views/bubble/webui_bubble_dialog_view.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++
++class Browser;
++
++// 云登账号面板的气泡宿主。
++//
++// 存在的唯一理由是重写 OpenURLFromTab。WebUI 气泡默认的实现返回 nullptr —— 页面
++// 里的链接点了什么都不会发生，所以「面板项就是几个 <a href>」这个形态在上游是
++// 走不通的，必须由宿主把导航接过来。
++//
++// 接过来之后顺带得到了一个更好的性质：**能去哪由这里的白名单决定，不由页面决定**。
++// 另一条路是给页面一个 mojo 方法让它请求打开 URL，那样就多了一个可调用的特权面，
++// 而这个面的成本特征是加一个方法几乎零成本、减一个方法要改两边。这里页面只有
++// 普通链接，一个可调用接口都没有。
++class AccountPanelBubbleView : public WebUIBubbleDialogView {
++  METADATA_HEADER(AccountPanelBubbleView, WebUIBubbleDialogView)
++
++ public:
++  AccountPanelBubbleView(views::View* anchor_view,
++                         base::WeakPtr<WebUIContentsWrapper> contents_wrapper,
++                         Browser* browser);
++  AccountPanelBubbleView(const AccountPanelBubbleView&) = delete;
++  AccountPanelBubbleView& operator=(const AccountPanelBubbleView&) = delete;
++  ~AccountPanelBubbleView() override;
++
++  // WebUIContentsWrapper::Host:
++  content::WebContents* OpenURLFromTab(
++      content::WebContents* source,
++      const content::OpenURLParams& params,
++      base::OnceCallback<void(content::NavigationHandle&)>
++          navigation_handle_callback) override;
++
++ private:
++  raw_ptr<Browser> browser_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_PROFILES_ACCOUNT_PANEL_BUBBLE_VIEW_H_
+diff --git a/chrome/browser/ui/views/profiles/profile_menu_coordinator.cc b/chrome/browser/ui/views/profiles/profile_menu_coordinator.cc
+index 94a8dbf56b..e42613c106 100644
+--- a/chrome/browser/ui/views/profiles/profile_menu_coordinator.cc
++++ b/chrome/browser/ui/views/profiles/profile_menu_coordinator.cc
+@@ -5,7 +5,14 @@
+ #include "chrome/browser/ui/views/profiles/profile_menu_coordinator.h"
+ 
+ #include "base/check_deref.h"
++#include "base/command_line.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/views/profiles/account_panel_bubble_view.h"
++#include "chrome/browser/ui/webui/account_panel/account_panel_ui.h"
++#include "chrome/browser/ui/webui/webui_embedding_context.h"
++#include "chrome/browser/ui/webui/top_chrome/webui_contents_wrapper.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/generated_resources.h"
+ #include "chrome/browser/signin/identity_manager_factory.h"
+ #include "chrome/browser/signin/signin_promo_util.h"
+ #include "chrome/browser/signin/signin_ui_util.h"
+@@ -93,6 +100,50 @@ void ProfileMenuCoordinator::ShowWithPromoResults(
+   auto avatar_toolbar_button = GetAvatarToolbarButton();
+   std::unique_ptr<ProfileMenuViewBase> bubble;
+   const bool is_incognito = GetProfile()->IsIncognitoProfile();
++
++  // FingerBrowser：用云登账号面板替换原生头像菜单。
++  //
++  // 隐身分支不动：那条走 IncognitoMenuView，讲的是隐身窗口本身，与账号无关。
++  // 不传 --fp-account-panel 时整段跳过，行为与上游完全一致，可随时回退。
++  //
++  // 原生菜单里的「添加/打开访客/管理个人资料」操作的是原生 Chromium profile，
++  // 而本产品里 profile 这个位置已经被「环境」占了。不过那个洞是靠命令层禁用
++  // 堵住的（见 browser_command_controller.cc），不靠这里换掉菜单 —— 菜单里
++  // 看不见和做不到是两回事，那三项还能从三点菜单和 chrome://profile-picker
++  // 走到。换面板是品牌与体验，不是安全边界。
++  if (!is_incognito &&
++      base::CommandLine::ForCurrentProcess()->HasSwitch("fp-account-panel")) {
++    auto contents_wrapper =
++        std::make_unique<WebUIContentsWrapperT<AccountPanelUI>>(
++            GURL(chrome::kChromeUIAccountPanelURL), GetProfile(),
++            IDS_ACCOUNT_PANEL_TITLE);
++    auto* wrapper_ptr = contents_wrapper.get();
++    account_panel_contents_ = std::move(contents_wrapper);
++
++    // 必须在建气泡前设好。WebUIBubbleManagerImpl 里也是这一步（它建 wrapper 之后
++    // 立刻调），top-chrome 那套 WebUI 靠它拿到所属浏览器窗口；不设的话页面一初始化
++    // 就取不到宿主，表现是点头像直接闪退，而不是弹出一个空面板。
++    webui::SetBrowserWindowInterface(wrapper_ptr->web_contents(),
++                                     &browser_.get());
++
++    // 直接取头像按钮的 View，不走 GetAvatarToolbarButton()。后者优先返回
++    // BubbleAnchor(TrackedElement)——不是 View，GetIfView() 给回 nullptr，于是
++    // 气泡既没有 anchor_widget 也没有 parent_window，CreateBubble 里
++    // DCHECK(bubble_params.parent || !bubble->has_parent()) 当场失败，
++    // 表现就是点头像闪退。原生 ProfileMenuView 接受 BubbleAnchor 所以没这问题。
++    views::View* const anchor_view =
++        BrowserView::GetBrowserViewForBrowser(browser)
++            ->toolbar()
++            ->avatar_toolbar_button();
++    auto panel = std::make_unique<AccountPanelBubbleView>(
++        anchor_view, wrapper_ptr->GetWeakPtr(), browser);
++    panel->SetProperty(views::kElementIdentifierKey,
++                       kToolbarAvatarBubbleElementId);
++    views::Widget* panel_widget =
++        views::BubbleDialogDelegateView::CreateBubble(std::move(panel));
++    panel_widget->Show();
++    return;
++  }
+   if (is_incognito) {
+     bubble =
+         std::make_unique<IncognitoMenuView>(avatar_toolbar_button, browser);
+diff --git a/chrome/browser/ui/views/profiles/profile_menu_coordinator.h b/chrome/browser/ui/views/profiles/profile_menu_coordinator.h
+index a11eb3208b..34d9ed7280 100644
+--- a/chrome/browser/ui/views/profiles/profile_menu_coordinator.h
++++ b/chrome/browser/ui/views/profiles/profile_menu_coordinator.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_PROFILES_PROFILE_MENU_COORDINATOR_H_
+ #define CHROME_BROWSER_UI_VIEWS_PROFILES_PROFILE_MENU_COORDINATOR_H_
+ 
++#include <memory>
+ #include <optional>
+ 
+ #include "base/memory/raw_ref.h"
+@@ -16,6 +17,7 @@
+ class BrowserWindowInterface;
+ class Profile;
+ class ProfileMenuViewBase;
++class WebUIContentsWrapper;
+ 
+ namespace signin_metrics {
+ enum class AccessPoint;
+@@ -62,6 +64,11 @@ class ProfileMenuCoordinator {
+   const raw_ref<Profile> profile_;
+   views::ViewTracker bubble_tracker_;
+ 
++  // FingerBrowser：云登账号面板的 WebContents。气泡视图只持有它的 WeakPtr
++  // （见 WebUIBubbleDialogView 构造函数的注释：wrapper 的生命周期与 View 无关），
++  // 所以得由这里保有所有权，否则气泡一显示就是空白。
++  std::unique_ptr<WebUIContentsWrapper> account_panel_contents_;
++
+   base::WeakPtrFactory<ProfileMenuCoordinator> weak_pointer_factory_{this};
+ };
+ 
+diff --git a/chrome/browser/ui/webui/account_panel/BUILD.gn b/chrome/browser/ui/webui/account_panel/BUILD.gn
+new file mode 100644
+index 0000000000..5181313d44
+--- /dev/null
++++ b/chrome/browser/ui/webui/account_panel/BUILD.gn
+@@ -0,0 +1,26 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++assert(!is_android)
++
++source_set("account_panel") {
++  public = [ "account_panel_ui.h" ]
++  public_deps = [
++    "//chrome/browser:browser_public_dependencies",
++    "//chrome/browser/ui/webui/top_chrome",
++    "//content/public/browser",
++  ]
++}
++
++source_set("impl") {
++  sources = [ "account_panel_ui.cc" ]
++  public_deps = [ ":account_panel" ]
++  deps = [
++    "//chrome/browser/fingerbrowser",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/resources/account_panel:resources",
++    "//chrome/common",
++    "//ui/webui",
++  ]
++}
+diff --git a/chrome/browser/ui/webui/account_panel/account_panel_ui.cc b/chrome/browser/ui/webui/account_panel/account_panel_ui.cc
+new file mode 100644
+index 0000000000..1b0e1d25b7
+--- /dev/null
++++ b/chrome/browser/ui/webui/account_panel/account_panel_ui.cc
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/account_panel/account_panel_ui.h"
++
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/utf_string_conversions.h"
++#include "build/build_config.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/account_panel_resources.h"
++#include "chrome/grit/account_panel_resources_map.h"
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_ui.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "content/public/common/url_constants.h"
++#include "ui/webui/webui_util.h"
++
++namespace {
++
++// 面板显示名。客户端在启动时下发，内核当不透明串——长度、语言、是否含空格
++// 都不做校验，因为这是产品/白标的东西，不是内核该有意见的地方。
++std::string AccountDisplayName() {
++  const base::CommandLine::StringType raw =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueNative(
++          "fp-account-initial");
++#if BUILDFLAG(IS_WIN)
++  return base::WideToUTF8(raw);
++#else
++  return raw;
++#endif
++}
++
++}  // namespace
++
++AccountPanelUIConfig::AccountPanelUIConfig()
++    : DefaultTopChromeWebUIConfig(content::kChromeUIScheme,
++                                  chrome::kChromeUIAccountPanelHost) {}
++
++bool AccountPanelUIConfig::IsWebUIEnabled(
++    content::BrowserContext* browser_context) {
++  // 独立开关而非复用 fp-shell：面板替换的是原生头像菜单，属于可以单独回退的
++  // 产品形态。不传即完全走原生 ProfileMenuView，行为与上游一致。
++  return base::CommandLine::ForCurrentProcess()->HasSwitch("fp-account-panel");
++}
++
++bool AccountPanelUIConfig::ShouldAutoResizeHost() {
++  return true;
++}
++
++AccountPanelUI::AccountPanelUI(content::WebUI* web_ui)
++    : TopChromeWebUIController(web_ui) {
++  Profile* profile = Profile::FromWebUI(web_ui);
++  content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
++      profile, chrome::kChromeUIAccountPanelHost);
++
++  static constexpr webui::LocalizedString kStrings[] = {
++      {"title", IDS_ACCOUNT_PANEL_TITLE},
++  };
++  source->AddLocalizedStrings(kStrings);
++
++  // 页面拿到的全部东西：一个显示名、一个管理台地址。都是只读字符串，页面无法
++  // 用它们请求内核做任何事——链接去哪仍由气泡宿主的白名单裁决。
++  source->AddString("accountDisplayName", AccountDisplayName());
++  source->AddString("consoleUrl", fingerbrowser::GetConsoleUrl().spec());
++
++  webui::SetupWebUIDataSource(source, kAccountPanelResources,
++                              IDR_ACCOUNT_PANEL_ACCOUNT_PANEL_HTML);
++}
++
++AccountPanelUI::~AccountPanelUI() = default;
++
++WEB_UI_CONTROLLER_TYPE_IMPL(AccountPanelUI)
+diff --git a/chrome/browser/ui/webui/account_panel/account_panel_ui.h b/chrome/browser/ui/webui/account_panel/account_panel_ui.h
+new file mode 100644
+index 0000000000..78c904faa0
+--- /dev/null
++++ b/chrome/browser/ui/webui/account_panel/account_panel_ui.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_ACCOUNT_PANEL_ACCOUNT_PANEL_UI_H_
++#define CHROME_BROWSER_UI_WEBUI_ACCOUNT_PANEL_ACCOUNT_PANEL_UI_H_
++
++#include <string_view>
++
++#include "chrome/browser/ui/webui/top_chrome/top_chrome_web_ui_controller.h"
++#include "chrome/browser/ui/webui/top_chrome/top_chrome_webui_config.h"
++
++class AccountPanelUI;
++
++class AccountPanelUIConfig
++    : public DefaultTopChromeWebUIConfig<AccountPanelUI> {
++ public:
++  AccountPanelUIConfig();
++
++  // DefaultTopChromeWebUIConfig:
++  bool IsWebUIEnabled(content::BrowserContext* browser_context) override;
++
++  // 气泡必须跟着页面内容定尺寸。默认实现返回 false —— 那对侧栏是对的（尺寸由
++  // 侧栏决定），但气泡没有外部尺寸来源，关掉自动伸缩就停在最小尺寸，表现为
++  // 「弹出一个空白小气泡」，看起来像页面没加载，其实页面是好的。
++  bool ShouldAutoResizeHost() override;
++};
++
++// 云登账号面板，替换原生 ProfileMenuView。
++//
++// 这个面被有意做成**没有任何可调用接口**：不绑 mojo，不注册 message handler。
++// 页面唯一能做的事是渲染 <a href>，而链接能去哪由气泡宿主的白名单决定。
++//
++// 这条约束不是洁癖。WebUI 跑在 chrome:// 上，天生带 WebUI 绑定，是真正的特权面
++// ——AI 新标签页是普通 http 页面，能做到一个字节的桥都不注入，这里做不到。而这
++// 类接口的成本特征是「加一个方法几乎零成本、减一个方法要改两边」，所以要在还
++// 没有第一个方法的时候就卡住。
++//
++// 第一期不需要任何方法：面板项全是「打开某个管理台路由」，用链接即可表达。
++class AccountPanelUI : public TopChromeWebUIController {
++ public:
++  explicit AccountPanelUI(content::WebUI* web_ui);
++  AccountPanelUI(const AccountPanelUI&) = delete;
++  AccountPanelUI& operator=(const AccountPanelUI&) = delete;
++  ~AccountPanelUI() override;
++
++  static constexpr std::string_view GetWebUIName() { return "AccountPanel"; }
++
++  WEB_UI_CONTROLLER_TYPE_DECL();
++};
++
++#endif  // CHROME_BROWSER_UI_WEBUI_ACCOUNT_PANEL_ACCOUNT_PANEL_UI_H_
+diff --git a/chrome/browser/ui/webui/chrome_web_ui_configs.cc b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+index d3fb382ea2..c57072cf25 100644
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -131,6 +131,7 @@
+ #include "chrome/browser/ui/webui/side_panel/history_clusters/history_clusters_side_panel_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/reading_list/reading_list_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_ui.h"
++#include "chrome/browser/ui/webui/account_panel/account_panel_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h"
+ #include "chrome/browser/ui/webui/signin/sync_confirmation_ui.h"
+ #include "chrome/browser/ui/webui/suggest_internals/suggest_internals_ui.h"
+@@ -396,6 +397,7 @@ void RegisterChromeWebUIConfigs() {
+   map.AddWebUIConfig(std::make_unique<TabsFromOtherDevicesUIConfig>());
+   map.AddWebUIConfig(std::make_unique<TermsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<UserEducationInternalsUIConfig>());
++  map.AddWebUIConfig(std::make_unique<AccountPanelUIConfig>());
+   map.AddWebUIConfig(std::make_unique<VoyagerSidePanelUIConfig>());
+   map.AddWebUIConfig(std::make_unique<WebAppInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<WebNNInternalsUIConfig>());
+diff --git a/chrome/chrome_paks.gni b/chrome/chrome_paks.gni
+index 3f91098522..f969ec000d 100644
+--- a/chrome/chrome_paks.gni
++++ b/chrome/chrome_paks.gni
+@@ -256,6 +256,7 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/side_panel_reading_list_resources.pak",
+         "$root_gen_dir/chrome/side_panel_shared_resources.pak",
+         "$root_gen_dir/chrome/side_panel_tabs_from_other_devices_resources.pak",
++        "$root_gen_dir/chrome/account_panel_resources.pak",
+         "$root_gen_dir/chrome/side_panel_voyager_resources.pak",
+         "$root_gen_dir/chrome/signin_resources.pak",
+         "$root_gen_dir/chrome/suggest_internals_resources.pak",
+@@ -614,6 +615,7 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/side_panel_reading_list_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_shared_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_tabs_from_other_devices_code_cache_resources.pak",
++        "$root_gen_dir/chrome/account_panel_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_voyager_code_cache_resources.pak",
+         "$root_gen_dir/chrome/webui_toolbar_code_cache_resources.pak",
+         "$root_gen_dir/ui/webui/resources/webui_code_cache_resources.pak",
+diff --git a/chrome/common/webui_url_constants.h b/chrome/common/webui_url_constants.h
+index a7950e6df8..38391479b0 100644
+--- a/chrome/common/webui_url_constants.h
++++ b/chrome/common/webui_url_constants.h
+@@ -463,6 +463,10 @@ inline constexpr char kChromeUIUntrustedReadAnythingSidePanelHost[] =
+     "read-anything-side-panel.top-chrome";
+ inline constexpr char kChromeUIUntrustedReadAnythingSidePanelURL[] =
+     "chrome-untrusted://read-anything-side-panel.top-chrome/";
++inline constexpr char kChromeUIAccountPanelHost[] =
++    "account-panel.top-chrome";
++inline constexpr char kChromeUIAccountPanelURL[] =
++    "chrome://account-panel.top-chrome/";
+ inline constexpr char kChromeUIVoyagerSidePanelHost[] =
+     "voyager.top-chrome";
+ inline constexpr char kChromeUIVoyagerSidePanelURL[] =
+diff --git a/third_party/lit/v3_0/BUILD.gn b/third_party/lit/v3_0/BUILD.gn
+index e0ca47f8c0..c04329e46f 100644
+--- a/third_party/lit/v3_0/BUILD.gn
++++ b/third_party/lit/v3_0/BUILD.gn
+@@ -102,6 +102,7 @@ ts_library("build_ts") {
+     "//chrome/browser/resources/side_panel/shared:build_ts",
+     "//chrome/browser/resources/side_panel/tabs_from_other_devices:build_ts",
+     "//chrome/browser/resources/side_panel/voyager:build_ts",
++    "//chrome/browser/resources/account_panel:build_ts",
+     "//chrome/browser/resources/signin:build_ts",
+     "//chrome/browser/resources/signin/batch_upload:build_ts",
+     "//chrome/browser/resources/signin/history_sync_optin:build_ts",
+diff --git a/tools/gritsettings/resource_ids.spec b/tools/gritsettings/resource_ids.spec
+index 2aed452f2d..0d609cb230 100644
+--- a/tools/gritsettings/resource_ids.spec
++++ b/tools/gritsettings/resource_ids.spec
+@@ -801,6 +801,14 @@
+     "META": {"sizes": {"includes": [10],}},
+     "includes": [4937],
+   },
++  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/account_panel/code_cache_resources.grd": {
++    "META": {"sizes": {"includes": [10],}},
++    "includes": [4938],
++  },
++  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/account_panel/resources.grd": {
++    "META": {"sizes": {"includes": [10],}},
++    "includes": [4939],
++  },
+   "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/signin/batch_upload/resources.grd": {
+     "META": {"sizes": {"includes": [10]}},
+     "includes": [4940],
+diff --git a/tools/metrics/histograms/metadata/page/histograms.xml b/tools/metrics/histograms/metadata/page/histograms.xml
+index 963b717e9f..218cf8c89d 100644
+--- a/tools/metrics/histograms/metadata/page/histograms.xml
++++ b/tools/metrics/histograms/metadata/page/histograms.xml
+@@ -615,6 +615,7 @@ chromium-metrics-reviews@google.com.
+ 
+ <variants name="WebUIName">
+   <variant name=""/>
++  <variant name=".AccountPanel"/>
+   <variant name=".BookmarksSidePanel"/>
+   <variant name=".CommentsSidePanel"/>
+   <variant name=".Compose"/>
+-- 
+2.52.0.windows.1
+

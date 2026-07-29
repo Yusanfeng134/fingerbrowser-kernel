@@ -44,6 +44,36 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0020 | fingerbrowser-newtab-url | 新标签页 | `--fp-newtab-url` 让新标签页打开客户端的 AI 新标签页 |
 | 0021 | fingerbrowser-block-native-profiles | 堵洞 | 禁用原生 profile 的创建入口（命令层 + profile-picker）|
 | 0022 | fingerbrowser-newtab-blank-omnibox | 新标签页 | 新标签页地址栏留空但保持可用（依赖 0020）|
+| 0023 | fingerbrowser-account-panel | 账号面板 | `--fp-account-panel` 用云登账号面板替换原生头像菜单（22 个文件）|
+
+### 0023 说明：新增一个 top-chrome WebUI 要接的九处线
+
+以 Voyager 侧栏（0016）为模板，但**宿主不同**：侧栏 → 气泡。接线清单：
+
+| # | 文件 | 漏了会怎样 |
+|---|---|---|
+| 1 | `resources/<name>/` 四件 | — |
+| 2 | `webui/<name>/` 三件 | — |
+| 3 | `webui_url_constants.h` | 编译失败 |
+| 4 | `chrome_web_ui_configs.cc` | 页面 404 |
+| 5 | `chrome_paks.gni` ×2 | gn 失败 |
+| 6 | `resources/BUILD.gn` ×2 | gn 失败 |
+| 7 | `resource_ids.spec` ×2 | 资源打不进去 |
+| 8 | `third_party/lit/v3_0/BUILD.gn` | gn 失败（可见性白名单）|
+| 9 | `histograms.xml` | **静默**：埋点打出未知 WebUI 名 |
+| — | `ui/BUILD.gn` ×2 | 链接失败 |
+
+只有第 9 条是静默的。
+
+**气泡宿主另有三处非显然的坑**（侧栏模板里没有）：
+
+- **锚点必须直接取头像按钮的 View**。`GetAvatarToolbarButton()` 优先返回 `BubbleAnchor(TrackedElement)`，不是 View；取不到 View 则气泡既无 `anchor_widget` 又无 `parent_window`，`CreateBubble` 的 `DCHECK(bubble_params.parent || !bubble->has_parent())` 当场失败 —— **表现是点头像闪退**。
+- **`ShouldAutoResizeHost()` 必须返回 true**。默认 false 对侧栏是对的（尺寸由侧栏决定），气泡没有外部尺寸来源，关掉就停在最小尺寸 —— **表现是空白小气泡，看起来像页面没加载，实际内容已渲染成 288×186 而视口只有 26px**。
+- **`WebUIContentsWrapper` 的所有权在 coordinator**，气泡视图只持 `WeakPtr`。
+
+> **链接由宿主接管，不给页面 mojo 方法。** 上游 `WebUIContentsWrapper::Host::OpenURLFromTab` 默认返回 `nullptr`，气泡里的链接点了不会有任何反应，所以「面板项就是几个 `<a href>`」在上游走不通。`AccountPanelBubbleView` 重写它并只放行管理台 origin ——**能去哪由 C++ 决定，不由页面决定**，比给页面一个打开 URL 的方法收得更紧。这个面天生是特权面（跑在 `chrome://` 上），而这类接口「加一个方法几乎零成本、减一个方法要改两边」，故在还没有第一个方法时就卡住。
+>
+> **未验证**：白名单的**拒绝**路径。面板当前不含非管理台链接，「非管理台 URL 会被拦下」只有代码保证，没有实测。
 
 ### 0021 说明：为什么在命令层禁而不在菜单里藏
 
