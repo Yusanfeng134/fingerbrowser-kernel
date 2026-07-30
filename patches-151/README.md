@@ -47,6 +47,35 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0023 | fingerbrowser-account-panel | 账号面板 | `--fp-account-panel` 用云登账号面板替换原生头像菜单（22 个文件）|
 | 0024 | fingerbrowser-aumid-prefix | 品牌 | AUMID 前缀 `Chromium.` → `Yunbrowser.`（任务栏分组键）|
 | 0025 | fingerbrowser-account-panel-login-entry | 账号面板 | 顶部账号行可点，指向管理台 `#/account`（依赖 0023）|
+| 0026 | fingerbrowser-fingerprint-contradictions | 指纹 | 消除 DPR / 媒体查询 / 触摸 / platformVersion 四处问题 |
+| 0027 | fingerbrowser-account-panel-drop-settings | 账号面板 | 去掉指向不存在路由的「设置」项（依赖 0023）|
+
+### 0026 说明：矛盾 ≠ 未伪装
+
+两者危害不同级：**未伪装**暴露真实值，检测方看到一个普通用户；**矛盾**是两个本该一致的值对不上，检测方看到的是**有人动过手脚**。后者是阳性证据。本补丁前三项是矛盾，第四项是未伪装。
+
+| 项 | 类型 | 说明 |
+|---|---|---|
+| 媒体查询 `device-width` | 矛盾 | `screen.*` 的伪装在 `Screen::width()` getter 上，媒体查询走 `ScreenInfo`，两条路各说各话。实测宿主 4K@175% 时媒体查询报 2195（= 3840/1.75）而 `screen.width` 报 1920，**一条 CSS 媒体查询即可拆穿**。复用已有 `fp-screen-*` 而不新开开关：屏幕尺寸只能有一处真相 |
+| `--fp-dpr-x1000` | 矛盾 | 宿主 1.75，而人格声称的普通桌面屏几乎总是 1；它也是上面 2195 的来源 |
+| `--fp-max-touch-points` | 矛盾 | 宿主报 10，而 `ontouchstart` 不存在、`pointer:coarse` 为否 —— 三者本该同进同退 |
+| `--fp-platform-version` | **未伪装** | Windows 上是 WinRT API Contract 版本，实测本机 19.0.0（Win11 24H2+），罕见即高熵 |
+
+> **`LayoutZoomFactor()` 已经含了设备缩放**（= 设备缩放 × 页面缩放）。第一版直接相乘等于把 1.75 又乘回去，实测 DPR 仍是 1.75，改动看起来完全没生效。现改为除掉真实设备缩放、只保留页面缩放 —— 用户按 Ctrl+= 时 DPR 本该跟着变，钉死成常数反而是新特征。
+
+> **新开关必须加进 `render_process_host_impl.cc` 的渲染进程转发白名单**，否则开关传了、代码写了、就是不生效。而媒体查询那处因复用旧开关**反而先生效了** —— 一半好一半不好，比全都不生效更难定位。
+
+> **`fp-max-touch-points` 不能用「值 > 0」判断是否接管**：0 恰恰是桌面人格该传的值。为此新增 `fingerbrowser::HasSwitch()`；策略侧同理用独立的 `has_` 标志位。
+
+> **CreepJS 报的「UA Win10 vs CH Win11」不成立。** Win11 起 UA 里的 `Windows NT` 冻结在 `10.0`，Client Hints 用另一套编号，两者不同是**正常**的 —— 真实 Win11 机器就这么报。此前转述该结论时未经核实。
+
+### 0027 说明：打开成功 ≠ 去对了地方
+
+「设置」指向 `#/settings`，而管理台没有这个路由；SPA 的兜底 `<Route path="*">` 接住它，最终显示环境管理。**能点、有反应、页面也正常渲染，只是去错了地方。**
+
+> 只验「每一项都能点开一个标签页」时该项**必然通过** —— 因为它确实打开了一个标签页。验收得逐项核对**落地页是不是它声称的那个**。
+>
+> 已做成自动检查（`probe/run-panel-links.cjs`）。两处刻意设计：**面板有几项由面板自己说**（硬编码清单则面板加项时不会失败，等于漏测）；**假管理台不设兜底路由**（真管理台的兜底恰恰是本次假通过的成因，测试环境复刻它就等于复刻盲区）。
 
 ### 0024 说明：只改 `base_app_id`
 

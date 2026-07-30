@@ -1,0 +1,61 @@
+From 397f78a2a7ab2c5e6a0161c65c00e0984c89bcef Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Thu, 30 Jul 2026 08:23:08 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E8=B4=A6=E5=8F=B7=E9=9D=A2?=
+ =?UTF-8?q?=E6=9D=BF=E5=8E=BB=E6=8E=89=E3=80=8C=E8=AE=BE=E7=BD=AE=E3=80=8D?=
+ =?UTF-8?q?=E9=A1=B9=EF=BC=8C=E5=AE=83=E6=98=AF=E4=B8=AA=E6=AD=BB=E9=93=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+该项指向 #/settings，而管理台没有这个路由 —— SPA 的兜底 <Route path="*"> 接住
+它，最终显示环境管理。能点、有反应、页面也正常渲染，只是去错了地方；用户不会
+觉得这是缺陷，只会以为设置页坏了。
+
+不改指向别处凑数：设置页真做出来之前，任何替代目的地都是同一个名不副实换了个
+形式。等它存在了按同样流程加回来。
+
+这条躲过验收的方式值得记住：只验「每一项都能点开一个标签页」，该项**必然通过**
+—— 因为它确实打开了一个标签页。通过条件被一个与被测属性无关的前提满足了：
+打开成功 ≠ 去对了地方。要发现它，验收得逐项核对落地页是不是它声称的那个。
+
+已把这条做成自动检查（probe/run-panel-links.cjs）：从面板 DOM 读出所有链接与
+目标，逐个核对路由是否真实存在。两处刻意设计：
+
+- 面板有几项、指向哪里由面板自己说，脚本不硬编码清单 —— 否则面板加项时这里
+  不会失败，等于漏测。
+- 假管理台不设兜底路由，未知路由明确失败而不是被兜底页悄悄接住。真管理台的
+  兜底恰恰是本次假通过的成因，测试环境复刻它就等于复刻了那个盲区。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/browser/resources/account_panel/app.html.ts | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/resources/account_panel/app.html.ts b/chrome/browser/resources/account_panel/app.html.ts
+index 593ea79c00..8c500e1690 100644
+--- a/chrome/browser/resources/account_panel/app.html.ts
++++ b/chrome/browser/resources/account_panel/app.html.ts
+@@ -93,6 +93,18 @@ export function getHtml(this: AccountPanelAppElement) {
+ -->
+ <a class="item" href="${this.route_('yunlogin-environments')}">环境管理</a>
+ <a class="item" href="${this.route_('proxies')}">代理管理</a>
+-<a class="item" href="${this.route_('settings')}">设置</a>
++<!--
++  这里曾有一项「设置」指向 #/settings，而管理台没有这个路由 —— SPA 的兜底
++  <Route path="*"> 接住它，最终显示环境管理。**能点、有反应、页面也正常渲染，
++  只是去错了地方**，用户只会以为设置页坏了。
++
++  它躲过验收的方式值得记住：只验「每一项都能点开一个标签页」，这条必然通过，
++  因为它确实打开了一个标签页。要发现它，验收得逐项核对**落地页是不是它声称
++  的那个**。
++
++  设置页真做出来之前不放替代目的地 —— 任何「指向别处凑数」都是同一个名不副实
++  换了个形式。
++-->
++
+ <!--_html_template_end_-->`;
+ }
+-- 
+2.52.0.windows.1
+

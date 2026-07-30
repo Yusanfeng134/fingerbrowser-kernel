@@ -1,0 +1,370 @@
+From 09111517ca8024ae78fc1a298df0f1a7f8dc7ee9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Thu, 30 Jul 2026 08:13:37 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E6=B6=88=E9=99=A4=E5=9B=9B?=
+ =?UTF-8?q?=E5=A4=84=E6=8C=87=E7=BA=B9=E7=9F=9B=E7=9B=BE=EF=BC=88DPR?=
+ =?UTF-8?q?=E3=80=81=E5=AA=92=E4=BD=93=E6=9F=A5=E8=AF=A2=E3=80=81=E8=A7=A6?=
+ =?UTF-8?q?=E6=91=B8=E3=80=81platformVersion=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+区分「未伪装」与「矛盾」：前者暴露真实值，检测方看到一个普通用户；后者是两个
+本该一致的值对不上，检测方看到的是有人动过手脚。后者是阳性证据，危害高一级。
+本改动四项里前三项是矛盾，第四项是未伪装。
+
+1) 媒体查询的 device-width/height 与 screen.* 同源
+
+   screen.* 的伪装做在 Screen::width() 这个 getter 上，而媒体查询走 ScreenInfo，
+   两条路各说各话：实测宿主 4K@175% 时媒体查询报 2195（= 3840/1.75），而
+   screen.width 报伪装后的 1920。一条 CSS 媒体查询即可拆穿。
+
+   复用已有的 fp-screen-* 而不新开开关：屏幕尺寸只能有一处真相，两份规则迟早
+   漂移，而漂移出来的又是矛盾。
+
+2) 新增 --fp-dpr-x1000：devicePixelRatio
+
+   宿主 4K + 175% 缩放时报 1.75，而人格声称的是一块 1920x1080 普通桌面屏，
+   那种屏几乎总是 1。它也是上面 2195 的来源。
+
+   实现踩了一个坑：LayoutZoomFactor() 在 zoom-for-DSF 下**已经含了设备缩放**
+   （= 设备缩放 × 页面缩放），第一版直接相乘等于把 1.75 又乘回去，实测 DPR
+   仍是 1.75，改动看起来完全没生效。现改为先除掉真实设备缩放、只保留页面缩放
+   那一份 —— 用户按 Ctrl+= 时 DPR 本该跟着变（真实 1x 屏在 110% 下报 1.1），
+   钉死成常数反而是个新特征。
+
+3) 新增 --fp-max-touch-points：navigator.maxTouchPoints
+
+   宿主带触摸屏时报 10，而同一台机器上 ontouchstart 不存在、(pointer: coarse)
+   为否 —— 这三者本该同进同退。
+
+   0 是桌面人格的正确值，也是最常见的取值，故新增 fingerbrowser::HasSwitch()
+   以「开关是否在场」判断是否接管。此前所有整数开关都靠「值 > 0」，那对 screen
+   宽高、DPR 成立（0 无意义），对触摸点数不成立 —— 会把「明确要求无触摸」读成
+   「没配置」。策略侧同理，用单独的 has_ 标志位而非值本身。
+
+4) 新增 --fp-platform-version：Client Hints 的 platformVersion
+
+   Windows 上它是 WinRT Universal API Contract 版本，直接反映宿主发行版：本机
+   实测 19.0.0（Win11 24H2+），而装机量最大的档位更低。声称普通美国 Windows
+   用户的人格报出罕见值，等于自带高熵标识。
+
+   这一项是「未伪装」而非「矛盾」。UA 里的 Windows NT 自 Win11 起冻结在 10.0，
+   与 platformVersion 用不同编号是**正常**的，真实 Win11 机器就这么报 ——
+   CreepJS 报的「UA Win10 vs CH Win11」并不成立，此前转述该结论时未经核实。
+
+   不设默认值、不自动推导：合理取值取决于人格声称的 Windows 版本，内核无从
+   判断，猜一个可能同样罕见。客户端不传则保持真实值。
+
+另：新开关必须加进 render_process_host_impl.cc 的渲染进程转发白名单。不加则
+开关传了、代码写了、就是不生效 —— 而媒体查询那处因为复用旧开关反而先生效了，
+一半好一半不好，比全都不生效更难定位。
+
+验证（probe/run-creepjs-audit.cjs，一个自洽的美国 Windows 人格）：四条矛盾检查
+全部通过，矛盾项 0 个。
+
+审计脚本本身修了两条不合格的断言：
+- UA/CH 那条原先只验「两个值都存在」，必然通过，且验错了对象（见上）。现改为
+  与人格配置值比对。原先那个 <= 13 的阈值是拍出来的，没有依据 —— 用编出来的
+  阈值判定，通过与否都说明不了什么。
+- TTS 那条把 getVoices() 首次调用的空数组当成「没有 CJK 语音」。getVoices 是
+  异步填充的，空列表与是否屏蔽无关。现改为等 voiceschanged，且列表为空时明确
+  标注「无法判定」，不计入通过。
+
+未解决：TTS 语音列表在本机为空，该项无法判定；WebGL 参数（MAX_TEXTURE_SIZE 等）
+仍是宿主真实值。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser/fingerbrowser_policy.cc     | 29 +++++++++++++++++++
+ .../fingerbrowser/fingerbrowser_policy.h      | 12 ++++++++
+ .../embedder_support/user_agent_utils.cc      | 20 +++++++++++++
+ .../renderer_host/render_process_host_impl.cc |  2 ++
+ .../blink/renderer/core/css/media_values.cc   | 17 +++++++++++
+ .../renderer/core/events/navigator_events.cc  | 10 +++++++
+ .../blink/renderer/core/frame/local_frame.cc  | 29 +++++++++++++++++++
+ .../fingerbrowser/fingerbrowser_fingerprint.h | 19 ++++++++++++
+ 8 files changed, 138 insertions(+)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index 96588721ab..e3267198ed 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -207,6 +207,11 @@ std::optional<FingerBrowserPolicy> ParsePolicyDict(
+         platform && IsSafeDisplayString(*platform)) {
+       policy.platform = *platform;
+     }
++    if (const std::string* platform_version =
++            hardware_profile->FindString("platformVersion");
++        platform_version && IsSafeDisplayString(*platform_version)) {
++      policy.platform_version = *platform_version;
++    }
+     if (const std::optional<int> hardware_concurrency =
+             hardware_profile->FindInt("hardwareConcurrency");
+         hardware_concurrency && *hardware_concurrency >= 1 &&
+@@ -374,6 +379,10 @@ void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
+   if (!policy.platform.empty()) {
+     command_line->AppendSwitchASCII("fp-platform", policy.platform);
+   }
++  if (!policy.platform_version.empty()) {
++    command_line->AppendSwitchASCII("fp-platform-version",
++                                    policy.platform_version);
++  }
+   if (policy.hardware_concurrency > 0) {
+     command_line->AppendSwitchASCII(
+         "fp-hardware-concurrency",
+@@ -408,6 +417,26 @@ void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
+     command_line->AppendSwitchASCII("fp-screen-height",
+                                     base::NumberToString(policy.screen_height));
+   }
++  // 伪装了 screen.* 就必须一并伪装 DPR：宿主 4K@175% 时 DPR 报 1.75，而媒体查询
++  // 的 device-width = 物理宽 ÷ DPR ≈ 2195，与伪装成 1920 的 screen.width 对不上。
++  // 少这一项不是「少伪装一条」，是把伪装本身暴露出来。
++  //
++  // 客户端未指定时按 1.0 兜底：人格声称的是普通桌面屏，那种屏几乎总是 1；
++  // 而沿用宿主真实值必然与伪装后的 screen.* 矛盾。
++  if (policy.screen_width > 0 || policy.screen_height > 0) {
++    command_line->AppendSwitchASCII(
++        "fp-dpr-x1000", base::NumberToString(
++                            policy.device_pixel_ratio_x1000 > 0
++                                ? policy.device_pixel_ratio_x1000
++                                : 1000));
++  }
++  // 触摸点数。0 是桌面人格最常见也最该传的值，所以用 has_ 标志判断是否下发，
++  // 不能用「值 > 0」——那会把「明确要求无触摸」读成「没配置」。
++  if (policy.has_max_touch_points) {
++    command_line->AppendSwitchASCII(
++        "fp-max-touch-points",
++        base::NumberToString(policy.max_touch_points));
++  }
+   if (policy.has_geo) {
+     command_line->AppendSwitchASCII(
+         "fp-geo-lat-e6", base::NumberToString(policy.geo_latitude_e6));
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+index e35ade5e8d..ac7b815b43 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.h
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
+@@ -47,6 +47,10 @@ struct FingerBrowserPolicy {
+   std::string webgpu_device;
+   std::string webgpu_description;
+   std::string platform;
++  // Client Hints 的 platformVersion（Windows 上是 WinRT API Contract 版本，
++  // 如 "15.0.0"）。为空则保持宿主真实值 —— 合理取值取决于人格声称的 Windows
++  // 版本，内核无从判断，猜一个可能同样罕见。
++  std::string platform_version;
+   int hardware_concurrency = 0;
+   int device_memory = 0;
+   int canvas_noise_seed = 0;
+@@ -56,6 +60,14 @@ struct FingerBrowserPolicy {
+   // 真实分辨率，必须单独伪装。
+   int screen_width = 0;
+   int screen_height = 0;
++  // devicePixelRatio × 1000（1000 = 1.0）。0 表示未配置，此时若伪装了 screen.*
++  // 会按 1.0 兜底——普通桌面屏几乎总是 1，而沿用宿主真实值必然与伪装后的
++  // screen.* 矛盾（宿主 4K@175% 时 DPR=1.75，媒体查询宽度算出 2195 而非 1920）。
++  int device_pixel_ratio_x1000 = 0;
++  // navigator.maxTouchPoints。0 是桌面人格的正确值，也是最常见的取值，故用单独
++  // 的标志位区分「配了 0」与「没配」——用值本身判断会把前者读成后者。
++  bool has_max_touch_points = false;
++  int max_touch_points = 0;
+   // 经纬度以 1e6 倍整数保存，0 表示未配置（用 has_geo 区分真实的 0 坐标）。
+   bool has_geo = false;
+   int geo_latitude_e6 = 0;
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 0d78444b25..c220516f39 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -607,6 +607,26 @@ bool GetMobileBitForUAMetadata() {
+ }
+ 
+ std::string GetPlatformVersion() {
++  // FingerBrowser：Client Hints 的 platformVersion。
++  //
++  // Windows 上它是 WinRT Universal API Contract 版本，直接反映宿主的 Windows
++  // 发行版 —— 实测本机报 19.0.0（Win11 24H2+），而市面上多数机器落在更低的档位。
++  // 一个声称自己是普通美国 Windows 用户的人格报出罕见值，等于自带高熵标识。
++  //
++  // 这一项属于「未伪装」而非「矛盾」：UA 里的 Windows NT 自 Win11 起就冻结在
++  // 10.0，与 platformVersion 用不同编号是**正常**的，真实 Win11 机器就这么报。
++  // CreepJS 把二者并列成「UA Win10 vs CH Win11」并不成立，不要照抄那个结论。
++  //
++  // 不设默认值、不自动推导：合理取值取决于人格声称的 Windows 版本，内核无从
++  // 判断。客户端不传就保持真实值 —— 与其猜一个可能同样罕见的数字，不如让
++  // 配置方负责。
++  if (const std::string fb_version =
++          base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++              "fp-platform-version");
++      !fb_version.empty()) {
++    return fb_version;
++  }
++
+ #if BUILDFLAG(IS_ANDROID)
+   if (base::android::device_info::is_desktop() ||
+       base::android::device_info::is_xr()) {
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 15e11bb07e..85d216a3b0 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3844,6 +3844,8 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       "fp-accept-lang",
+       "fp-screen-width",
+       "fp-screen-height",
++      "fp-dpr-x1000",
++      "fp-max-touch-points",
+       "fp-geo-lat-e6",
+       "fp-geo-lon-e6",
+       "fp-webrtc-ip-policy",
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index 0d60244742..ef5e18df8e 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -12,6 +12,7 @@
+ #include "third_party/blink/renderer/core/css/media_values_cached.h"
+ #include "third_party/blink/renderer/core/css/media_values_dynamic.h"
+ #include "third_party/blink/renderer/core/css/style_engine.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/core/css_value_keywords.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+@@ -171,6 +172,16 @@ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+     device_width = static_cast<int>(
+         lroundf(device_width * screen_info.device_scale_factor));
+   }
++  // FingerBrowser：媒体查询的 device-width 必须与 screen.width 同源。
++  // screen.* 的伪装做在 Screen::width() 这个 getter 上，而媒体查询走 ScreenInfo，
++  // 两条路各说各话 —— 实测宿主 4K@175% 时这里报 2195、screen.width 报 1920，
++  // 一条 CSS 媒体查询就能拆穿。复用同一个开关而不是新开一个：屏幕尺寸只能有
++  // 一处真相，两份规则迟早漂移，而漂移出来的又是矛盾。
++  if (const int fb_width =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      fb_width > 0) {
++    return fb_width;
++  }
+   return device_width;
+ }
+ 
+@@ -183,6 +194,12 @@ int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
+     device_height = static_cast<int>(
+         lroundf(device_height * screen_info.device_scale_factor));
+   }
++  // FingerBrowser：同 CalculateDeviceWidth，与 screen.height 同源。
++  if (const int fb_height =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      fb_height > 0) {
++    return fb_height;
++  }
+   return device_height;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/events/navigator_events.cc b/third_party/blink/renderer/core/events/navigator_events.cc
+index a57561775c..6785bc2bd8 100644
+--- a/third_party/blink/renderer/core/events/navigator_events.cc
++++ b/third_party/blink/renderer/core/events/navigator_events.cc
+@@ -34,10 +34,20 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ 
+ namespace blink {
+ 
+ int32_t NavigatorEvents::maxTouchPoints(Navigator& navigator) {
++  // FingerBrowser：宿主带触摸屏时这里报 10，而同一台机器上 ontouchstart 不存在、
++  // (pointer: coarse) 为否 —— 这三者本该同进同退。对不上不是「少伪装一项」，
++  // 是阳性证据：检测方看到的是有人动过手脚，而不是一个普通用户。
++  //
++  // 开关值 0 表示无触摸（桌面人格），也是最常见的取值，所以用「是否传了这个
++  // 开关」而不是「值是否大于 0」来判断是否接管。
++  if (fingerbrowser::HasSwitch(fingerbrowser::kMaxTouchPointsSwitch)) {
++    return fingerbrowser::IntSwitch(fingerbrowser::kMaxTouchPointsSwitch);
++  }
+   LocalDOMWindow* window = navigator.DomWindow();
+   return window ? window->GetFrame()->GetSettings()->GetMaxTouchPoints() : 0;
+ }
+diff --git a/third_party/blink/renderer/core/frame/local_frame.cc b/third_party/blink/renderer/core/frame/local_frame.cc
+index b50b6d67f8..77aca89e5f 100644
+--- a/third_party/blink/renderer/core/frame/local_frame.cc
++++ b/third_party/blink/renderer/core/frame/local_frame.cc
+@@ -220,6 +220,7 @@
+ #include "third_party/blink/renderer/core/svg/svg_document_extensions.h"
+ #include "third_party/blink/renderer/core/timing/dom_window_performance.h"
+ #include "third_party/blink/renderer/platform/back_forward_cache_utils.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
+ #include "third_party/blink/renderer/platform/bindings/source_location.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
+@@ -1841,6 +1842,34 @@ double LocalFrame::DevicePixelRatio() const {
+   if (!page_)
+     return 0;
+ 
++  // FingerBrowser：devicePixelRatio。宿主 4K + 175% 缩放时这里是 1.75，而人格
++  // 声称的是一块 1920x1080 的普通桌面屏 —— 那种屏的 DPR 几乎总是 1。
++  //
++  // 放在这里而不是 LocalDOMWindow::devicePixelRatio()：媒体查询的
++  // MediaValues::CalculateDevicePixelRatio() 也调这个函数，改一处两边同时生效，
++  // 不会出现 window.devicePixelRatio 与 (resolution: Xdppx) 各说各话。
++  //
++  // LayoutZoomFactor() 在 zoom-for-DSF 下**已经含了设备缩放**（= 设备缩放 ×
++  // 页面缩放），直接相乘等于把 1.75 又乘回去 —— 第一版就这么写的，实测 DPR
++  // 仍是 1.75，改动看起来完全没生效。
++  //
++  // 所以先把真实设备缩放除掉，只保留页面缩放那一份：用户按 Ctrl+= 放大页面时
++  // DPR 本来就该跟着变（真实 1x 屏在 110% 缩放下报 1.1），钉死成常数反而是个
++  // 新特征。
++  if (const int fb_dpr_x1000 =
++          fingerbrowser::IntSwitch(fingerbrowser::kDevicePixelRatioX1000Switch);
++      fb_dpr_x1000 > 0) {
++    // GetScreenInfo 取非 const 引用，而本函数是 const —— 这里只读屏幕信息，
++    // 不改帧状态，故去掉 const 限定是安全的。
++    const float real_dsf =
++        page_->GetChromeClient()
++            .GetScreenInfo(const_cast<LocalFrame&>(*this))
++            .device_scale_factor;
++    const double page_zoom =
++        real_dsf > 0 ? LayoutZoomFactor() / real_dsf : LayoutZoomFactor();
++    return (fb_dpr_x1000 / 1000.0) * page_zoom;
++  }
++
+   double ratio = page_->InspectorDeviceScaleFactorOverride();
+   ratio *= LayoutZoomFactor();
+   return ratio;
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index 0f2e1843dd..6c2e4f12ec 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -55,6 +55,18 @@ inline constexpr char kAcceptLangSwitch[] = "fp-accept-lang";
+ // screen.width/height 仍是宿主真实分辨率，两者不一致本身就是可检测特征。
+ inline constexpr char kScreenWidthSwitch[] = "fp-screen-width";
+ inline constexpr char kScreenHeightSwitch[] = "fp-screen-height";
++// devicePixelRatio。以 1000 倍整数传递（同经纬度，避免浮点字符串的本地化问题）：
++// 1000 = 1.0，1500 = 1.5。
++//
++// 不伪装它的后果不是「少伪装一项」，而是**制造矛盾**：宿主 4K + 175% 缩放时
++// DPR 报 1.75，而媒体查询的 device-width 是物理宽 ÷ DPR = 3840/1.75 ≈ 2195，
++// 与伪装成 1920 的 screen.width 对不上。检测方看到的不是一个普通用户，而是
++// 「有人动过手脚」——阳性证据，比单纯泄漏真实值严重。
++inline constexpr char kDevicePixelRatioX1000Switch[] = "fp-dpr-x1000";
++// navigator.maxTouchPoints。宿主带触摸屏时它是 10，而 ontouchstart 不存在、
++// pointer:coarse 为否——这三者本该同进同退，对不上同样是阳性证据。
++// 传 0 表示无触摸（桌面人格）。
++inline constexpr char kMaxTouchPointsSwitch[] = "fp-max-touch-points";
+ inline constexpr char kDoNotTrackSwitch[] = "fp-do-not-track";
+ // 经纬度以 1e6 倍整数传递（命令行开关只走整数解析，避免浮点字符串的本地化问题）。
+ inline constexpr char kGeoLatitudeE6Switch[] = "fp-geo-lat-e6";
+@@ -103,6 +115,13 @@ inline int IntSwitch(const char* name) {
+   return (!value.empty() && base::StringToInt(value, &parsed)) ? parsed : 0;
+ }
+ 
++// 用于合法值包含 0 的开关。此前所有整数开关都靠「值 > 0」判断是否接管，那对
++// screen 宽高、DPR 成立（0 无意义），但对 maxTouchPoints 不成立 —— 0 恰恰是
++// 桌面人格最该传的值，用 IntSwitch 判会把「明确要求无触摸」读成「没配置」。
++inline bool HasSwitch(const char* name) {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(name);
++}
++
+ inline uint32_t CanvasSeed() {
+   return static_cast<uint32_t>(IntSwitch(kCanvasNoiseSwitch));
+ }
+-- 
+2.52.0.windows.1
+
