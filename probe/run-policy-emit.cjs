@@ -47,6 +47,12 @@ const PORT = 9471
 
 const WANT_DPR = 1.5
 const WANT_TOUCH = 5
+// 16 是刻意选的：本机基线 32（宿主 >=32GB）。旧校验器只接受 {1,2,4,8}，会把 16
+// 静默丢弃 -> 开关不下发 -> 页面仍读 32；新校验器接受 -> 读到 16。基线、旧行为、
+// 期望值三者两两不同，所以红绿可分。
+// 注意 151 桌面的可达集合是 {2,4,8,16,32}（钳位 [2,32]，8 只在 Android 分支），
+// 与 124 的 {0.25..8} 不同 —— 这个值不能照搬到 124 的探针上。
+const WANT_MEM = 16
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -65,12 +71,12 @@ fs.writeFileSync(POLICY, JSON.stringify({
     hardwareProfile: {
       platform: 'Win32',
       hardwareConcurrency: 8,
-      deviceMemory: 8,
       screenWidth: 1920,
       screenHeight: 1080,
-      // 被测的两个字段。DPR 刻意用小数，见文件头。
+      // 被测的三个字段。DPR 刻意用小数，见文件头。
       devicePixelRatio: WANT_DPR,
       maxTouchPoints: WANT_TOUCH,
+      deviceMemory: WANT_MEM,
     },
   },
 }, null, 2), 'utf8')
@@ -116,7 +122,7 @@ async function measure(withPolicy, profileSuffix) {
       id: 1, method: 'Runtime.evaluate',
       params: {
         returnByValue: true,
-        expression: 'JSON.stringify({dpr: devicePixelRatio, touch: navigator.maxTouchPoints})',
+        expression: 'JSON.stringify({dpr: devicePixelRatio, touch: navigator.maxTouchPoints, mem: navigator.deviceMemory})',
       },
     }))
   })
@@ -130,7 +136,7 @@ function fail(msg) { console.log('X ' + msg); process.exit(1) }
 ;(async () => {
   // ── 1. 基线：不带策略 ───────────────────────────────────────────────
   const base = await measure(false, 'base')
-  console.log(`  基线（无策略）  dpr=${base.dpr}  maxTouchPoints=${base.touch}`)
+  console.log(`  基线（无策略）  dpr=${base.dpr}  maxTouchPoints=${base.touch}  deviceMemory=${base.mem}`)
 
   // 前提检查：配置值必须与基线不同，否则「生效」与「没生效」不可区分。
   // 这不是可选的谨慎 —— 正是原探针失败的根因：它选的 0 恰好等于宿主真值。
@@ -142,10 +148,15 @@ function fail(msg) { console.log('X ' + msg); process.exit(1) }
     fail(`基线 maxTouchPoints 恰好等于要配置的 ${WANT_TOUCH}，本次测量无法区分。\n` +
          `  换一个配置值再跑（改本文件的 WANT_TOUCH）。`)
   }
+  if (base.mem === WANT_MEM) {
+    fail(`基线 deviceMemory 恰好等于要配置的 ${WANT_MEM}，本次测量无法区分。\n` +
+         `  换一个配置值再跑（改本文件的 WANT_MEM），且必须落在上游可达集合内\n` +
+         `  （151 桌面是 {2,4,8,16,32}，见 check-policy-contract.cjs 的输出）。`)
+  }
 
   // ── 2. 带策略 ───────────────────────────────────────────────────────
   const got = await measure(true, 'policy')
-  console.log(`  带策略          dpr=${got.dpr}  maxTouchPoints=${got.touch}`)
+  console.log(`  带策略          dpr=${got.dpr}  maxTouchPoints=${got.touch}  deviceMemory=${got.mem}`)
   console.log('')
 
   let bad = 0
@@ -172,12 +183,22 @@ function fail(msg) { console.log('X ' + msg); process.exit(1) }
     console.log(`OK navigator.maxTouchPoints = ${WANT_TOUCH}（基线是 ${base.touch}，确实变了）`)
   }
 
+  if (got.mem !== WANT_MEM) {
+    bad++
+    const why = got.mem === base.mem
+      ? '与基线相同 —— fp-device-memory 很可能没下发（校验器把该值当非法丢弃了？）。'
+      : '既不是配置值也不是基线值。'
+    console.log(`X navigator.deviceMemory: 期望 ${WANT_MEM}，实际 ${got.mem}。${why}`)
+  } else {
+    console.log(`OK navigator.deviceMemory = ${WANT_MEM}（基线是 ${base.mem}，确实变了）`)
+  }
+
   console.log('')
   if (bad) {
     console.log(`X ${bad} 项未通过 —— 策略 JSON 到渲染侧这条链路有断点。`)
     process.exit(1)
   }
   console.log('OK 策略 JSON → 开关下发 → 渲染侧，整条链路通。')
-  console.log('   注意：这只覆盖 devicePixelRatio 与 maxTouchPoints 两个字段。')
+  console.log('   注意：这只覆盖 devicePixelRatio、maxTouchPoints、deviceMemory 三个字段。')
   console.log('   其余字段仍只被命令行直传的探针验过，同一个洞可能还在别处。')
 })().catch((e) => { console.log('X ' + e.message); process.exit(1) })

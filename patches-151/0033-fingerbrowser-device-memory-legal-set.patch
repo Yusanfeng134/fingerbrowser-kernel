@@ -1,0 +1,87 @@
+From dd5c430e4744dc5ba3b10683300c275de63d99bd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 14:31:04 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20deviceMemory=20=E5=90=88?=
+ =?UTF-8?q?=E6=B3=95=E9=9B=86=E5=90=88=E6=8C=89=20151=20=E7=9A=84=E5=AE=9E?=
+ =?UTF-8?q?=E9=99=85=E9=92=B3=E4=BD=8D=E6=94=B9=E4=B8=BA=20{2,4,8,16,32}?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原先是 {1,2,4,8}，那是 124 时代的规范。151 改了钳位，照搬过来两头都错。
+
+真相在 third_party/blink/common/device_memory/approximated_device_memory.cc：
+算法把物理内存舍入到 2 的幂再转 GB，然后钳到 [kMinMemory, kMaxMemory]。151 桌面
+是 [2, 32]（kMaxMemory=8 只在 #if BUILDFLAG(IS_ANDROID) 分支里），所以可达取值
+恰好是 {2,4,8,16,32}。124 那边只有「>8 封顶到 8」、无下限，可达 {0.25..8} ——
+**两个内核的合法集合本来就不同，124 的 {1,2,4,8} 是对的，不要跟着改。**
+
+  接受 1     151 桌面下限是 2，永远不会报 1。客户端配了 1，我们就报出一个原生
+             浏览器产生不了的值 —— 那不是「暴露真实内存」，是暴露「这不是真实
+             浏览器」，危害高一级。
+  拒绝 16/32 151 上这两个既合法又常见。拒掉等于高配人格无法表达，且我们所有
+             151 环境都报 <=8，形成群体性偏斜。
+
+## 这条是被一个错误的报告逼出来的
+
+客户端报「navigator.deviceMemory=32，规范只有 0.25..8，真实浏览器不可能报 32，
+内核回落路径少了规范封顶」。**那条不成立** —— 32 正是原生 Chromium 151 在一台
+32GB 机器上的输出，内核调的就是上游那个函数，没有少封顶。他记的是旧规范。
+
+但顺着去读上游那个文件，才看见校验器的集合早就过期了。错误的报告指向了一个真
+问题，只是方向相反。
+
+## 漂移检测
+
+合法集合随 Chromium 版本变化，而这类漂移没有编译错误、没有运行时报错，只有恰好
+去读上游那个文件时才发现。probe/check-policy-contract.cjs 现在从上游源码抠出钳位
+常量、算出可达集合，跟校验器实际接受的集合比 —— 两边都不硬编码，下次上游再改会
+自己响。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser/fingerbrowser_policy.cc     | 26 +++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index e8faf75ccc..ac598bb060 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -218,10 +218,32 @@ std::optional<FingerBrowserPolicy> ParsePolicyDict(
+         *hardware_concurrency <= 128) {
+       policy.hardware_concurrency = *hardware_concurrency;
+     }
++    // deviceMemory 的合法集合**随 Chromium 版本变化**，这份是 151 的。
++    //
++    // 真相在 third_party/blink/common/device_memory/approximated_device_memory.cc
++    // 的 CalculateAndSetApproximatedDeviceMemory()：算法把物理内存舍入到 2 的幂
++    // 再转 GB，然后钳到 [kMinMemory, kMaxMemory]。151 桌面是 [2, 32]
++    //（kMaxMemory=8 只在 #if BUILDFLAG(IS_ANDROID) 分支里），所以桌面可达取值
++    // 恰好是 {2, 4, 8, 16, 32}。
++    //
++    // 原先这里写的是 {1, 2, 4, 8} —— 那是 124 时代的规范（那时只有 >8 封顶到 8、
++    // 没有下限）。照搬到 151 有两个反向的错：
++    //
++    //   接受 1  →  151 桌面**永远不会**报 1（下限是 2）。客户端配了 1，我们就
++    //             报出一个原生浏览器产生不了的值 —— 那不是「暴露真实内存」，
++    //             是暴露「这不是真实浏览器」，危害高一级。
++    //   拒绝 16/32 → 151 桌面上这两个既合法又常见。拒掉等于高配人格无法表达，
++    //             而且我们所有 151 环境都报 ≤8，形成群体性偏斜。
++    //
++    // 非法值静默丢弃（不写入 policy，开关不下发，回落到宿主真值）。这一点本身
++    // 危险：缺省在指纹场景里不是中性的，它等于泄漏宿主。但改成「拒绝整份策略」
++    // 会让一个字段配错就整个环境起不来，那是另一种更糟的失败。留在这里记一笔，
++    // 由 probe/check-policy-contract.cjs 侧去发现这类「配了但没生效」。
+     if (const std::optional<int> device_memory =
+             hardware_profile->FindInt("deviceMemory");
+-        device_memory && (*device_memory == 1 || *device_memory == 2 ||
+-                          *device_memory == 4 || *device_memory == 8)) {
++        device_memory && (*device_memory == 2 || *device_memory == 4 ||
++                          *device_memory == 8 || *device_memory == 16 ||
++                          *device_memory == 32)) {
+       policy.device_memory = *device_memory;
+     }
+     if (const std::optional<int> canvas_noise =
+-- 
+2.52.0.windows.1
+

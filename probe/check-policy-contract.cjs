@@ -77,8 +77,17 @@ function clientMentions(dir, keys) {
         files++
         let txt
         try { txt = fs.readFileSync(p, 'utf8') } catch (e2) { continue }
+
+        // 先剥注释再匹配。裸 \bkey\b 会把注释里的提及也算成「客户端发了」——
+        // 实测过：platformVersion 在客户端有 3 处命中，其中 2 处是注释，只有
+        // 1 处是真赋值。若那天只有注释，这个检查会通过，而字段实际没下发。
+        // 「提到过」不等于「发出去了」，这正是本目录反复记录的假通过形态。
+        const stripped = txt
+          .replace(/\/\*[\s\S]*?\*\//g, ' ')   // 块注释
+          .replace(/(^|[^:])\/\/[^\n]*/g, '$1') // 行注释（避开 http:// 里的 //）
+
         for (const k of keys) {
-          if (new RegExp(`\\b${k}\\b`).test(txt)) found.add(k)
+          if (new RegExp(`\\b${k}\\b`).test(stripped)) found.add(k)
         }
       }
     }
@@ -119,6 +128,78 @@ for (const k of KERNELS) {
   }
   console.log('')
 }
+
+// ── deviceMemory 合法集合的漂移检测 ─────────────────────────────────────
+//
+// 策略校验器里硬编码着 deviceMemory 的合法取值集合，而**真相在 blink 里，且随
+// Chromium 版本变化**。124 桌面只有「>8 封顶到 8」、无下限，可达 {0.25…8}；
+// 151 改成钳到 [kMinMemory, kMaxMemory] = [2, 32]（8 只在 Android 分支），可达
+// {2,4,8,16,32}。校验器一直写的是 124 时代的 {1,2,4,8}，于是在 151 上两头错：
+// 接受 151 产生不了的 1（=暴露「这不是真实浏览器」），拒掉合法常见的 16/32。
+//
+// 这类漂移没有任何编译错误、没有运行时报错，只有在有人恰好去读上游那个文件时
+// 才会发现。所以从上游源码里把常量抠出来，跟校验器实际接受的集合比。
+function checkDeviceMemorySet(kernelName, policyFile, blinkFile) {
+  if (!fs.existsSync(blinkFile)) {
+    console.log(`  ? 内核 ${kernelName}：找不到 ${blinkFile}，deviceMemory 合法集合未检查`)
+    return 0
+  }
+  const blink = fs.readFileSync(blinkFile, 'utf8')
+
+  // 上游有两种形态：151 的 kMinMemory/kMaxMemory 变量，124 的裸 `> 8` 封顶。
+  let lo = null, hi = null
+  const mMax = blink.match(/float\s+kMaxMemory\s*=\s*([\d.]+)f/)
+  const mMin = blink.match(/float\s+kMinMemory\s*=\s*([\d.]+)f/)
+  if (mMax && mMin) {
+    lo = parseFloat(mMin[1]); hi = parseFloat(mMax[1])
+  } else {
+    const legacy = blink.match(/approximated_device_memory_gb_\s*>\s*(\d+)\)/)
+    if (legacy) { lo = 0.25; hi = parseFloat(legacy[1]) }
+  }
+  if (lo === null) {
+    console.log(`  X 内核 ${kernelName}：从 ${path.basename(blinkFile)} 抠不出钳位常量 —— 抠取规则失效，不能判定。`)
+    return 1
+  }
+
+  // 算法产出 2 的幂 / 1024 GB，再钳到 [lo, hi]。
+  const reachable = []
+  for (let v = 0.25; v <= 4096; v *= 2) {
+    const c = Math.min(Math.max(v, lo), hi)
+    if (!reachable.includes(c)) reachable.push(c)
+  }
+  reachable.sort((a, b) => a - b)
+
+  const pol = fs.readFileSync(policyFile, 'utf8')
+  const seg = pol.slice(pol.indexOf('FindInt("deviceMemory")'))
+  const accepted = [...seg.slice(0, 400).matchAll(/\*device_memory\s*==\s*(\d+)/g)]
+    .map((m) => parseInt(m[1], 10)).sort((a, b) => a - b)
+  if (accepted.length === 0) {
+    console.log(`  X 内核 ${kernelName}：抠不出校验器接受的 deviceMemory 集合。`)
+    return 1
+  }
+
+  const illegal = accepted.filter((x) => !reachable.includes(x))
+  const missing = reachable.filter((x) => Number.isInteger(x) && !accepted.includes(x))
+  console.log(`  内核 ${kernelName} deviceMemory：上游可达 [${reachable.join(', ')}]，校验器接受 [${accepted.join(', ')}]`)
+  if (illegal.length) {
+    console.log(`    X 接受了上游产生不了的值：${illegal.join(', ')}`)
+    console.log('      配上它 → 报出原生浏览器不可能有的值 → 暴露「这不是真实浏览器」')
+  }
+  if (missing.length) {
+    console.log(`    X 拒掉了上游合法的值：${missing.join(', ')} → 那类人格无法表达`)
+  }
+  if (!illegal.length && !missing.length) console.log('    OK 两边一致')
+  return (illegal.length || missing.length) ? 1 : 0
+}
+
+console.log('── deviceMemory 合法集合（上游钳位 vs 策略校验器）──')
+for (const k of KERNELS) {
+  if (!fs.existsSync(k.policy)) continue
+  const blink = path.join(k.policy.split('/chrome/browser/')[0],
+    'third_party/blink/common/device_memory/approximated_device_memory.cc')
+  bad += checkDeviceMemorySet(k.name, k.policy, blink)
+}
+console.log('')
 
 // 反方向（客户端发了、内核不读）这里查不了：需要客户端那侧导出它写出的键集合。
 // 明说而不是假装覆盖到了 —— 那正是本目录反复记录的假通过。
