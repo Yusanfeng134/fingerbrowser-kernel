@@ -1,0 +1,117 @@
+From 5b2883bd1e2edb823d23328e5dbe56fed85212e9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 10:16:06 +0800
+Subject: [PATCH 28/30] =?UTF-8?q?fingerbrowser:=20=E5=90=91=E9=87=8F?=
+ =?UTF-8?q?=E5=9B=BE=E6=A0=87=E8=81=9A=E5=90=88=E8=84=9A=E6=9C=AC=E6=8C=89?=
+ =?UTF-8?q?=20UTF-8=20=E8=AF=BB=E5=86=99=EF=BC=8C=E4=B8=8D=E5=86=8D?=
+ =?UTF-8?q?=E5=90=83=E4=B8=AD=E6=96=87=20Windows=20=E7=9A=84=20GBK?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+在中文 Windows 上给 .icon 文件写中文注释，构建报的是：
+
+  gen/chrome/app/vector_icons/vector_icons.cc: FAILED
+  UnicodeDecodeError: 'gbk' codec can't decode byte 0x82 in position 206
+
+报错点在聚合脚本，不在那个文件，也没说是哪个文件 —— 400 多个 .icon 里找一个。
+Python 的 open() 不带 encoding 时用 locale 编码，简体中文 Windows 上是 GBK。
+
+与 0012（blink 的 json5_generator.py / in_generator.py）同一族。上游 .icon 全是
+纯 ASCII，所以这条永远轮不到上游踩；它只在有人用非拉丁语写注释的那一刻触发。
+
+六处 open() 一起改，不只改撞上的那一处：其余五处是同一个错误的另外五次拷贝，
+留着就是留着五颗同样的雷，而下一次触发同样会是一条指错地方的报错。
+其中三处（模板读入）在续行上加 encoding，注意关键字参数不能排在位置参数之前。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../vector_icons/aggregate_vector_icons.py    | 28 +++++++++++++------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/components/vector_icons/aggregate_vector_icons.py b/components/vector_icons/aggregate_vector_icons.py
+index 1974b6fc9e..eb71e4dcba 100644
+--- a/components/vector_icons/aggregate_vector_icons.py
++++ b/components/vector_icons/aggregate_vector_icons.py
+@@ -55,7 +55,15 @@ def ExtractIconReps(icon_file_name):
+   Args:
+       icon_file_name: The file path of the icon file to read.
+   """
+-  with open(icon_file_name, "r") as icon_file:
++  # FingerBrowser: encoding must be explicit. Without it Python uses the locale
++  # encoding, which on a Chinese Windows host is GBK -- an .icon file whose
++  # comments contain non-ASCII then fails to read and the build stops with
++  # UnicodeDecodeError, pointing at the aggregator rather than at the file.
++  #
++  # Upstream .icon files are pure ASCII, so this never fires for them; it fires
++  # the moment anyone documents an icon in a non-Latin language. Same family as
++  # patches-151/0012 (blink code generators) and 0001 (Chinese Windows ACLs).
++  with open(icon_file_name, "r", encoding="utf-8") as icon_file:
+     icon_file_contents = icon_file.readlines()
+ 
+   current_icon_size = REFERENCE_SIZE_DIP
+@@ -121,7 +129,7 @@ def AggregateVectorIcons(working_directory, file_list, output_cc, output_h, outp
+   # .icon. This will map the icon's name to its path, e.g.,
+   # path_map['cat'] = 'foo/bar/cat.icon'.
+   icon_list = []
+-  with open(file_list, "r") as f:
++  with open(file_list, "r", encoding="utf-8") as f:
+     file_list_contents = f.read()
+   icon_list = shlex.split(file_list_contents)
+ 
+@@ -143,10 +151,10 @@ def AggregateVectorIcons(working_directory, file_list, output_cc, output_h, outp
+   # converting to camel case, prepending 'k', and appending 'Icon'. For
+   # example, the icon 'foo_bar' will have the variable name kFooBarIcon.
+   with open(os.path.join(working_directory, "vector_icons.h.template"),
+-            "r") as input_header_template:
++            "r", encoding="utf-8") as input_header_template:
+     header_template_contents = input_header_template.readlines()
+ 
+-  output_header = open(output_h, "w")
++  output_header = open(output_h, "w", encoding="utf-8")
+   for line in header_template_contents:
+     if not TEMPLATE_PLACEHOLDER in line:
+       output_header.write(line)
+@@ -163,11 +171,12 @@ def AggregateVectorIcons(working_directory, file_list, output_cc, output_h, outp
+   # into their individual icon representations, and use them to generate
+   # vector_icons.cc, which defines the variables declared in vector_icons.h.
+   input_cc_template = open(
+-      os.path.join(working_directory, "vector_icons.cc.template"))
++      os.path.join(working_directory, "vector_icons.cc.template"),
++      encoding="utf-8")
+   cc_template_contents = input_cc_template.readlines()
+   input_cc_template.close()
+ 
+-  output_cc = open(output_cc, "w")
++  output_cc = open(output_cc, "w", encoding="utf-8")
+   for line in cc_template_contents:
+     if not TEMPLATE_PLACEHOLDER in line:
+       output_cc.write(line)
+@@ -198,12 +207,13 @@ def AggregateVectorIcons(working_directory, file_list, output_cc, output_h, outp
+ 
+   if (output_test_h):
+       input_test_cc_template = open(
+-          os.path.join(working_directory, "vector_icons_unittest.h.template"))
++          os.path.join(working_directory, "vector_icons_unittest.h.template"),
++          encoding="utf-8")
+       cc_test_template_contents = input_test_cc_template.readlines()
+       input_test_cc_template.close()
+ 
+       # Write the vector icon unittests.
+-      output_test_h = open(output_test_h, "w")
++      output_test_h = open(output_test_h, "w", encoding="utf-8")
+       for line in cc_test_template_contents:
+         if not TEMPLATE_PLACEHOLDER in line:
+           output_test_h.write(line)
+@@ -213,7 +223,7 @@ def AggregateVectorIcons(working_directory, file_list, output_cc, output_h, outp
+                                    os.path.basename(path_map[icon]))
+           formatted_name = GetIconName(icon_name)
+           icon_file_contents = []
+-          with open(path_map[icon], "r") as icon_file:
++          with open(path_map[icon], "r", encoding="utf-8") as icon_file:
+                 icon_file_contents = icon_file.readlines()
+           output_test_h.write("""TEST_F(VectorIconsTest, Parse{}) {{ \\
+               std::string s = \\\n""".format(formatted_name[1:]))
+-- 
+2.52.0.windows.1
+

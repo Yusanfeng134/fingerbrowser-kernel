@@ -1,0 +1,983 @@
+From b74f45140a42bf735772de304114e14447d35473 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 10:28:05 +0800
+Subject: [PATCH 30/30] =?UTF-8?q?fingerbrowser:=20=E7=81=B5=E5=8A=A8?=
+ =?UTF-8?q?=E5=B2=9B=E7=9A=84=E5=B7=A5=E5=85=B7=E6=A0=8F=E5=85=A5=E5=8F=A3?=
+ =?UTF-8?q?=E3=80=81=E5=91=BD=E4=BB=A4=E4=B8=8E=E5=BF=AB=E6=8D=B7=E9=94=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上一个补丁把页面注册好了但没有入口，这一个把入口装上：工具栏按钮 →
+DynamicIslandCoordinator → 气泡承载那个 WebUI。另加命令
+IDC_TOGGLE_DYNAMIC_ISLAND 与 Ctrl+Shift+K。
+
+按钮不做成 pinned action：pinned action 自带右键「取消固定」，用户一旦隐藏，
+唯一的 AI 入口就只能从三点菜单找回 —— 对产品的签名入口是负债。代价是不进
+ToolbarView::GetViewCommandMap()（那里有两处写死的 std::array<Button*, 5>，
+扩它是典型的静默失效点），按钮因此不跟随命令 enabled 态；岛按钮只要可见就该
+可用，本来也不需要跟随。
+
+气泡与协调器独立成 //chrome/browser/ui/views/dynamic_island，不像 0023 的账号
+面板那样直接挂进 chrome/browser/ui：chrome/browser/ui 已经 deps 了
+views/toolbar:impl，而岛按钮住在 toolbar 里、要 include 气泡头文件，留在原处就是
+toolbar -> chrome/browser/ui -> toolbar 的 GN 环。0023 没撞上是因为它挂在**已有的**
+头像按钮上，不需要 toolbar 反向依赖 —— 「照抄上一个同类实现」在这里会失效，
+差别不在气泡本身，在谁去唤起它。
+
+快捷键选 Ctrl+Shift+K，不是原计划的 Ctrl+Shift+A：后者已被 IDC_TAB_SEARCH 占用
+（accelerator_table.cc 同一张表里，往上数几行）。也没选带 Space 的组合 ——
+中文 Windows 上 Ctrl+Space 是输入法开关、Ctrl+Shift 是键盘布局切换，那类冲突在
+英文布局的开发机上复现不出来。
+
+顺手补了 chrome_action_id.h 的映射。kUseActionsForBrowserCommands 现在默认关闭，
+走 CommandUpdaterImpl，任意 ID 都能用；但那个 flag 一旦翻开，未映射的命令在
+CommandActionUpdater::SupportsCommand 只是返回 false —— 不 CHECK，不报错，快捷键
+从此静默失效。一行消掉整类风险。
+
+三处编译器拦不住的错配，其中两处是写完之后才查出来的：
+
+- tooltip 文案里写着 Ctrl+Shift+A，而绑定是 K。字符串和快捷键表之间没有任何约束
+  把它们绑在一起，按提示按下去会打开标签搜索。
+- 图标原先用 SetVectorIcons(rounded, old)。那个函数的第二参数是**触摸模式**图标，
+  不是样式变体（ToolbarButton::UpdateIcon() 只按 touch_ui() 二选一，
+  IsRoundedIconsEnabled 在那条路径上根本没人读）。实际效果是桌面永远只见圆角款、
+  触摸模式反而换成旧款 —— 编译链接全过。改为在样式轴上自己判。
+- view_ids.h 的注释以「插中间会平移后续 ID」为由说明位置选择，而它自己就在平移。
+  核实后位移无害（这些是编译期枚举常量，VIEW_ID_PREDEFINED_COUNT 在 chrome/ 下
+  没有任何消费者，不持久化不跨进程），但把一条不成立的理由留在代码里会误导
+  下一个人。改成实话。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/app/chrome_command_ids.h               |  4 +
+ chrome/app/generated_resources.grd            |  9 ++
+ chrome/app/vector_icons/BUILD.gn              |  2 +
+ chrome/app/vector_icons/dynamic_island.icon   | 32 +++++++
+ .../app/vector_icons/dynamic_island_old.icon  | 18 ++++
+ chrome/browser/ui/BUILD.gn                    |  4 +
+ chrome/browser/ui/accelerator_table.cc        |  9 ++
+ chrome/browser/ui/actions/chrome_action_id.h  |  1 +
+ .../browser/ui/browser_command_controller.cc  | 18 ++++
+ .../browser/ui/browser_element_identifiers.cc |  4 +
+ .../browser/ui/browser_element_identifiers.h  |  3 +
+ chrome/browser/ui/browser_window.h            |  8 ++
+ chrome/browser/ui/view_ids.h                  |  8 ++
+ .../browser/ui/views/dynamic_island/BUILD.gn  | 51 +++++++++++
+ .../dynamic_island_bubble_view.cc             | 70 +++++++++++++++
+ .../dynamic_island_bubble_view.h              | 54 ++++++++++++
+ .../dynamic_island_coordinator.cc             | 87 +++++++++++++++++++
+ .../dynamic_island_coordinator.h              | 67 ++++++++++++++
+ chrome/browser/ui/views/frame/browser_view.cc | 10 +++
+ chrome/browser/ui/views/frame/browser_view.h  |  1 +
+ chrome/browser/ui/views/toolbar/BUILD.gn      |  5 ++
+ .../ui/views/toolbar/dynamic_island_button.cc | 64 ++++++++++++++
+ .../ui/views/toolbar/dynamic_island_button.h  | 45 ++++++++++
+ .../browser/ui/views/toolbar/toolbar_view.cc  | 17 ++++
+ .../browser/ui/views/toolbar/toolbar_view.h   |  8 ++
+ 25 files changed, 599 insertions(+)
+ create mode 100644 chrome/app/vector_icons/dynamic_island.icon
+ create mode 100644 chrome/app/vector_icons/dynamic_island_old.icon
+ create mode 100644 chrome/browser/ui/views/dynamic_island/BUILD.gn
+ create mode 100644 chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.cc
+ create mode 100644 chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.h
+ create mode 100644 chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.cc
+ create mode 100644 chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.h
+ create mode 100644 chrome/browser/ui/views/toolbar/dynamic_island_button.cc
+ create mode 100644 chrome/browser/ui/views/toolbar/dynamic_island_button.h
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index 3bdb2131ef..8bae6a29b4 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -634,6 +634,10 @@
+ #define IDC_OMNIBOX_CONTEXT_SHARED_TABS_SUBMENU               54019
+ #define IDC_OMNIBOX_CONTEXT_SMART_TAB_SHARING                 54020
+ 
++// FingerBrowser 命令段：56800 起。刻意远离上游的增长区（当前最大 54020），
++// 每次 rebase 都不会撞号；上限 57343 之下仍留有余量。
++#define IDC_TOGGLE_DYNAMIC_ISLAND                             56800
++
+ // NOTE: The last valid command value is 57343 (0xDFFF)
+ // See http://msdn.microsoft.com/en-us/library/t2zechd4(VS.71).aspx
+ 
+diff --git a/chrome/app/generated_resources.grd b/chrome/app/generated_resources.grd
+index 4477045f7e..2beec54d5b 100644
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -9383,6 +9383,15 @@ Keep your key file in a safe place. You will need it to create new versions of y
+       <message name="IDS_ACCOUNT_PANEL_TITLE" desc="Title of the account panel bubble opened from the avatar button.">
+         账号
+       </message>
++      <message name="IDS_DYNAMIC_ISLAND_TITLE" desc="Title of the dynamic island bubble for asking the AI assistant.">
++        AI 助手
++      </message>
++      <message name="IDS_TOOLTIP_DYNAMIC_ISLAND" desc="Tooltip for the toolbar button that opens the AI assistant island.">
++        问 AI 助手 (Ctrl+Shift+K)
++      </message>
++      <message name="IDS_ACCNAME_DYNAMIC_ISLAND" desc="Accessible name for the toolbar button that opens the AI assistant island.">
++        AI 助手
++      </message>
+       <message name="IDS_SIDE_PANEL_TOOLBAR_BUTTON_CXMENU_UNPIN" desc="The label of the context menu item for unpinning a side panel toolbar button.">
+         Unpin
+       </message>
+diff --git a/chrome/app/vector_icons/BUILD.gn b/chrome/app/vector_icons/BUILD.gn
+index af65e7bc86..a7d920d24b 100644
+--- a/chrome/app/vector_icons/BUILD.gn
++++ b/chrome/app/vector_icons/BUILD.gn
+@@ -136,6 +136,8 @@ aggregate_vector_icons("chrome_vector_icons") {
+     "draft_spark_old.icon",
+     "drive_shortcut.icon",
+     "drive_shortcut_chrome_refresh_old.icon",
++    "dynamic_island.icon",
++    "dynamic_island_old.icon",
+     "edit.icon",
+     "edit_chrome_refresh_old.icon",
+     "error_filled.icon",
+diff --git a/chrome/app/vector_icons/dynamic_island.icon b/chrome/app/vector_icons/dynamic_island.icon
+new file mode 100644
+index 0000000000..92b6a16c89
+--- /dev/null
++++ b/chrome/app/vector_icons/dynamic_island.icon
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// 灵动岛（AI 助手）工具栏按钮图标：四角星。
++// 这是圆角图标风格下的变体，与 dynamic_island_old.icon 成对 —— 151 的工具栏
++// 按钮普遍走 features::IsRoundedIconsEnabled() 双分支，只给一个不会崩，但会和
++// 左右邻居风格不一致。
++
++CANVAS_DIMENSIONS, 24,
++MOVE_TO, 12, 3,
++R_CUBIC_TO, 0.4f, 0, 0.75f, 0.26f, 0.87f, 0.64f,
++R_LINE_TO, 1.3f, 4.06f,
++R_ARC_TO, 3.2f, 3.2f, 0, 0, 0, 2.07f, 2.07f,
++R_LINE_TO, 4.06f, 1.3f,
++R_CUBIC_TO, 0.38f, 0.12f, 0.64f, 0.47f, 0.64f, 0.87f,
++R_CUBIC_TO, 0, 0.4f, -0.26f, 0.75f, -0.64f, 0.87f,
++R_LINE_TO, -4.06f, 1.3f,
++R_ARC_TO, 3.2f, 3.2f, 0, 0, 0, -2.07f, 2.07f,
++R_LINE_TO, -1.3f, 4.06f,
++R_CUBIC_TO, -0.12f, 0.38f, -0.47f, 0.64f, -0.87f, 0.64f,
++R_CUBIC_TO, -0.4f, 0, -0.75f, -0.26f, -0.87f, -0.64f,
++R_LINE_TO, -1.3f, -4.06f,
++R_ARC_TO, 3.2f, 3.2f, 0, 0, 0, -2.07f, -2.07f,
++R_LINE_TO, -4.06f, -1.3f,
++CUBIC_TO, 3.26f, 12.75f, 3, 12.4f, 3, 12,
++R_CUBIC_TO, 0, -0.4f, 0.26f, -0.75f, 0.64f, -0.87f,
++R_LINE_TO, 4.06f, -1.3f,
++R_ARC_TO, 3.2f, 3.2f, 0, 0, 0, 2.07f, -2.07f,
++R_LINE_TO, 1.3f, -4.06f,
++CUBIC_TO, 11.25f, 3.26f, 11.6f, 3, 12, 3,
++CLOSE
+diff --git a/chrome/app/vector_icons/dynamic_island_old.icon b/chrome/app/vector_icons/dynamic_island_old.icon
+new file mode 100644
+index 0000000000..665fd133fa
+--- /dev/null
++++ b/chrome/app/vector_icons/dynamic_island_old.icon
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// 灵动岛（AI 助手）工具栏按钮图标：四角星，旧图标风格变体。
++// 与 dynamic_island.icon 成对，见那份文件的说明。
++// 旧风格的星形更瘦、笔画更直，与同期的 draft_spark_old.icon 一致。
++
++CANVAS_DIMENSIONS, 24,
++MOVE_TO, 12, 2.5f,
++R_LINE_TO, 2.1f, 6.4f,
++R_LINE_TO, 6.4f, 2.1f,
++R_LINE_TO, -6.4f, 2.1f,
++R_LINE_TO, -2.1f, 6.4f,
++R_LINE_TO, -2.1f, -6.4f,
++R_LINE_TO, -6.4f, -2.1f,
++R_LINE_TO, 6.4f, -2.1f,
++CLOSE
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index eb313fdb1f..a76b5cd8fb 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1861,6 +1861,8 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/settings:impl",
+       "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices:impl",
+       "//chrome/browser/ui/webui/account_panel:impl",
++      "//chrome/browser/ui/views/dynamic_island:impl",
++      "//chrome/browser/ui/webui/dynamic_island:impl",
+       "//chrome/browser/ui/webui/side_panel/voyager:impl",
+       "//chrome/browser/ui/webui/signin",
+       "//chrome/browser/ui/webui/signin:login_ui_service",
+@@ -2011,6 +2013,8 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/side_panel/read_anything",
+       "//chrome/browser/ui/webui/side_panel/tabs_from_other_devices",
+       "//chrome/browser/ui/webui/account_panel",
++      "//chrome/browser/ui/views/dynamic_island",
++      "//chrome/browser/ui/webui/dynamic_island",
+       "//chrome/browser/ui/webui/side_panel/voyager",
+       "//chrome/browser/ui/webui/suggest_internals",
+       "//chrome/browser/ui/webui/util",
+diff --git a/chrome/browser/ui/accelerator_table.cc b/chrome/browser/ui/accelerator_table.cc
+index 847093f9bb..79c5c47ed6 100644
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -65,6 +65,15 @@ const AcceleratorMapping kAcceleratorMap[] = {
+     {ui::VKEY_F, ui::EF_PLATFORM_ACCELERATOR, IDC_FIND},
+     {ui::VKEY_A, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
+      IDC_TAB_SEARCH},
++    // FingerBrowser：灵动岛。
++    //
++    // 选 K 不选 A：Ctrl+Shift+A 是上面这条 IDC_TAB_SEARCH，撞了。
++    // 也不选 Space：中文 Windows 上 Ctrl+Space 是输入法开关、Ctrl+Shift 是
++    // 键盘布局切换，带 Space 的组合在目标用户机器上有被输入法先吃掉的风险，
++    // 而这类失败在开发机（英文键盘布局）上复现不出来。
++    // Ctrl+Shift+K 在本表中空闲，且不与任何输入法约定重叠。
++    {ui::VKEY_K, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
++     IDC_TOGGLE_DYNAMIC_ISLAND},
+     {ui::VKEY_G, ui::EF_PLATFORM_ACCELERATOR, IDC_FIND_NEXT},
+     {ui::VKEY_G, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
+      IDC_FIND_PREVIOUS},
+diff --git a/chrome/browser/ui/actions/chrome_action_id.h b/chrome/browser/ui/actions/chrome_action_id.h
+index 3862c3dacb..de93bdd5f2 100644
+--- a/chrome/browser/ui/actions/chrome_action_id.h
++++ b/chrome/browser/ui/actions/chrome_action_id.h
+@@ -609,6 +609,7 @@
+   E(kActionShowAiOverlayDialog) \
+   E(kActionWebAuthnAmbientSignin) \
+   E(kActionAutofillPayment) \
++  E(kActionToggleDynamicIsland, IDC_TOGGLE_DYNAMIC_ISLAND) \
+ 
+ #define CHROME_ACTION_IDS \
+     CHROME_COMMON_ACTION_IDS \
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index 31d812492f..64d9da8b1a 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/browsing_data_important_sites_util.h"
+ #include "chrome/browser/defaults.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
+ #include "chrome/browser/devtools/devtools_window.h"
+ #include "chrome/browser/devtools/features.h"
+ #include "chrome/browser/feedback/public/feedback_source.h"
+@@ -679,6 +680,11 @@ void BrowserCommandController::HandleCommandWithDisposition(
+     case IDC_TAB_SEARCH_TOGGLE_PIN:
+       ToggleTabSearchPin(browser_);
+       break;
++    case IDC_TOGGLE_DYNAMIC_ISLAND:
++      // 直接打 BrowserWindow，不经 browser_commands.cc 转一手：那层在这里
++      // 只会是一个纯转发函数，多两个文件的补丁面换不来任何东西。
++      window()->ToggleDynamicIsland();
++      break;
+     case IDC_TOGGLE_VERTICAL_TABS:
+       ToggleVerticalTabs(browser_);
+       break;
+@@ -1973,6 +1979,18 @@ void BrowserCommandController::InitCommandState() {
+   command_updater_->UpdateCommandEnabled(IDC_TAB_SEARCH_TOGGLE_PIN,
+                                          enable_tab_search_commands);
+ 
++  // FingerBrowser：灵动岛。门禁与按钮创建条件保持一致 —— 非 fp-shell 下命令
++  // 不可用，Ctrl+Shift+K 就落回给页面，不会被浏览器吞掉。
++  //
++  // 开关直接经 base::CommandLine 读，与本文件上方 0021 的 fb_manages_profiles
++  // 以及 toolbar_view.cc 的按钮创建条件写法一致。fingerbrowser::HasSwitch 是
++  // blink 侧 fingerbrowser_fingerprint.h 的内联函数，浏览器进程够不着。
++  command_updater_->UpdateCommandEnabled(
++      IDC_TOGGLE_DYNAMIC_ISLAND,
++      browser_->is_type_normal() &&
++          base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell") &&
++          fingerbrowser::GetNewTabUrl().is_valid());
++
+   command_updater_->UpdateCommandEnabled(IDC_SHOW_CONTEXTUAL_TASKS_SIDE_PANEL,
+                                          true);
+ 
+diff --git a/chrome/browser/ui/browser_element_identifiers.cc b/chrome/browser/ui/browser_element_identifiers.cc
+index 6e43cac4b8..a18f33079b 100644
+--- a/chrome/browser/ui/browser_element_identifiers.cc
++++ b/chrome/browser/ui/browser_element_identifiers.cc
+@@ -215,6 +215,10 @@ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarActionViewElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarAppMenuButtonElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarAvatarBubbleElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarAvatarButtonElementId);
++// FingerBrowser：灵动岛按钮与其气泡。声明与定义必须成对，只加一处会在链接期
++// 报未定义符号 —— 那是好事，属于响亮失败。
++DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarDynamicIslandButtonElementId);
++DEFINE_ELEMENT_IDENTIFIER_VALUE(kDynamicIslandBubbleElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarBackButtonElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarBackButtonMenuElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kToolbarBatterySaverBubbleElementId);
+diff --git a/chrome/browser/ui/browser_element_identifiers.h b/chrome/browser/ui/browser_element_identifiers.h
+index c98f0ee20c..bcef471f72 100644
+--- a/chrome/browser/ui/browser_element_identifiers.h
++++ b/chrome/browser/ui/browser_element_identifiers.h
+@@ -258,6 +258,9 @@ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarActionViewElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarAppMenuButtonElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarAvatarBubbleElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarAvatarButtonElementId);
++// FingerBrowser：灵动岛按钮与其气泡。
++DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarDynamicIslandButtonElementId);
++DECLARE_ELEMENT_IDENTIFIER_VALUE(kDynamicIslandBubbleElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarBackButtonElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarBackButtonMenuElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kToolbarBatterySaverBubbleElementId);
+diff --git a/chrome/browser/ui/browser_window.h b/chrome/browser/ui/browser_window.h
+index 880ba06755..8d704f7a33 100644
+--- a/chrome/browser/ui/browser_window.h
++++ b/chrome/browser/ui/browser_window.h
+@@ -498,6 +498,14 @@ class BrowserWindow : public ui::BaseWindow {
+   // Closes the tab search bubble if open for the given browser instance.
+   virtual void CloseTabSearchBubble() = 0;
+ 
++  // FingerBrowser: 展开/收起灵动岛。这是 chrome/browser/ui 抵达 views 层工具栏
++  // 唯一不产生 GN 依赖环的通路（CreateTabSearchBubble 走的也是这条）。
++  //
++  // 有默认空实现而非纯虚：另外两个实现者（WebUIBrowserWindow、
++  // TestBrowserWindow）都没有工具栏，纯虚只会逼出两个同样空的桩，白白扩大
++  // 补丁面。灵动岛按钮不存在时（非 fp-shell）本来也该是 no-op。
++  virtual void ToggleDynamicIsland() {}
++
+   // Shows an Incognito clear browsing data dialog.
+   virtual void ShowIncognitoClearBrowsingDataDialog() = 0;
+ 
+diff --git a/chrome/browser/ui/view_ids.h b/chrome/browser/ui/view_ids.h
+index 7d5cc80a55..56ab3405b2 100644
+--- a/chrome/browser/ui/view_ids.h
++++ b/chrome/browser/ui/view_ids.h
+@@ -69,6 +69,14 @@ enum ViewID {
+   VIEW_ID_SHARING_HUB_BUTTON,
+   VIEW_ID_MANAGEMENT_BUTTON,
+   VIEW_ID_RECORD_REPLAY_BUTTON,
++  // FingerBrowser：灵动岛（AI 助手）工具栏按钮。放在工具栏段末尾纯粹是就近分组。
++  //
++  // 这确实会把其后所有 ID 连同 VIEW_ID_PREDEFINED_COUNT 平移一位，而那是无害的：
++  // 这些是编译期枚举常量，只在单个二进制内使用，既不持久化也不跨进程传递
++  // （VIEW_ID_PREDEFINED_COUNT 在 chrome/ 下没有任何消费者）。
++  // 唯一按位置取值的是 chrome/browser/ui/cocoa/view_id_util_browsertest.mm，
++  // Windows 目标不构建它。
++  VIEW_ID_DYNAMIC_ISLAND_BUTTON,
+ 
+   // Location bar content settings icons.
+   VIEW_ID_CONTENT_SETTING_JAVASCRIPT,
+diff --git a/chrome/browser/ui/views/dynamic_island/BUILD.gn b/chrome/browser/ui/views/dynamic_island/BUILD.gn
+new file mode 100644
+index 0000000000..504cb3ba60
+--- /dev/null
++++ b/chrome/browser/ui/views/dynamic_island/BUILD.gn
+@@ -0,0 +1,51 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++assert(is_win || is_mac || is_linux || is_chromeos)
++
++# 为什么这里要独立成 target，而不是像 0023 的 account_panel_bubble_view 那样直接
++# 挂进 chrome/browser/ui 的 sources：
++#
++#   chrome/browser/ui/BUILD.gn:1833 已经 deps 了 //chrome/browser/ui/views/toolbar:impl
++#
++# 灵动岛的工具栏按钮住在 toolbar 里、要 include 这个气泡的头文件。若气泡还留在
++# chrome/browser/ui 里，就成了 toolbar -> chrome/browser/ui -> toolbar 的环，
++# gn gen 直接失败。
++#
++# account_panel 没撞上是因为它挂在**已有的**头像按钮上，不需要 toolbar 反向依赖。
++# 「照抄上一个同类实现」在这里会失效 —— 差别不在气泡本身，在谁去唤起它。
++#
++# header target 绝不能 public_deps 到 toolbar：协调器只前置声明 views::View，
++# 不 include 任何 toolbar 头文件，回边就不存在。
++
++source_set("dynamic_island") {
++  public = [
++    "dynamic_island_bubble_view.h",
++    "dynamic_island_coordinator.h",
++  ]
++  public_deps = [
++    "//base",
++    "//chrome/browser:browser_public_dependencies",
++    "//chrome/browser/ui/views/bubble",
++    "//content/public/browser",
++    "//ui/base/metadata",
++    "//ui/views",
++  ]
++}
++
++source_set("impl") {
++  sources = [
++    "dynamic_island_bubble_view.cc",
++    "dynamic_island_coordinator.cc",
++  ]
++  public_deps = [ ":dynamic_island" ]
++  deps = [
++    "//chrome/browser/fingerbrowser",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/webui:webui_util",
++    "//chrome/browser/ui/webui/dynamic_island",
++    "//chrome/browser/ui/webui/top_chrome",
++    "//chrome/common",
++  ]
++}
+diff --git a/chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.cc b/chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.cc
+new file mode 100644
+index 0000000000..5591a5b199
+--- /dev/null
++++ b/chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.cc
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.h"
++
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/window_open_disposition.h"
++
++DynamicIslandBubbleView::DynamicIslandBubbleView(
++    views::View* anchor_view,
++    base::WeakPtr<WebUIContentsWrapper> contents_wrapper,
++    Browser* browser)
++    : WebUIBubbleDialogView(anchor_view, std::move(contents_wrapper)),
++      browser_(browser) {
++  // 「岛」与普通气泡的分界：不随失焦关闭。用户可以点到页面上看内容、再回来接着
++  // 问，而不是一移开焦点整个输入就没了。
++  //
++  // 放在构造函数里只是就近，不是时序要求：核对过 151 的实现，close_on_deactivate_
++  // 只在失焦时经 ShouldCloseOnDeactivate() 读取
++  // （ui/views/bubble/bubble_dialog_delegate_view.cc:743，调用点在 :1326），
++  // CreateBubbleWidget 全程不碰它。所以在 CreateBubble 之后设也来得及。
++  //
++  // 之所以把这句写清楚：第一版注释断言「widget 创建时会读取」，那是错的。留着
++  // 会让下一个人以为「构造函数之后设任何气泡字段都无效」，从而绕开本可直接设的
++  // 属性。真正会被 CreateBubbleInternal 重置的是 adjust_if_offscreen，不是这个。
++  set_close_on_deactivate(false);
++}
++
++DynamicIslandBubbleView::~DynamicIslandBubbleView() = default;
++
++content::WebContents* DynamicIslandBubbleView::OpenURLFromTab(
++    content::WebContents* source,
++    const content::OpenURLParams& params,
++    base::OnceCallback<void(content::NavigationHandle&)>
++        navigation_handle_callback) {
++  // 白名单：只放行 AI 新标签页。这是这个面板唯一的安全边界 —— 页面本身没有可
++  // 调用接口，它能造成的全部影响就是让宿主导航到某个 URL。
++  //
++  // 用 IsNewTabUrl 而不是 IsConsoleUrl：两者同源（同一个本地服务），但语义相反。
++  // 管理台那条规则附带「地址栏只读」，套到这里会让用户在打开的标签里输不进网址
++  // —— 那正是 0020/0022 修过的回归。判定只有一处定义，不在这里另写一份。
++  if (!browser_ || !fingerbrowser::IsNewTabUrl(params.url)) {
++    return nullptr;
++  }
++
++  // 在浏览器里开标签页，而不是在气泡内部导航：气泡是个浮层，把 AI 页加载到里面
++  // 既没有标签栏也无法返回。
++  NavigateParams nav_params(browser_, params.url,
++                            ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  nav_params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  Navigate(&nav_params);
++
++  // 问题已经送出去了，岛收起来。这一处收起是主动的，与「失焦不关闭」不冲突：
++  // 前者是完成动作后的自然收尾，后者是不因为用户去看别处就消失。
++  if (GetWidget()) {
++    GetWidget()->CloseWithReason(
++        views::Widget::ClosedReason::kAcceptButtonClicked);
++  }
++
++  return nav_params.navigated_or_inserted_contents;
++}
++
++BEGIN_METADATA(DynamicIslandBubbleView)
++END_METADATA
+diff --git a/chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.h b/chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.h
+new file mode 100644
+index 0000000000..5f68de3ea0
+--- /dev/null
++++ b/chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_DYNAMIC_ISLAND_DYNAMIC_ISLAND_BUBBLE_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_DYNAMIC_ISLAND_DYNAMIC_ISLAND_BUBBLE_VIEW_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/views/bubble/webui_bubble_dialog_view.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++
++class Browser;
++
++// 灵动岛的气泡宿主。
++//
++// 与 AccountPanelBubbleView 同构，两点不同：
++//
++// 1) **不随失焦关闭**（set_close_on_deactivate(false)）。这正是「岛」与普通气泡
++//    的分界：用户可以点到页面上去看内容、再回来接着问。
++//
++//    这条只有**点击页面其它地方**才验得出来，而截图验收永远不会做这个动作 ——
++//    所以它必须写进验收步骤，不能指望看截图的人想到。
++//
++// 2) 白名单放行的是 AI 新标签页而不是管理台首页。两者同源（同一个本地服务），
++//    但语义不同，所以判定用 fingerbrowser::IsNewTabUrl 而非 IsConsoleUrl ——
++//    管理台那条规则要求只读地址栏，套到这里会让用户在打开的标签里输不进网址。
++//
++// 存在的理由与 0023 相同：WebUI 气泡默认的 OpenURLFromTab 返回 nullptr，页面里的
++// 链接点了什么都不会发生。接过来之后能去哪由这里的白名单决定，不由页面决定 ——
++// 比给页面一个 mojo 方法收得更紧：页面能调用的面是零。
++class DynamicIslandBubbleView : public WebUIBubbleDialogView {
++  METADATA_HEADER(DynamicIslandBubbleView, WebUIBubbleDialogView)
++
++ public:
++  DynamicIslandBubbleView(views::View* anchor_view,
++                          base::WeakPtr<WebUIContentsWrapper> contents_wrapper,
++                          Browser* browser);
++  DynamicIslandBubbleView(const DynamicIslandBubbleView&) = delete;
++  DynamicIslandBubbleView& operator=(const DynamicIslandBubbleView&) = delete;
++  ~DynamicIslandBubbleView() override;
++
++  // WebUIContentsWrapper::Host:
++  content::WebContents* OpenURLFromTab(
++      content::WebContents* source,
++      const content::OpenURLParams& params,
++      base::OnceCallback<void(content::NavigationHandle&)>
++          navigation_handle_callback) override;
++
++ private:
++  raw_ptr<Browser> browser_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_DYNAMIC_ISLAND_DYNAMIC_ISLAND_BUBBLE_VIEW_H_
+diff --git a/chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.cc b/chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.cc
+new file mode 100644
+index 0000000000..c88c2f3653
+--- /dev/null
++++ b/chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.cc
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.h"
++
++#include <utility>
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/views/dynamic_island/dynamic_island_bubble_view.h"
++#include "chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h"
++#include "chrome/browser/ui/webui/top_chrome/webui_contents_wrapper.h"
++#include "chrome/browser/ui/webui/webui_embedding_context.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/controls/webview/webview.h"
++
++DynamicIslandCoordinator::DynamicIslandCoordinator(Browser* browser)
++    : browser_(browser) {}
++
++DynamicIslandCoordinator::~DynamicIslandCoordinator() {
++  Close();
++}
++
++bool DynamicIslandCoordinator::IsShowing() const {
++  return widget_ != nullptr;
++}
++
++void DynamicIslandCoordinator::Toggle(views::View* anchor) {
++  if (IsShowing()) {
++    Close();
++    return;
++  }
++  if (!browser_ || !anchor) {
++    return;
++  }
++
++  // 顺序是硬约束，不是风格：
++  //
++  //   1. 建 wrapper
++  //   2. 所有权转到成员（气泡只持 WeakPtr）
++  //   3. SetBrowserWindowInterface
++  //   4. 才能构造气泡 —— WebUIBubbleDialogView 的初始化列表里就解引用 wrapper
++  //      （webui_bubble_dialog_view.cc 的 web_view_ 初始化）
++  //
++  // 第 3 步漏掉的症状是**点击直接闪退**，不是「面板空白」：top-chrome 那套 WebUI
++  // 靠它拿所属浏览器窗口。0023 上漏过一次。
++  auto wrapper = std::make_unique<WebUIContentsWrapperT<DynamicIslandUI>>(
++      GURL(chrome::kChromeUIDynamicIslandURL), browser_->profile(),
++      IDS_DYNAMIC_ISLAND_TITLE);
++  auto* wrapper_ptr = wrapper.get();
++  contents_ = std::move(wrapper);
++  webui::SetBrowserWindowInterface(wrapper_ptr->web_contents(), browser_);
++
++  auto bubble = std::make_unique<DynamicIslandBubbleView>(
++      anchor, wrapper_ptr->GetWeakPtr(), browser_);
++  auto* bubble_ptr = bubble.get();
++  widget_ = views::BubbleDialogDelegateView::CreateBubble(std::move(bubble));
++  observation_.Observe(widget_.get());
++  widget_->Show();
++
++  // 让输入框拿到焦点，否则岛展开后用户还得点一下才能打字 —— 而「展开即可输入」
++  // 正是这个交互的全部意义。
++  bubble_ptr->web_view()->RequestFocus();
++}
++
++void DynamicIslandCoordinator::Close() {
++  if (widget_) {
++    // CloseNow 而非 Close：析构路径上必须同步完成，否则 widget 回调可能在
++    // contents_ 已经析构之后到达。
++    views::Widget* w = widget_;
++    widget_ = nullptr;
++    observation_.Reset();
++    w->CloseNow();
++  }
++  contents_.reset();
++}
++
++void DynamicIslandCoordinator::OnWidgetDestroying(views::Widget* widget) {
++  // 气泡可能被自身关闭（提交后收起）或被外部销毁（窗口关闭），两条路径都要把
++  // 状态清干净，否则 IsShowing() 会长期返回 true，岛再也展不开。
++  observation_.Reset();
++  widget_ = nullptr;
++  contents_.reset();
++}
+diff --git a/chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.h b/chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.h
+new file mode 100644
+index 0000000000..2c6548f21b
+--- /dev/null
++++ b/chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_DYNAMIC_ISLAND_DYNAMIC_ISLAND_COORDINATOR_H_
++#define CHROME_BROWSER_UI_VIEWS_DYNAMIC_ISLAND_DYNAMIC_ISLAND_COORDINATOR_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++
++class Browser;
++class WebUIContentsWrapper;
++
++namespace views {
++class View;
++}
++
++// 灵动岛气泡的生命周期管理。由工具栏按钮持有。
++//
++// **本头文件刻意只前置声明 views::View，不 include 任何 toolbar 头文件。**
++// 灵动岛的按钮住在 //chrome/browser/ui/views/toolbar 里、要 include 本文件；而
++// chrome/browser/ui/BUILD.gn:1833 已经依赖 toolbar:impl。一旦这里反向依赖 toolbar，
++// gn gen 就会报环。锚点由调用方（按钮自己）以 views::View* 传进来，回边就不存在。
++class DynamicIslandCoordinator : public views::WidgetObserver {
++ public:
++  explicit DynamicIslandCoordinator(Browser* browser);
++  DynamicIslandCoordinator(const DynamicIslandCoordinator&) = delete;
++  DynamicIslandCoordinator& operator=(const DynamicIslandCoordinator&) = delete;
++  ~DynamicIslandCoordinator() override;
++
++  // 已显示则收起，否则以 `anchor` 为锚点展开。
++  //
++  // 锚点由调用方传入而不是在这里向 toolbar 索取：ProfileMenuCoordinator 那条路
++  // （GetAvatarToolbarButton()）返回的是 views::BubbleAnchor，它可能包着
++  // TrackedElement 而非 View —— 取不到 View 时气泡既无 anchor_widget 又无
++  // parent_window，CreateBubble 里
++  // DCHECK(bubble_params.parent || !bubble->has_parent()) 当场失败，表现为点击
++  // 闪退。0023 上实际踩过。按钮把自己的 this 传进来，这条根因链整条不存在。
++  void Toggle(views::View* anchor);
++
++  bool IsShowing() const;
++
++  // views::WidgetObserver:
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++ private:
++  void Close();
++
++  raw_ptr<Browser> browser_;
++
++  // WebContents 的所有权必须在这里：气泡视图只持 WeakPtr（见
++  // WebUIBubbleDialogView 构造函数注释 —— wrapper 的生命周期与 View 无关）。
++  // 放在栈上或让它随构造表达式销毁，气泡一显示就是空白，而那个症状与「资源没
++  // 打包」完全一样，会把人引到错误的方向。
++  std::unique_ptr<WebUIContentsWrapper> contents_;
++
++  raw_ptr<views::Widget> widget_ = nullptr;
++  base::ScopedObservation<views::Widget, views::WidgetObserver> observation_{
++      this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_DYNAMIC_ISLAND_DYNAMIC_ISLAND_COORDINATOR_H_
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index a56d65c56f..21533ef636 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -217,6 +217,7 @@
+ #include "chrome/browser/ui/views/toolbar/avatar_toolbar_button_interface.h"
+ #include "chrome/browser/ui/views/toolbar/browser_app_menu_button.h"
+ #include "chrome/browser/ui/views/toolbar/chrome_labs/chrome_labs_coordinator.h"
++#include "chrome/browser/ui/views/toolbar/dynamic_island_button.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h"
+ #include "chrome/browser/ui/views/toolbar/reload_control.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+@@ -4211,6 +4212,15 @@ void BrowserView::CloseTabSearchBubble() {
+   }
+ }
+ 
++void BrowserView::ToggleDynamicIsland() {
++  // 按钮只在 fp-shell 且新标签页 URL 有效时创建，其余情况这里恒为 nullptr ——
++  // 命令侧也做了同样的门禁，两层都判是因为命令 enable 状态在窗口类型变化时
++  // 才刷新，而按钮的存在性是构造期一次性决定的，两者不必然同步。
++  if (toolbar_ && toolbar_->dynamic_island_button()) {
++    toolbar_->dynamic_island_button()->Toggle();
++  }
++}
++
+ void BrowserView::DeleteBrowserWindow() {
+   CHECK(browser_widget_);
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_view.h b/chrome/browser/ui/views/frame/browser_view.h
+index c6bcc529f1..3884eb7b5f 100644
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -769,6 +769,7 @@ class BrowserView : public BrowserWindow,
+ 
+   void CreateTabSearchBubble() override;
+   void CloseTabSearchBubble() override;
++  void ToggleDynamicIsland() override;
+ 
+   bool IsBookmarkBarVisible() const;
+   bool IsBookmarkBarAnimating() const;
+diff --git a/chrome/browser/ui/views/toolbar/BUILD.gn b/chrome/browser/ui/views/toolbar/BUILD.gn
+index f50374fe1c..b931b0dd7e 100644
+--- a/chrome/browser/ui/views/toolbar/BUILD.gn
++++ b/chrome/browser/ui/views/toolbar/BUILD.gn
+@@ -14,6 +14,7 @@ source_set("toolbar") {
+     "app_menu.h",
+     "app_menu_control.h",
+     "back_forward_button.h",
++    "dynamic_island_button.h",
+     "browser_app_menu_button.h",
+     "chrome_labs/chrome_labs_bubble_view.h",
+     "chrome_labs/chrome_labs_coordinator.h",
+@@ -113,6 +114,7 @@ source_set("impl") {
+     "ai_overlay_toolbar_button.cc",
+     "app_menu.cc",
+     "back_forward_button.cc",
++    "dynamic_island_button.cc",
+     "browser_app_menu_button.cc",
+     "chrome_labs/chrome_labs_bubble_view.cc",
+     "chrome_labs/chrome_labs_coordinator.cc",
+@@ -156,6 +158,9 @@ source_set("impl") {
+   deps = [
+     ":toolbar",
+     "//base:i18n",
++    # 灵动岛的气泡与协调器住在独立 target 里，不在 //chrome/browser/ui：
++    # 后者已经 deps 了 toolbar:impl，把气泡放那边会让这条依赖成环。
++    "//chrome/browser/ui/views/dynamic_island",
+     "//build:branding_buildflags",
+     "//cc/paint",
+     "//chrome/app:branded_strings",
+diff --git a/chrome/browser/ui/views/toolbar/dynamic_island_button.cc b/chrome/browser/ui/views/toolbar/dynamic_island_button.cc
+new file mode 100644
+index 0000000000..6846d5988b
+--- /dev/null
++++ b/chrome/browser/ui/views/toolbar/dynamic_island_button.cc
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/toolbar/dynamic_island_button.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/view_ids.h"
++#include "chrome/browser/ui/views/dynamic_island/dynamic_island_coordinator.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/ui_base_features.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/menu_button_controller.h"
++#include "ui/views/view_class_properties.h"
++
++DynamicIslandButton::DynamicIslandButton(Browser* browser)
++    : browser_(browser),
++      coordinator_(std::make_unique<DynamicIslandCoordinator>(browser)) {
++  // 两个图标是 rounded / old 的**样式**对，两份都是 24dp。
++  //
++  // 不能用 SetVectorIcons(a, b)：它的第二参数是**触摸模式**图标，不是样式变体
++  // （toolbar_button.h:106「Sets an icon and touch-mode icon」，ToolbarButton::
++  // UpdateIcon() 只按 TouchUiController 的 touch_ui() 二选一，
++  // toolbar_button.cc:320-329 —— IsRoundedIconsEnabled 在那条路径上根本没人读）。
++  // 那样写编译链接都过，只是把样式变体接到了触摸这条正交的轴上：桌面永远只见
++  // 圆角款，触摸模式反而换成旧款。这类错配编译器拦不住。
++  //
++  // 样式轴要自己判。SetVectorIcon(x) 即 SetVectorIcons(x, x)（同上 :308），
++  // 触摸模式沿用同一份 24dp 资源 —— 我们本就没有触摸专用尺寸，不丢东西。
++  SetVectorIcon(features::IsRoundedIconsEnabled() ? kDynamicIslandIcon
++                                                  : kDynamicIslandOldIcon);
++  SetTooltipText(l10n_util::GetStringUTF16(IDS_TOOLTIP_DYNAMIC_ISLAND));
++  GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_ACCNAME_DYNAMIC_ISLAND));
++  SetID(VIEW_ID_DYNAMIC_ISLAND_BUTTON);
++  SetProperty(views::kElementIdentifierKey,
++              kToolbarDynamicIslandButtonElementId);
++
++  // MenuButtonController 而不是普通 PressedCallback：气泡展开期间按钮要保持
++  // 「按下」态，且再次点击应当收起而不是重新展开一次。TabSearch 按钮是同一形态。
++  SetButtonController(std::make_unique<views::MenuButtonController>(
++      this,
++      base::BindRepeating(&DynamicIslandButton::Toggle, base::Unretained(this)),
++      std::make_unique<views::Button::DefaultButtonControllerDelegate>(this)));
++}
++
++DynamicIslandButton::~DynamicIslandButton() = default;
++
++void DynamicIslandButton::Toggle() {
++  // 锚点传 this：协调器不向 toolbar 索取按钮，既避免 GN 环，也绕开
++  // BubbleAnchor 可能包着 TrackedElement（取不到 View 会让 CreateBubble 的
++  // DCHECK 当场失败，表现为点击闪退）—— 0023 上实际踩过这条。
++  coordinator_->Toggle(this);
++}
++
++BEGIN_METADATA(DynamicIslandButton)
++END_METADATA
+diff --git a/chrome/browser/ui/views/toolbar/dynamic_island_button.h b/chrome/browser/ui/views/toolbar/dynamic_island_button.h
+new file mode 100644
+index 0000000000..a304e51cf6
+--- /dev/null
++++ b/chrome/browser/ui/views/toolbar/dynamic_island_button.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TOOLBAR_DYNAMIC_ISLAND_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_TOOLBAR_DYNAMIC_ISLAND_BUTTON_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++
++class Browser;
++class DynamicIslandCoordinator;
++
++// 灵动岛（AI 助手）的工具栏按钮。
++//
++// 做成 ToolbarView 的直接子 View，而不是 pinned action：pinned action 自带右键
++// 「取消固定」，用户一旦隐藏，唯一的 AI 入口就只能从三点菜单找回 —— 对产品的
++// 签名入口是负债。
++//
++// 刻意**不**注册进 ToolbarView::GetViewCommandMap()：那里有两处写死的
++// std::array<views::Button*, 5>，扩它是典型的静默失效点（数组长度写错不报错，
++// 只是有个按钮的命令再也不生效）。代价是按钮的 enabled 状态不跟随命令 ——
++// 而岛按钮只要可见就该可用，本来也不需要跟随。
++class DynamicIslandButton : public ToolbarButton {
++  METADATA_HEADER(DynamicIslandButton, ToolbarButton)
++
++ public:
++  explicit DynamicIslandButton(Browser* browser);
++  DynamicIslandButton(const DynamicIslandButton&) = delete;
++  DynamicIslandButton& operator=(const DynamicIslandButton&) = delete;
++  ~DynamicIslandButton() override;
++
++  // 展开/收起岛。按钮点击与快捷键共用这一条入口 —— 两条路径分开实现的话，
++  // 迟早只有一条被验到。
++  void Toggle();
++
++ private:
++  raw_ptr<Browser> browser_;
++  std::unique_ptr<DynamicIslandCoordinator> coordinator_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TOOLBAR_DYNAMIC_ISLAND_BUTTON_H_
+diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.cc b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+index 5a42610d05..ad16b26596 100644
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -96,6 +96,8 @@
+ #include "chrome/browser/ui/views/toolbar/back_forward_button.h"
+ #include "chrome/browser/ui/views/toolbar/browser_app_menu_button.h"
+ #include "chrome/browser/ui/views/toolbar/chrome_labs/chrome_labs_coordinator.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
++#include "chrome/browser/ui/views/toolbar/dynamic_island_button.h"
+ #include "chrome/browser/ui/views/toolbar/home_button.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h"
+ #include "chrome/browser/ui/views/toolbar/reload_button.h"
+@@ -578,6 +580,21 @@ void ToolbarView::Init() {
+     UpdateGlicButtonVisibility();
+   }
+ 
++  // FingerBrowser：灵动岛（AI 助手）按钮，放在头像按钮之前 —— 子 View 的添加
++  // 顺序就是工具栏从左到右的视觉顺序。
++  //
++  // 可见性一次性判定，不做动态更新：这两个开关都是启动参数，运行期不会变。
++  // 用 BooleanPrefMember 之类的动态机制反而要处理一个永远不会发生的状态变化。
++  //
++  // 条件与 DynamicIslandUIConfig::IsWebUIEnabled 保持一致 —— 少了 fp-newtab-url
++  // 岛无处可去，与其给一个按回车没反应的按钮，不如不显示。两处条件必须同源，
++  // 否则会出现「按钮在但气泡打不开」这种只在某种配置下才复现的形态。
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("fp-shell") &&
++      fingerbrowser::GetNewTabUrl().is_valid()) {
++    dynamic_island_ =
++        AddChildView(std::make_unique<DynamicIslandButton>(browser_));
++  }
++
+   if (!features::IsWebUIAvatarButtonEnabled()) {
+     avatar_ =
+         AddChildView(std::make_unique<AvatarToolbarButton>(browser_view_));
+diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.h b/chrome/browser/ui/views/toolbar/toolbar_view.h
+index c2d82dc622..75283309f3 100644
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -52,6 +52,7 @@ class BrowserAppMenuButton;
+ class Browser;
+ class ExtensionsToolbarButton;
+ class ExtensionsToolbarDesktop;
++class DynamicIslandButton;
+ class HomeButton;
+ class IntentChipButton;
+ class ExtensionsToolbarCoordinator;
+@@ -184,6 +185,11 @@ class ToolbarView : public views::AccessiblePaneView,
+   }
+   MediaToolbarButtonView* media_button() const { return media_button_; }
+   HomeButton* home_button() const { return home_; }
++  // FingerBrowser：命令层（IDC_TOGGLE_DYNAMIC_ISLAND）需要拿到它来触发展开。
++  // 可能为 nullptr —— 不在外壳形态时按钮根本不创建，调用方必须判空。
++  DynamicIslandButton* dynamic_island_button() const {
++    return dynamic_island_;
++  }
+ 
+   // TODO(crbug.com/513238408): Remove this once toolbar layout/overflow is
+   // fixed.
+@@ -370,6 +376,8 @@ class ToolbarView : public views::AccessiblePaneView,
+   raw_ptr<WebUIToolbarWebView> toolbar_webview_ = nullptr;
+   std::unique_ptr<WebUIToolbarWebView> detached_toolbar_webview_;
+   raw_ptr<HomeButton> home_ = nullptr;
++  // FingerBrowser：灵动岛按钮。仅在 --fp-shell 且 --fp-newtab-url 有效时创建。
++  raw_ptr<DynamicIslandButton> dynamic_island_ = nullptr;
+   raw_ptr<SplitTabsToolbarButton> split_tabs_ = nullptr;
+   raw_ptr<CustomTabBarView> custom_tab_bar_ = nullptr;
+   raw_ptr<LocationBarView> location_bar_view_ = nullptr;
+-- 
+2.52.0.windows.1
+

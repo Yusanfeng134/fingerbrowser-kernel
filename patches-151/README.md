@@ -49,6 +49,9 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0025 | fingerbrowser-account-panel-login-entry | 账号面板 | 顶部账号行可点，指向管理台 `#/account`（依赖 0023）|
 | 0026 | fingerbrowser-fingerprint-contradictions | 指纹 | 消除 DPR / 媒体查询 / 触摸 / platformVersion 四处问题 |
 | 0027 | fingerbrowser-account-panel-drop-settings | 账号面板 | 去掉指向不存在路由的「设置」项（依赖 0023）|
+| 0028 | fingerbrowser-vector-icon-script-utf8 | 构建 | 向量图标聚合脚本按 UTF-8 读写（与 0012 同族，**必须在 0030 之前**）|
+| 0029 | fingerbrowser-dynamic-island-webui | 灵动岛 | 灵动岛的 WebUI 页面本体，注册完成但无入口 |
+| 0030 | fingerbrowser-dynamic-island-toolbar-entry | 灵动岛 | 工具栏按钮 + 气泡 + `IDC_TOGGLE_DYNAMIC_ISLAND` + Ctrl+Shift+K（依赖 0029）|
 
 ### 0026 说明：矛盾 ≠ 未伪装
 
@@ -163,7 +166,15 @@ AI 新标签页由客户端**同一个本地服务**提供，与管理台**同�
 > **由此得到的规则**：分配文件前先看它是否被多方改过；是的话不能整文件归属，
 > 只能由后应用的一方生成增量 hunk。详见 `SHELL-PATCHES-NOTE.md` 第 5 节。
 >
-> 顺序不可打乱，存在三处硬依赖：0009 先于 0011、0013 先于 0016、0017 先于 0019。
+> 顺序不可打乱，存在四处硬依赖：0009 先于 0011、0013 先于 0016、0017 先于 0019、
+> **0028 先于 0030**。最后一处的失败形态与前三处不同：不是应用冲突，而是应用
+> 得干干净净、随后**构建**炸在一条指错地方的报错上 —— 0030 新增的两个 `.icon`
+> 带中文注释，没有 0028 的编码修复，聚合脚本会在中文 Windows 上以 GBK 读它们，
+> 报的是 `gen/chrome/app/vector_icons/vector_icons.cc: FAILED` 加一句
+> `UnicodeDecodeError`，既不指名文件也不指向 0030。
+>
+> 所以「补丁全部干净应用」对顺序依赖同样不是充分检查 —— 与下面那条全树比对的
+> 教训是同一件事的两个方向。
 
 > **0009 为何单独成一个补丁**：0011 的清单产物名依赖改名，而 `chrome/BUILD.gn` 里改名与清单两处改动在同一文件、无法按文件拆分，故按提交顺序分层导出。0009 必须在 0011 之前应用。
 

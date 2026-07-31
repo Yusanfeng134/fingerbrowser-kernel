@@ -1,0 +1,557 @@
+From 90c215150261064672eac4ee7c68ca33d1502d4b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 10:16:29 +0800
+Subject: [PATCH 29/30] =?UTF-8?q?fingerbrowser:=20=E7=81=B5=E5=8A=A8?=
+ =?UTF-8?q?=E5=B2=9B=E7=9A=84=20WebUI=20=E9=A1=B5=E9=9D=A2=E6=9C=AC?=
+ =?UTF-8?q?=E4=BD=93=EF=BC=88=E5=8F=AA=E6=98=AF=E9=A1=B5=E9=9D=A2=EF=BC=8C?=
+ =?UTF-8?q?=E8=BF=98=E6=B2=A1=E6=9C=89=E5=85=A5=E5=8F=A3=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+一个 top-chrome WebUI：输入框 + 提交，回车把问题带进 AI 新标签页。本补丁到此
+为止 —— 页面注册好了，但没有任何地方能打开它。入口在下一个补丁。
+
+拆开是为了可读：这一半全是 WebUI 的接线（九处，见下），另一半全是工具栏与命令。
+混在一起看不出哪些改动是「新增一个 WebUI」的固定成本、哪些是这个功能特有的。
+
+九处接线，任缺一处的失败形态都不一样，且大多不是编译错误：
+  resources/BUILD.gn、chrome_paks.gni（两处）、resource_ids.spec（两处）—— 缺了
+  资源不进包，页面空白；lit/v3_0/BUILD.gn 的 visibility —— 缺了 GN 报可见性错误；
+  chrome_web_ui_configs.cc —— 缺了 URL 无法解析；histograms.xml —— 缺了跑不过
+  presubmit。
+
+页面自身的两处刻意设计：
+
+- 提交用创建 <a> 再 click，不用 location.assign。前者会走宿主的 OpenURLFromTab
+  白名单，后者是页面内导航，绕过它。安全边界要在必经之路上，不在旁路上。
+- 回车判 e.isComposing。中文输入法组词过程中的回车是「确认候选词」，不是提交；
+  不判这条，用户打「亚马逊」按回车选词就会把半截问题发出去。这个缺陷在英文
+  键盘上永远复现不出来。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/browser/resources/BUILD.gn             |  2 +
+ .../browser/resources/dynamic_island/BUILD.gn | 27 ++++++
+ .../resources/dynamic_island/app.html.ts      | 57 +++++++++++++
+ .../browser/resources/dynamic_island/app.ts   | 83 +++++++++++++++++++
+ .../dynamic_island/dynamic_island.html        | 26 ++++++
+ .../browser/ui/webui/chrome_web_ui_configs.cc |  2 +
+ .../browser/ui/webui/dynamic_island/BUILD.gn  | 26 ++++++
+ .../webui/dynamic_island/dynamic_island_ui.cc | 68 +++++++++++++++
+ .../webui/dynamic_island/dynamic_island_ui.h  | 51 ++++++++++++
+ chrome/chrome_paks.gni                        |  2 +
+ chrome/common/webui_url_constants.h           |  4 +
+ third_party/lit/v3_0/BUILD.gn                 |  1 +
+ tools/gritsettings/resource_ids.spec          |  8 ++
+ .../histograms/metadata/page/histograms.xml   |  1 +
+ 14 files changed, 358 insertions(+)
+ create mode 100644 chrome/browser/resources/dynamic_island/BUILD.gn
+ create mode 100644 chrome/browser/resources/dynamic_island/app.html.ts
+ create mode 100644 chrome/browser/resources/dynamic_island/app.ts
+ create mode 100644 chrome/browser/resources/dynamic_island/dynamic_island.html
+ create mode 100644 chrome/browser/ui/webui/dynamic_island/BUILD.gn
+ create mode 100644 chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.cc
+ create mode 100644 chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h
+
+diff --git a/chrome/browser/resources/BUILD.gn b/chrome/browser/resources/BUILD.gn
+index 538449be14..4914d510af 100644
+--- a/chrome/browser/resources/BUILD.gn
++++ b/chrome/browser/resources/BUILD.gn
+@@ -91,6 +91,7 @@ group("resources") {
+       "side_panel/shared:resources",
+       "side_panel/tabs_from_other_devices:resources",
+       "account_panel:resources",
++      "dynamic_island:resources",
+       "side_panel/voyager:resources",
+       "signin:resources",
+       "suggest_internals:resources",
+@@ -233,6 +234,7 @@ if (enable_webui_generate_code_cache) {
+       "side_panel/shared:code_cache_resources",
+       "side_panel/tabs_from_other_devices:code_cache_resources",
+       "account_panel:code_cache_resources",
++      "dynamic_island:code_cache_resources",
+       "side_panel/voyager:code_cache_resources",
+       "webui_toolbar:code_cache_resources",
+     ]
+diff --git a/chrome/browser/resources/dynamic_island/BUILD.gn b/chrome/browser/resources/dynamic_island/BUILD.gn
+new file mode 100644
+index 0000000000..54fe86226b
+--- /dev/null
++++ b/chrome/browser/resources/dynamic_island/BUILD.gn
+@@ -0,0 +1,27 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//ui/webui/resources/tools/build_webui.gni")
++import("//ui/webui/webui_features.gni")
++
++assert(!is_android)
++
++build_webui("build") {
++  grd_prefix = "dynamic_island"
++
++  static_files = [ "dynamic_island.html" ]
++
++  ts_files = [
++    "app.html.ts",
++    "app.ts",
++  ]
++
++  ts_deps = [
++    "//third_party/lit/v3_0:build_ts",
++    "//ui/webui/resources/js:build_ts",
++  ]
++
++  webui_context_type = "trusted"
++  generate_code_cache = enable_webui_generate_code_cache
++}
+diff --git a/chrome/browser/resources/dynamic_island/app.html.ts b/chrome/browser/resources/dynamic_island/app.html.ts
+new file mode 100644
+index 0000000000..30878ca4ef
+--- /dev/null
++++ b/chrome/browser/resources/dynamic_island/app.html.ts
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {DynamicIslandAppElement} from './app.js';
++
++export function getHtml(this: DynamicIslandAppElement) {
++  return html`<!--_html_template_start_-->
++<style>
++  :host {
++    display: block;
++    /* 固定宽度：气泡尺寸由内容决定（ShouldAutoResizeHost），不给宽度会随文字
++       长度抖动。高度让内容决定，此处只有一行输入，不需要 max-height。 */
++    width: 420px;
++  }
++
++  .row {
++    align-items: center;
++    display: flex;
++    gap: 8px;
++    padding: 10px 12px;
++  }
++
++  input {
++    background: transparent;
++    border: 0;
++    color: inherit;
++    flex: 1;
++    font: inherit;
++    outline: none;
++  }
++
++  input::placeholder {
++    color: var(--color-sys-on-surface-subtle, #444746);
++  }
++
++  .hint {
++    color: var(--color-sys-on-surface-subtle, #444746);
++    font-size: 11px;
++    flex: none;
++  }
++</style>
++
++<div class="row">
++  <input type="text"
++         .value="${this.query_}"
++         placeholder="问点什么…"
++         maxlength="500"
++         autofocus
++         @input="${this.onInput_}"
++         @keydown="${this.onKeydown_}">
++  <span class="hint">回车发送</span>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/dynamic_island/app.ts b/chrome/browser/resources/dynamic_island/app.ts
+new file mode 100644
+index 0000000000..8c2deaa101
+--- /dev/null
++++ b/chrome/browser/resources/dynamic_island/app.ts
+@@ -0,0 +1,83 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import '/strings.m.js';
++
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++
++import {getHtml} from './app.html.js';
++
++// 灵动岛第一期：只做「唤起」。
++//
++// 输入问题 → 回车 → 带着问题打开 AI 新标签页。**不新增任何能力**：就地对话需要
++// 气泡直接调 /ai/chat，而气泡跑在 chrome:// 源上，拿不到 AI 令牌、Origin 也对
++// 不上 —— 那要新开 mojo 通道，是第二期的事。
++//
++// 本页面没有任何可调用接口：不绑 mojo，不注册 message handler。它能造成的全部
++// 影响就是让宿主导航到管理台 origin 下的一个 URL，而去哪由 C++ 白名单裁决
++// （见 dynamic_island_bubble_view.cc 的 OpenURLFromTab）。
++export class DynamicIslandAppElement extends CrLitElement {
++  static get is() {
++    return 'dynamic-island-app';
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      query_: {type: String},
++    };
++  }
++
++  protected accessor query_: string = '';
++
++  // 问题经 URL 传递，所以要限长。客户端那边做了防御性截断（2000），但 URL 不该
++  // 承载长文本 —— 两侧都限，且这一侧限得更严：用户在这里能看到输入框，超长时
++  // 的截断对他是可见的；到了 URL 那层再截就是静默丢失。
++  protected static readonly MAX_QUERY_LENGTH = 500;
++
++  protected onInput_(e: Event) {
++    this.query_ = (e.target as HTMLInputElement).value;
++  }
++
++  protected onKeydown_(e: KeyboardEvent) {
++    if (e.key !== 'Enter' || e.isComposing) {
++      // isComposing：中文输入法组词过程中的回车是「确认候选词」，不是提交。
++      // 不判这一条的话，用户打「亚马逊」按回车选词就会直接把半截问题发出去。
++      return;
++    }
++    e.preventDefault();
++    this.submit_();
++  }
++
++  protected submit_() {
++    const q = this.query_.trim().slice(0, DynamicIslandAppElement.MAX_QUERY_LENGTH);
++    if (!q) {
++      return;
++    }
++    const base = loadTimeData.getString('newTabUrl');
++    if (!base) {
++      return;
++    }
++    // 用锚点导航而不是 location.assign：导航要经过宿主的 OpenURLFromTab 白名单，
++    // 由它决定放不放行、开在哪里。页面自己跳转会试图在气泡内部导航，那既没有
++    // 标签栏也回不去。
++    const a = document.createElement('a');
++    a.href = `${base}?q=${encodeURIComponent(q)}`;
++    this.shadowRoot.appendChild(a);
++    a.click();
++    a.remove();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'dynamic-island-app': DynamicIslandAppElement;
++  }
++}
++
++customElements.define(DynamicIslandAppElement.is, DynamicIslandAppElement);
+diff --git a/chrome/browser/resources/dynamic_island/dynamic_island.html b/chrome/browser/resources/dynamic_island/dynamic_island.html
+new file mode 100644
+index 0000000000..99059052bf
+--- /dev/null
++++ b/chrome/browser/resources/dynamic_island/dynamic_island.html
+@@ -0,0 +1,26 @@
++<!doctype html>
++<html dir="$i18n{textdirection}" lang="$i18n{language}">
++<head>
++  <meta charset="utf-8">
++  <title>$i18n{title}</title>
++  <meta name="color-scheme" content="light dark">
++  <link rel="stylesheet" href="chrome://resources/css/text_defaults_md.css">
++  <link rel="stylesheet" href="chrome://theme/colors.css?sets=ui,chrome">
++  <style>
++    html,
++    body {
++      margin: 0;
++      padding: 0;
++    }
++
++    body {
++      background: var(--color-bubble-background, Canvas);
++      overflow: hidden;
++    }
++  </style>
++  <script type="module" src="app.js"></script>
++</head>
++<body>
++  <dynamic-island-app></dynamic-island-app>
++</body>
++</html>
+diff --git a/chrome/browser/ui/webui/chrome_web_ui_configs.cc b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+index c57072cf25..2a1b0019f1 100644
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -132,6 +132,7 @@
+ #include "chrome/browser/ui/webui/side_panel/reading_list/reading_list_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_ui.h"
+ #include "chrome/browser/ui/webui/account_panel/account_panel_ui.h"
++#include "chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h"
+ #include "chrome/browser/ui/webui/side_panel/voyager/voyager_side_panel_ui.h"
+ #include "chrome/browser/ui/webui/signin/sync_confirmation_ui.h"
+ #include "chrome/browser/ui/webui/suggest_internals/suggest_internals_ui.h"
+@@ -398,6 +399,7 @@ void RegisterChromeWebUIConfigs() {
+   map.AddWebUIConfig(std::make_unique<TermsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<UserEducationInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<AccountPanelUIConfig>());
++  map.AddWebUIConfig(std::make_unique<DynamicIslandUIConfig>());
+   map.AddWebUIConfig(std::make_unique<VoyagerSidePanelUIConfig>());
+   map.AddWebUIConfig(std::make_unique<WebAppInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<WebNNInternalsUIConfig>());
+diff --git a/chrome/browser/ui/webui/dynamic_island/BUILD.gn b/chrome/browser/ui/webui/dynamic_island/BUILD.gn
+new file mode 100644
+index 0000000000..46fd2a7c46
+--- /dev/null
++++ b/chrome/browser/ui/webui/dynamic_island/BUILD.gn
+@@ -0,0 +1,26 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++assert(!is_android)
++
++source_set("dynamic_island") {
++  public = [ "dynamic_island_ui.h" ]
++  public_deps = [
++    "//chrome/browser:browser_public_dependencies",
++    "//chrome/browser/ui/webui/top_chrome",
++    "//content/public/browser",
++  ]
++}
++
++source_set("impl") {
++  sources = [ "dynamic_island_ui.cc" ]
++  public_deps = [ ":dynamic_island" ]
++  deps = [
++    "//chrome/browser/fingerbrowser",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/resources/dynamic_island:resources",
++    "//chrome/common",
++    "//ui/webui",
++  ]
++}
+diff --git a/chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.cc b/chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.cc
+new file mode 100644
+index 0000000000..40bd4519f9
+--- /dev/null
++++ b/chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.cc
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h"
++
++#include "base/command_line.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_console.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/dynamic_island_resources.h"
++#include "chrome/grit/dynamic_island_resources_map.h"
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_ui.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "content/public/common/url_constants.h"
++#include "ui/webui/webui_util.h"
++
++DynamicIslandUIConfig::DynamicIslandUIConfig()
++    : DefaultTopChromeWebUIConfig(content::kChromeUIScheme,
++                                  chrome::kChromeUIDynamicIslandHost) {}
++
++bool DynamicIslandUIConfig::IsWebUIEnabled(
++    content::BrowserContext* browser_context) {
++  // 门控用 --fp-shell（浏览器外壳）而非 --fp-active：岛只在客户端外壳出现。
++  //
++  // 不进店铺环境是有意的，理由不是「保持一致」：岛在环境里唤起会打开一个由
++  // 客户端本地服务提供的页面，等于让 AI 令牌多一个持有者，而店铺环境正是日常
++  // 承载外部内容的地方。
++  //
++  // 实测确认过一条既有性质（probe/run-env-localhost-reach.cjs）：店铺环境**本来
++  // 就够得着**客户端本地服务 —— Chromium 不让代理拦 127.0.0.1，配一个连不通的
++  // 代理时外部地址被挡而本地服务照样可达。所以这不是新洞；但「能做到」和「我们
++  // 主动把入口放进去」是两回事，后者会把边角情况变成常规路径。
++  //
++  // 还要 --fp-newtab-url：没有它岛无处可去，与其弹出一个按回车没反应的输入框，
++  // 不如不出现。
++  const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++  return cmd->HasSwitch("fp-shell") &&
++         fingerbrowser::GetNewTabUrl().is_valid();
++}
++
++bool DynamicIslandUIConfig::ShouldAutoResizeHost() {
++  return true;
++}
++
++DynamicIslandUI::DynamicIslandUI(content::WebUI* web_ui)
++    : TopChromeWebUIController(web_ui) {
++  Profile* profile = Profile::FromWebUI(web_ui);
++  content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
++      profile, chrome::kChromeUIDynamicIslandHost);
++
++  static constexpr webui::LocalizedString kStrings[] = {
++      {"title", IDS_DYNAMIC_ISLAND_TITLE},
++  };
++  source->AddLocalizedStrings(kStrings);
++
++  // 页面拿到的全部东西：AI 新标签页的地址。只读字符串，页面无法用它请求内核做
++  // 任何事 —— 导航去哪仍由气泡宿主的白名单裁决。
++  source->AddString("newTabUrl", fingerbrowser::GetNewTabUrl().spec());
++
++  webui::SetupWebUIDataSource(source, kDynamicIslandResources,
++                              IDR_DYNAMIC_ISLAND_DYNAMIC_ISLAND_HTML);
++}
++
++DynamicIslandUI::~DynamicIslandUI() = default;
++
++WEB_UI_CONTROLLER_TYPE_IMPL(DynamicIslandUI)
+diff --git a/chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h b/chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h
+new file mode 100644
+index 0000000000..0329beffd8
+--- /dev/null
++++ b/chrome/browser/ui/webui/dynamic_island/dynamic_island_ui.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_DYNAMIC_ISLAND_DYNAMIC_ISLAND_UI_H_
++#define CHROME_BROWSER_UI_WEBUI_DYNAMIC_ISLAND_DYNAMIC_ISLAND_UI_H_
++
++#include <string_view>
++
++#include "chrome/browser/ui/webui/top_chrome/top_chrome_web_ui_controller.h"
++#include "chrome/browser/ui/webui/top_chrome/top_chrome_webui_config.h"
++
++class DynamicIslandUI;
++
++class DynamicIslandUIConfig
++    : public DefaultTopChromeWebUIConfig<DynamicIslandUI> {
++ public:
++  DynamicIslandUIConfig();
++
++  // DefaultTopChromeWebUIConfig:
++  bool IsWebUIEnabled(content::BrowserContext* browser_context) override;
++  // 气泡必须跟着页面内容定尺寸。默认 false 对侧栏是对的（尺寸由侧栏决定），
++  // 气泡没有外部尺寸来源，关掉自动伸缩就停在最小尺寸 —— 表现为「弹出一个空白
++  // 小气泡」，看起来像页面没加载，实际页面完好（0023 上实测：内容已渲染成
++  // 288x186 而视口只有 26px）。
++  bool ShouldAutoResizeHost() override;
++};
++
++// 灵动岛第一期：唤起 AI 新标签页。
++//
++// 只做「带着问题打开一个标签页」，不新增任何能力。就地对话需要气泡直接调
++// /ai/chat，而气泡跑在 chrome:// 源上拿不到 AI 令牌、Origin 也对不上 —— 那要
++// 新开 mojo 通道，属第二期。
++//
++// 与 0023 账号面板同样的约束：不绑 mojo、不注册 message handler。页面唯一能做
++// 的是渲染一个 <a href>，去哪由气泡宿主的白名单决定。WebUI 跑在 chrome:// 上、
++// 天生带 WebUI 绑定，是真正的特权面，而这类接口「加一个方法几乎零成本、减一个
++// 方法要改两边」，所以在还没有第一个方法时就卡住。
++class DynamicIslandUI : public TopChromeWebUIController {
++ public:
++  explicit DynamicIslandUI(content::WebUI* web_ui);
++  DynamicIslandUI(const DynamicIslandUI&) = delete;
++  DynamicIslandUI& operator=(const DynamicIslandUI&) = delete;
++  ~DynamicIslandUI() override;
++
++  static constexpr std::string_view GetWebUIName() { return "DynamicIsland"; }
++
++  WEB_UI_CONTROLLER_TYPE_DECL();
++};
++
++#endif  // CHROME_BROWSER_UI_WEBUI_DYNAMIC_ISLAND_DYNAMIC_ISLAND_UI_H_
+diff --git a/chrome/chrome_paks.gni b/chrome/chrome_paks.gni
+index f969ec000d..eb89444daa 100644
+--- a/chrome/chrome_paks.gni
++++ b/chrome/chrome_paks.gni
+@@ -257,6 +257,7 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/side_panel_shared_resources.pak",
+         "$root_gen_dir/chrome/side_panel_tabs_from_other_devices_resources.pak",
+         "$root_gen_dir/chrome/account_panel_resources.pak",
++        "$root_gen_dir/chrome/dynamic_island_resources.pak",
+         "$root_gen_dir/chrome/side_panel_voyager_resources.pak",
+         "$root_gen_dir/chrome/signin_resources.pak",
+         "$root_gen_dir/chrome/suggest_internals_resources.pak",
+@@ -616,6 +617,7 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/side_panel_shared_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_tabs_from_other_devices_code_cache_resources.pak",
+         "$root_gen_dir/chrome/account_panel_code_cache_resources.pak",
++        "$root_gen_dir/chrome/dynamic_island_code_cache_resources.pak",
+         "$root_gen_dir/chrome/side_panel_voyager_code_cache_resources.pak",
+         "$root_gen_dir/chrome/webui_toolbar_code_cache_resources.pak",
+         "$root_gen_dir/ui/webui/resources/webui_code_cache_resources.pak",
+diff --git a/chrome/common/webui_url_constants.h b/chrome/common/webui_url_constants.h
+index 38391479b0..6a4767c6dd 100644
+--- a/chrome/common/webui_url_constants.h
++++ b/chrome/common/webui_url_constants.h
+@@ -465,6 +465,10 @@ inline constexpr char kChromeUIUntrustedReadAnythingSidePanelURL[] =
+     "chrome-untrusted://read-anything-side-panel.top-chrome/";
+ inline constexpr char kChromeUIAccountPanelHost[] =
+     "account-panel.top-chrome";
++inline constexpr char kChromeUIDynamicIslandHost[] =
++    "dynamic-island.top-chrome";
++inline constexpr char kChromeUIDynamicIslandURL[] =
++    "chrome://dynamic-island.top-chrome/";
+ inline constexpr char kChromeUIAccountPanelURL[] =
+     "chrome://account-panel.top-chrome/";
+ inline constexpr char kChromeUIVoyagerSidePanelHost[] =
+diff --git a/third_party/lit/v3_0/BUILD.gn b/third_party/lit/v3_0/BUILD.gn
+index c04329e46f..af531706a2 100644
+--- a/third_party/lit/v3_0/BUILD.gn
++++ b/third_party/lit/v3_0/BUILD.gn
+@@ -103,6 +103,7 @@ ts_library("build_ts") {
+     "//chrome/browser/resources/side_panel/tabs_from_other_devices:build_ts",
+     "//chrome/browser/resources/side_panel/voyager:build_ts",
+     "//chrome/browser/resources/account_panel:build_ts",
++    "//chrome/browser/resources/dynamic_island:build_ts",
+     "//chrome/browser/resources/signin:build_ts",
+     "//chrome/browser/resources/signin/batch_upload:build_ts",
+     "//chrome/browser/resources/signin/history_sync_optin:build_ts",
+diff --git a/tools/gritsettings/resource_ids.spec b/tools/gritsettings/resource_ids.spec
+index 0d609cb230..79dcac9b0d 100644
+--- a/tools/gritsettings/resource_ids.spec
++++ b/tools/gritsettings/resource_ids.spec
+@@ -813,6 +813,14 @@
+     "META": {"sizes": {"includes": [10]}},
+     "includes": [4940],
+   },
++  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/dynamic_island/code_cache_resources.grd": {
++    "META": {"sizes": {"includes": [10],}},
++    "includes": [4941],
++  },
++  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/dynamic_island/resources.grd": {
++    "META": {"sizes": {"includes": [10],}},
++    "includes": [4942],
++  },
+   "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/signin/history_sync_optin/resources.grd": {
+     "META": {"sizes": {"includes": [20],}},
+     "includes": [4950],
+diff --git a/tools/metrics/histograms/metadata/page/histograms.xml b/tools/metrics/histograms/metadata/page/histograms.xml
+index 218cf8c89d..1bf5d184b1 100644
+--- a/tools/metrics/histograms/metadata/page/histograms.xml
++++ b/tools/metrics/histograms/metadata/page/histograms.xml
+@@ -616,6 +616,7 @@ chromium-metrics-reviews@google.com.
+ <variants name="WebUIName">
+   <variant name=""/>
+   <variant name=".AccountPanel"/>
++  <variant name=".DynamicIsland"/>
+   <variant name=".BookmarksSidePanel"/>
+   <variant name=".CommentsSidePanel"/>
+   <variant name=".Compose"/>
+-- 
+2.52.0.windows.1
+
