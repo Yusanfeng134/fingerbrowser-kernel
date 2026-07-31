@@ -1,0 +1,68 @@
+From 61862ee1d35739ef4ee4306b7d40b074c6d4ffe1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 10:54:08 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E9=92=89=E4=BD=8F=E7=81=B5?=
+ =?UTF-8?q?=E5=8A=A8=E5=B2=9B=20URL=20=E9=87=8C=20`=3Fq=3D`=20=E5=BF=85?=
+ =?UTF-8?q?=E9=A1=BB=E8=90=BD=E5=9C=A8=20`#`=20=E4=B9=8B=E5=90=8E?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+单独成一个补丁而不是并进 0029：这不是补一句遗漏的注释，是一次跨会话协作的
+发现，值得留下可查的出处。并进 0029 就看不见了。
+
+客户端会话在验收时指出：base 形如 .../newtab#/ai-newtab，已经带 fragment，
+所以拼在末尾的 `?q=` 落在 fragment 内部 —— 正是 HashRouter 要读的位置。他实测
+过取值。但若有人按 URL 常规「规范化」成 /newtab?q=xxx#/ai-newtab，q 就彻底
+消失，而现象是：标签页照常打开、AI 页面照常渲染、只是问题没带过去。
+
+一条看起来更正确的写法，一次善意的重构，就能让它静默失效。
+
+顺带记下一个**被否掉**的方案，免得下一个人重走：本想改成 new URL(base) 再往
+.hash 上追加，让意图变成结构。实测三种 base 形态下与字符串拼接字节相同，可以
+安全替换 —— 但 `url.hash += '?q='` 同样会招来「一个 query 怎么写在 hash 里」的
+修正冲动，只是把诱惑挪了个落点。承重的是说明本身，不是形式。
+
+配套加了 probe/run-island-query.cjs（在内核仓库，不在本补丁里）。它抠出 app.ts
+里那行真正的 href 表达式来求值，不在脚本里重写一份拼接逻辑 —— 后者测的是脚本
+自己的副本，源码怎么改都通过。已用三种变异验过探针本身会红。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../browser/resources/dynamic_island/app.ts   | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/chrome/browser/resources/dynamic_island/app.ts b/chrome/browser/resources/dynamic_island/app.ts
+index 8c2deaa101..dfa7417ac3 100644
+--- a/chrome/browser/resources/dynamic_island/app.ts
++++ b/chrome/browser/resources/dynamic_island/app.ts
+@@ -67,6 +67,26 @@ export class DynamicIslandAppElement extends CrLitElement {
+     // 由它决定放不放行、开在哪里。页面自己跳转会试图在气泡内部导航，那既没有
+     // 标签栏也回不去。
+     const a = document.createElement('a');
++
++    // ⚠ `?q=` 必须落在 `#` 之后，下面这行不能「规范化」。
++    //
++    // base 形如 http://127.0.0.1:PORT/newtab#/ai-newtab —— 已经带 fragment，
++    // 所以直接拼在末尾的 `?q=` 落在 **fragment 内部**：
++    //     pathname=/newtab  search=""  hash="#/ai-newtab?q=..."
++    // 客户端那页是 HashRouter，它读的正是 hash 里 `?` 之后那段。
++    //
++    // 看起来更正确、实际会静默坏掉的写法是把 query 挪到 fragment 前面：
++    //     `${base_without_hash}?q=...#/ai-newtab`
++    // 那样 search 里确实有 q，但 HashRouter 看不见它，于是：标签页照常打开、
++    // AI 页面照常渲染、只是问题没带过去。没有任何报错，截图也看不出区别。
++    //
++    // 换成 new URL(base) 再往 .hash 上追加同样别做：实测两种写法字节相同，
++    // 但「一个 query 怎么写在 hash 里」会招来同一次修正，只是换了个落点。
++    // 承重的是这段说明本身。
++    //
++    // 与客户端的耦合写在这里而不是靠约定：这行的正确性取决于 base 带 fragment
++    // 且对端是 HashRouter。哪一条变了，这行都要跟着重新想 —— 而不是「看着像
++    // 拼错了，顺手改对」。
+     a.href = `${base}?q=${encodeURIComponent(q)}`;
+     this.shadowRoot.appendChild(a);
+     a.click();
+-- 
+2.52.0.windows.1
+

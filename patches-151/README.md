@@ -52,6 +52,7 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0028 | fingerbrowser-vector-icon-script-utf8 | 构建 | 向量图标聚合脚本按 UTF-8 读写（与 0012 同族，**必须在 0030 之前**）|
 | 0029 | fingerbrowser-dynamic-island-webui | 灵动岛 | 灵动岛的 WebUI 页面本体，注册完成但无入口 |
 | 0030 | fingerbrowser-dynamic-island-toolbar-entry | 灵动岛 | 工具栏按钮 + 气泡 + `IDC_TOGGLE_DYNAMIC_ISLAND` + Ctrl+Shift+K（依赖 0029）|
+| 0031 | fingerbrowser-dynamic-island-query-in-fragment | 灵动岛 | 钉住 `?q=` 必须落在 `#` 之后（纯注释，依赖 0029）|
 
 ### 0026 说明：矛盾 ≠ 未伪装
 
