@@ -36,7 +36,39 @@ if (require('fs').existsSync('D:/yunbrowser-run/STALE')) {
   process.exit(1)
 }
 
+
+// ── 场地检查：不再无条件 taskkill ───────────────────────────────────────
+//
+// 按镜像名杀进程分不清「探针上次留下的残留」和「客户端此刻正开着的环境」。
+// 实际发生过：一次探针运行杀掉了 21 个正在跑的内核进程，打断了另一端正在做
+// 的验证。破坏性操作不该是默认行为。
+//
+// 改为：发现有同名进程就拒绝运行并说明，确认无关时用 PROBE_FORCE_KILL=1 显式
+// 授权。保留了清残留的能力，但把「谁来决定杀」交还给人。
+function ensureFieldClear(image) {
+  const { execSync } = require('child_process')
+  let n = 0
+  try {
+    const out = execSync(`tasklist /FI "IMAGENAME eq ${image}" /NH`, { encoding: 'utf8' })
+    // 直接数镜像名出现次数，不按行切 —— 避开跨语言生成时的换行转义坑（就是它把
+    // 这一行写坏过一次）。
+    const hay = out.toLowerCase()
+    const needle = image.toLowerCase()
+    for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) n++
+  } catch (e) { return }
+  if (n === 0) return
+  if (process.env.PROBE_FORCE_KILL === '1') {
+    try { execSync(`taskkill /IM ${image} /F /T`, { stdio: 'ignore' }) } catch (e) {}
+    return
+  }
+  console.log(`X 有 ${n} 个 ${image} 进程在跑 —— 可能是客户端正开着环境。`)
+  console.log('  探针不会替你杀：按镜像名杀分不清哪些是你的工作。')
+  console.log('  关掉后重跑；确认与你无关时用 PROBE_FORCE_KILL=1 显式授权。')
+  process.exit(1)
+}
+
 const fs = require('fs')
+const http = require('http')
 const { spawn, execSync } = require('child_process')
 const WebSocket = require('ws')
 
@@ -44,6 +76,7 @@ const KERNEL = 'D:/yunbrowser-run/yunbrowser.exe'
 const WORKDIR = 'D:/chromium-work-151/probe'
 const POLICY = `${WORKDIR}/policy-emit-policy.json`
 const PORT = 9471
+const HTTP_PORT = 8796
 
 const WANT_DPR = 1.5
 const WANT_TOUCH = 5
@@ -55,6 +88,13 @@ const WANT_TOUCH = 5
 const WANT_MEM = 16
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 必须在一个**安全上下文**里测：navigator.deviceMemory 是 [SecureContext]
+// （navigator_device_memory.idl:8），在 about:blank 上恒为 undefined，而
+// devicePixelRatio / maxTouchPoints 不受此限、照常返回。于是读数会呈现为
+// 「只有 deviceMemory 坏了」—— 一个高度可信、且指向具体字段的错误结论。
+// http://localhost 是规范认定的可信来源，无需 https 证书。
+const PAGE_URL = `http://localhost:${HTTP_PORT}/`
 
 fs.mkdirSync(WORKDIR, { recursive: true })
 fs.writeFileSync(POLICY, JSON.stringify({
@@ -83,7 +123,7 @@ fs.writeFileSync(POLICY, JSON.stringify({
 
 // 在一个内核实例里读出被测值。withPolicy=false 时不传策略，用来取基线。
 async function measure(withPolicy, profileSuffix) {
-  try { execSync('taskkill /IM yunbrowser.exe /F /T', { stdio: 'ignore' }) } catch (e) {}
+  ensureFieldClear('yunbrowser.exe')
   await sleep(1200)
 
   const args = [
@@ -91,7 +131,7 @@ async function measure(withPolicy, profileSuffix) {
     '--disable-background-networking',
     `--remote-debugging-port=${PORT}`,
     `--user-data-dir=${WORKDIR}/prof-policy-emit-${profileSuffix}`,
-    'about:blank',
+    PAGE_URL,
   ]
   if (withPolicy) args.splice(4, 0, `--fingerbrowser-policy=${POLICY}`)
 
@@ -110,6 +150,22 @@ async function measure(withPolicy, profileSuffix) {
 
   const sock = new WebSocket(ws)
   await new Promise((res, rej) => { sock.onopen = res; sock.onerror = rej })
+
+  // 等 location.href 真的到了目标再测。**target 列表里的 URL 是「打算去哪」，
+  // 不是「现在在哪」** —— 连上去时文档往往还是初始的 about:blank。踩过：
+  // target 报 http://localhost:8796/ 而 location.href 是 about:blank，
+  // isSecureContext=false，deviceMemory 恒 UNDEFINED。
+  let landed = false
+  for (let i = 0; i < 40 && !landed; i++) {
+    const href = await new Promise((r) => {
+      sock.onmessage = (m) => { const d = JSON.parse(m.data); if (d.id === 99) r(d.result?.result?.value || '') }
+      sock.send(JSON.stringify({ id: 99, method: 'Runtime.evaluate',
+        params: { returnByValue: true, expression: 'location.href' } }))
+    })
+    if (href.startsWith(PAGE_URL)) landed = true; else await sleep(250)
+  }
+  if (!landed) { sock.close(); child.kill(); throw new Error('导航未在 10s 内到达测试页，测量无意义') }
+
   const out = await new Promise((res, rej) => {
     sock.onmessage = (m) => {
       const d = JSON.parse(m.data)
@@ -122,7 +178,7 @@ async function measure(withPolicy, profileSuffix) {
       id: 1, method: 'Runtime.evaluate',
       params: {
         returnByValue: true,
-        expression: 'JSON.stringify({dpr: devicePixelRatio, touch: navigator.maxTouchPoints, mem: navigator.deviceMemory})',
+        expression: 'JSON.stringify({sec: isSecureContext, dpr: devicePixelRatio, touch: navigator.maxTouchPoints, mem: navigator.deviceMemory})',
       },
     }))
   })
@@ -132,11 +188,24 @@ async function measure(withPolicy, profileSuffix) {
 }
 
 function fail(msg) { console.log('X ' + msg); process.exit(1) }
+// 注：fail() 用 process.exit 强制退出，句柄由进程退出一并释放，无需单独关服务。
 
 ;(async () => {
+  const srv = http.createServer((q, r) => {
+    r.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    r.end('<!doctype html><meta charset=utf-8><title>probe</title>')
+  })
+  await new Promise((r) => srv.listen(HTTP_PORT, '127.0.0.1', r))
+  process.on('exit', () => { try { srv.close() } catch (e) {} })
+
   // ── 1. 基线：不带策略 ───────────────────────────────────────────────
   const base = await measure(false, 'base')
   console.log(`  基线（无策略）  dpr=${base.dpr}  maxTouchPoints=${base.touch}  deviceMemory=${base.mem}`)
+
+  if (!base.sec) {
+    fail('测试页不是安全上下文（isSecureContext=false）—— deviceMemory 恒为 undefined，\n' +
+         '  本次测量对该字段无意义。检查是否仍在 about:blank 上求值。')
+  }
 
   // 前提检查：配置值必须与基线不同，否则「生效」与「没生效」不可区分。
   // 这不是可选的谨慎 —— 正是原探针失败的根因：它选的 0 恰好等于宿主真值。
@@ -195,9 +264,14 @@ function fail(msg) { console.log('X ' + msg); process.exit(1) }
 
   console.log('')
   if (bad) {
+    srv.close()
     console.log(`X ${bad} 项未通过 —— 策略 JSON 到渲染侧这条链路有断点。`)
     process.exit(1)
   }
+  // 显式关服务并退出。少了这句，http 服务的句柄会把 node 的事件循环挂住，
+  // 脚本跑完却不退出 —— 而它若被管进 `| tail`，管道要等进程结束才输出，于是
+  // 看起来像「卡住且没有任何诊断」。本次会话里这个组合踩过两次。
+  srv.close()
   console.log('OK 策略 JSON → 开关下发 → 渲染侧，整条链路通。')
   console.log('   注意：这只覆盖 devicePixelRatio、maxTouchPoints、deviceMemory 三个字段。')
   console.log('   其余字段仍只被命令行直传的探针验过，同一个洞可能还在别处。')

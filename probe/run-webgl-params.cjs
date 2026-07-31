@@ -12,6 +12,37 @@ if (require('fs').existsSync('D:/yunbrowser-run/STALE')) {
   process.exit(1)
 }
 
+
+// ── 场地检查：不再无条件 taskkill ───────────────────────────────────────
+//
+// 按镜像名杀进程分不清「探针上次留下的残留」和「客户端此刻正开着的环境」。
+// 实际发生过：一次探针运行杀掉了 21 个正在跑的内核进程，打断了另一端正在做
+// 的验证。破坏性操作不该是默认行为。
+//
+// 改为：发现有同名进程就拒绝运行并说明，确认无关时用 PROBE_FORCE_KILL=1 显式
+// 授权。保留了清残留的能力，但把「谁来决定杀」交还给人。
+function ensureFieldClear(image) {
+  const { execSync } = require('child_process')
+  let n = 0
+  try {
+    const out = execSync(`tasklist /FI "IMAGENAME eq ${image}" /NH`, { encoding: 'utf8' })
+    // 直接数镜像名出现次数，不按行切 —— 避开跨语言生成时的换行转义坑（就是它把
+    // 这一行写坏过一次）。
+    const hay = out.toLowerCase()
+    const needle = image.toLowerCase()
+    for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) n++
+  } catch (e) { return }
+  if (n === 0) return
+  if (process.env.PROBE_FORCE_KILL === '1') {
+    try { execSync(`taskkill /IM ${image} /F /T`, { stdio: 'ignore' }) } catch (e) {}
+    return
+  }
+  console.log(`X 有 ${n} 个 ${image} 进程在跑 —— 可能是客户端正开着环境。`)
+  console.log('  探针不会替你杀：按镜像名杀分不清哪些是你的工作。')
+  console.log('  关掉后重跑；确认与你无关时用 PROBE_FORCE_KILL=1 显式授权。')
+  process.exit(1)
+}
+
 const http = require('http')
 const { spawn, execSync } = require('child_process')
 const WebSocket = require('ws')
@@ -74,7 +105,7 @@ const PROBE = `(() => {
 })()`
 
 async function measure(label, extraArgs, profile) {
-  try { execSync('taskkill /IM yunbrowser.exe /F /T', { stdio: 'ignore' }) } catch (e) {}
+  ensureFieldClear('yunbrowser.exe')
   await sleep(1500)
   const srv = http.createServer((q, s) => {
     s.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -97,7 +128,7 @@ async function measure(label, extraArgs, profile) {
     setTimeout(() => resolve(null), 15000)
   })
   ws.close()
-  try { execSync('taskkill /IM yunbrowser.exe /F /T', { stdio: 'ignore' }) } catch (e) {}
+  ensureFieldClear('yunbrowser.exe')
   srv.close()
   return raw ? JSON.parse(raw) : null
 }
