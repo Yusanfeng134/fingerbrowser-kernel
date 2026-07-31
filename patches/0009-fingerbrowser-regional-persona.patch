@@ -1,0 +1,301 @@
+From b9089959bbf543745dc5491eb974ca3d96a41983 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 14:11:33 +0800
+Subject: [PATCH 09/12] =?UTF-8?q?fingerbrowser:=20=E5=8C=BA=E5=9F=9F?=
+ =?UTF-8?q?=E4=BA=BA=E6=A0=BC=EF=BC=88=E6=97=B6=E5=8C=BA=E3=80=81=E8=AF=AD?=
+ =?UTF-8?q?=E8=A8=80=E3=80=81Accept-Language=E3=80=81CJK=20=E5=AD=97?=
+ =?UTF-8?q?=E4=BD=93=E5=B1=8F=E8=94=BD=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ICU 默认时区与 Date 行为、navigator.language(s)、发到线上的 Accept-Language
+请求头，以及按人格屏蔽 CJK 字体。
+
+## navigator.language 通过 ≠ Accept-Language 头通过
+
+这两者必须一起验，而且**要抓线上的请求头，不能只在 JS 里读**。改了
+navigator.language 而请求头仍是宿主语言，是一个一条 HTTP 请求就能拆穿的矛盾。
+
+## 已知欠账：pref 那条路径
+
+151 上还额外修了 profile pref language::prefs::kAcceptLanguages —— 该 pref 仍
+持有宿主 locale，任何直接读它的消费者（尤其 ReduceAcceptLanguage 委托）都可能
+把宿主 locale 盖回线上。124 尚未移植这一处，**本补丁不含它**，记为待办。
+---
+ .../browser/chrome_content_browser_client.cc  | 40 ++++++++++++
+ .../net/profile_network_context_service.cc    | 15 +++++
+ .../renderer/core/frame/navigator_language.cc |  8 +++
+ .../core/timezone/timezone_controller.cc      | 33 ++++++++++
+ .../renderer/platform/fonts/font_cache.cc     | 62 +++++++++++++++++++
+ 5 files changed, 158 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index ac42bd8b0c..18fe5aed4e 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2876,6 +2876,24 @@ std::string ChromeContentBrowserClient::GetApplicationLocale() {
+ 
+ std::string ChromeContentBrowserClient::GetAcceptLangs(
+     content::BrowserContext* context) {
++  // FingerBrowser: the Accept-Language HTTP header comes from this pref, which
++  // our command line never sets, so it leaked the host locale (e.g. zh-CN)
++  // even when navigator.language was overridden to en-US. Return the profile
++  // locale here so the header matches. Expand "en-US" to "en-US,en" the way a
++  // real browser does; the network stack appends the q-values.
++  {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("fp-active")) {
++      const std::string fb_lang = cmd->GetSwitchValueASCII("fp-accept-lang");
++      if (!fb_lang.empty()) {
++        const size_t dash = fb_lang.find('-');
++        if (dash != std::string::npos && fb_lang.find(',') == std::string::npos) {
++          return fb_lang + "," + fb_lang.substr(0, dash);
++        }
++        return fb_lang;
++      }
++    }
++  }
+   Profile* profile = Profile::FromBrowserContext(context);
+   return profile->GetPrefs()->GetString(language::prefs::kAcceptLanguages);
+ }
+@@ -3985,6 +4003,28 @@ void ChromeContentBrowserClient::OverrideWebkitPrefs(
+                                        &web_prefs->math_font_family_map);
+   }
+ 
++  // FingerBrowser: on a CJK Windows the generic font families (sans-serif,
++  // serif, monospace) default to CJK fonts -- their common-script ("Zyyy")
++  // entry is e.g. Microsoft YaHei. That both leaks the host region (sans-serif
++  // Latin text renders as YaHei) and, once the CJK-font block hides those
++  // families, collapses the generics onto a wrong last-resort (monospace turns
++  // proportional). Remap the common/Latin generic entries to US-Windows fonts
++  // so the generics render like a US machine. CJK text still renders via glyph
++  // fallback; only the explicit-family enumeration path is blocked elsewhere.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("fp-block-cjk-fonts")) {
++    const auto set_generic =
++        [](blink::web_pref::ScriptFontFamilyMap* map, const char16_t* font) {
++          (*map)["Zyyy"] = font;  // USCRIPT_COMMON: the default/Latin generic
++          (*map)["Latn"] = font;
++        };
++    set_generic(&web_prefs->standard_font_family_map, u"Times New Roman");
++    set_generic(&web_prefs->serif_font_family_map, u"Times New Roman");
++    set_generic(&web_prefs->sans_serif_font_family_map, u"Arial");
++    set_generic(&web_prefs->fixed_font_family_map, u"Consolas");
++    set_generic(&web_prefs->cursive_font_family_map, u"Comic Sans MS");
++    set_generic(&web_prefs->fantasy_font_family_map, u"Impact");
++  }
++
+   web_prefs->default_font_size =
+       prefs->GetInteger(prefs::kWebKitDefaultFontSize);
+   web_prefs->default_fixed_font_size =
+diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
+index e50641649a..a28e36f908 100644
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -479,6 +479,21 @@ void ProfileNetworkContextService::OnFirstPartySetsEnabledChanged(
+ }
+ 
+ std::string ProfileNetworkContextService::ComputeAcceptLanguage() const {
++  // FingerBrowser: this feeds NetworkContextParams.accept_language, the real
++  // source of the Accept-Language request header. It reads a pref our command
++  // line never sets, so the header leaked the host locale (zh-CN) even with
++  // navigator.language overridden. Override from our switch and reuse the same
++  // expansion/q-value formatting (en-US -> "en-US,en;q=0.9").
++  {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("fp-active")) {
++      const std::string fb_lang = cmd->GetSwitchValueASCII("fp-accept-lang");
++      if (!fb_lang.empty()) {
++        return ComputeAcceptLanguageFromPref(fb_lang);
++      }
++    }
++  }
++
+   // If reduce accept language is enabled, only return the first language
+   // without expanding the language list.
+   if (base::FeatureList::IsEnabled(network::features::kReduceAcceptLanguage)) {
+diff --git a/third_party/blink/renderer/core/frame/navigator_language.cc b/third_party/blink/renderer/core/frame/navigator_language.cc
+index 36018e4422..ef77138caa 100644
+--- a/third_party/blink/renderer/core/frame/navigator_language.cc
++++ b/third_party/blink/renderer/core/frame/navigator_language.cc
+@@ -7,6 +7,7 @@
+ #include "services/network/public/cpp/features.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/language.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
+@@ -65,6 +66,13 @@ void NavigatorLanguage::EnsureUpdatedLanguage() {
+ 
+     if (!accept_languages_override.IsNull()) {
+       languages_ = ParseAndSanitize(accept_languages_override);
++    } else if (const std::string fb_lang = fingerbrowser::SwitchValue(
++                   fingerbrowser::kAcceptLangSwitch);
++               !fb_lang.empty()) {
++      // FingerBrowser L2: per-profile Accept-Language. The browser process
++      // appends --lang, but that only picks the UI locale; navigator.language
++      // reads the Accept-Language list, which lives here in the renderer.
++      languages_ = ParseAndSanitize(String::FromUTF8(fb_lang));
+     } else {
+       languages_ = ParseAndSanitize(GetAcceptLanguages());
+       if (RuntimeEnabledFeatures::ReduceAcceptLanguageEnabled(
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.cc b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+index 07561c95b1..7ba3b64ac5 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -18,10 +18,13 @@
+ #include "third_party/blink/renderer/core/workers/worker_backing_thread.h"
+ #include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"
+ #include "third_party/blink/renderer/core/workers/worker_thread.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/main_thread.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/main_thread_scheduler.h"
+ #include "third_party/icu/source/common/unicode/char16ptr.h"
++#include "third_party/icu/source/common/unicode/locid.h"
++#include "third_party/icu/source/common/unicode/stringpiece.h"
+ #include "third_party/icu/source/i18n/unicode/timezone.h"
+ #include "v8/include/v8.h"
+ 
+@@ -114,6 +117,36 @@ void TimeZoneController::Init() {
+   Platform::Current()->GetBrowserInterfaceBroker()->GetInterface(
+       monitor.BindNewPipeAndPassReceiver());
+   monitor->AddClient(instance().receiver_.BindNewPipeAndPassRemote());
++
++  // FingerBrowser L2: apply the per-profile timezone inside this renderer.
++  // The browser process calls icu::TimeZone::adoptDefault(), but that is
++  // per-process and tzset() is POSIX-only, so on Windows Intl/Date here would
++  // otherwise keep reporting the host zone. Going through
++  // SetTimeZoneOverride() also notifies V8 so its date cache is invalidated.
++  // The handle is released on purpose: ~TimeZoneOverride() would clear the
++  // override, and this one must last for the life of the renderer.
++  const std::string fb_timezone =
++      fingerbrowser::SwitchValue(fingerbrowser::kTimezoneSwitch);
++  if (!fb_timezone.empty()) {
++    (void)SetTimeZoneOverride(String::FromUTF8(fb_timezone)).release();
++  }
++
++  // FingerBrowser L2: override the ICU default locale so Intl reports the
++  // profile locale, not the host's. V8 reads icu::Locale::getDefault() lazily
++  // on first Intl use (Isolate::DefaultLocale()); setting it here at blink
++  // init — before any page script runs — makes
++  // Intl.DateTimeFormat().resolvedOptions().locale agree with
++  // navigator.language. --lang sets the UI locale but not this.
++  const std::string fb_lang =
++      fingerbrowser::SwitchValue(fingerbrowser::kAcceptLangSwitch);
++  if (!fb_lang.empty()) {
++    UErrorCode status = U_ZERO_ERROR;
++    icu::Locale fb_locale = icu::Locale::forLanguageTag(
++        icu::StringPiece(fb_lang.data(), fb_lang.size()), status);
++    if (U_SUCCESS(status) && !fb_locale.isBogus()) {
++      icu::Locale::setDefault(fb_locale, status);
++    }
++  }
+ }
+ 
+ // static
+diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
+index b1d59f7b81..21acb096b1 100644
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -32,6 +32,7 @@
+ #include <limits>
+ #include <memory>
+ 
++#include "base/command_line.h"
+ #include "base/debug/alias.h"
+ #include "base/feature_list.h"
+ #include "base/timer/elapsed_timer.h"
+@@ -56,6 +57,7 @@
+ #include "third_party/blink/renderer/platform/instrumentation/tracing/web_process_memory_dump.h"
+ #include "third_party/blink/renderer/platform/wtf/text/atomic_string_hash.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_hash.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
+ #include "ui/gfx/font_list.h"
+ 
+@@ -65,6 +67,57 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// Returns true if an explicit request for `family` should report as
++// unavailable under the CJK-font block (see kBlockCjkFontsSwitch). Placed on
++// the explicit-family lookup (GetFontData / IsPlatformFamilyMatchAvailable),
++// NOT on the shared GetFontPlatformData/CreateFontPlatformData path, because
++// the system glyph fallback (GetDWriteFallbackFamily) also flows through the
++// latter -- blocking there rendered CJK text as tofu. The fallback bypasses
++// GetFontData, so CJK text still renders while enumeration sees the fonts as
++// absent. Matches common English names plus the most frequent native names.
++bool FingerBrowserIsBlockedCjkFont(const AtomicString& family) {
++  static const base::CommandLine* cmd =
++      base::CommandLine::ForCurrentProcess();
++  if (!cmd->HasSwitch(fingerbrowser::kBlockCjkFontsSwitch)) {
++    return false;
++  }
++  DEFINE_STATIC_LOCAL(
++      const Vector<AtomicString>, blocked,
++      ({// Chinese (Simplified)
++        AtomicString("Microsoft YaHei"), AtomicString("Microsoft YaHei UI"),
++        AtomicString(u"微软雅黑"), AtomicString("SimSun"),
++        AtomicString("NSimSun"), AtomicString(u"宋体"),
++        AtomicString("SimHei"), AtomicString(u"黑体"), AtomicString("KaiTi"),
++        AtomicString("FangSong"), AtomicString("DengXian"),
++        AtomicString(u"等线"),
++        // Chinese (Traditional)
++        AtomicString("Microsoft JhengHei"),
++        AtomicString("Microsoft JhengHei UI"), AtomicString(u"微軟正黑體"),
++        AtomicString("PMingLiU"), AtomicString("MingLiU"),
++        AtomicString("DFKai-SB"),
++        // Japanese
++        AtomicString("Meiryo"), AtomicString("Meiryo UI"),
++        AtomicString(u"メイリオ"), AtomicString("MS Gothic"),
++        AtomicString("MS PGothic"), AtomicString("MS Mincho"),
++        AtomicString("MS PMincho"), AtomicString("Yu Gothic"),
++        AtomicString("Yu Gothic UI"), AtomicString("Yu Mincho"),
++        AtomicString(u"游ゴシック"),
++        // Korean
++        AtomicString("Malgun Gothic"), AtomicString(u"맑은 고딕"),
++        AtomicString("Gulim"), AtomicString("Dotum"), AtomicString("Batang"),
++        AtomicString("Gungsuh")}));
++  for (const AtomicString& name : blocked) {
++    if (EqualIgnoringASCIICase(family, name)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ const char kColorEmojiLocale[] = "und-Zsye";
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -179,6 +232,12 @@ const SimpleFontData* FontCache::GetFontData(
+     const FontDescription& font_description,
+     const AtomicString& family,
+     AlternateFontName altername_font_name) {
++  // FingerBrowser: explicit page requests for region-revealing CJK fonts report
++  // as unavailable. Only this explicit-lookup path is gated; system glyph
++  // fallback reaches GetFontPlatformData directly, so CJK text still renders.
++  if (FingerBrowserIsBlockedCjkFont(family)) {
++    return nullptr;
++  }
+   if (const FontPlatformData* platform_data = GetFontPlatformData(
+           font_description,
+           FontFaceCreationParams(
+@@ -200,6 +259,9 @@ const SimpleFontData* FontCache::FontDataFromFontPlatformData(
+ bool FontCache::IsPlatformFamilyMatchAvailable(
+     const FontDescription& font_description,
+     const AtomicString& family) {
++  if (FingerBrowserIsBlockedCjkFont(family)) {
++    return false;
++  }
+   return GetFontPlatformData(
+       font_description,
+       FontFaceCreationParams(AdjustFamilyNameToAvoidUnsupportedFonts(family)),
+-- 
+2.52.0.windows.1
+

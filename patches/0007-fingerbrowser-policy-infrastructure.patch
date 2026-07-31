@@ -1,3 +1,58 @@
+From c19f5499f8083dde03685dc34ff5b409c25efe68 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 14:11:29 +0800
+Subject: [PATCH 07/12] =?UTF-8?q?fingerbrowser:=20=E7=AD=96=E7=95=A5?=
+ =?UTF-8?q?=E5=9F=BA=E7=A1=80=E8=AE=BE=E6=96=BD=E3=80=81=E5=BC=80=E5=85=B3?=
+ =?UTF-8?q?=E4=BC=A0=E6=92=AD=E4=B8=8E=E6=B8=B2=E6=9F=93=E4=BE=A7=E5=A4=B4?=
+ =?UTF-8?q?=E6=96=87=E4=BB=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+这一层本身不改变任何可观测行为，只搭骨架：--fingerbrowser-policy 开关、策略
+JSON 的解析与校验、把结果翻译成 fp-* 开关下发给渲染进程，以及渲染侧读取这些
+开关的头文件。后面五个补丁全部依赖它。
+
+## render_process_host_impl.cc 的白名单是静默失效点
+
+新开关必须加进渲染进程转发白名单，否则**开关传了、代码写了、就是不生效**，
+且没有任何报错。曾经踩过一次更难查的形态：一半开关在白名单里、一半不在，于是
+部分功能生效部分不生效 —— 比全都不生效难定位得多。
+
+已逐项核对：本补丁引入的每个 fp-* 开关都在白名单里。
+
+## HasSwitch 为什么必须存在
+
+`fp-max-touch-points` 不能用「值 > 0」判断是否接管 —— 0 恰恰是桌面人格该传的
+值，用 >0 会把「明确要求无触摸」读成「没配置」。为此头文件提供独立的
+HasSwitch()，策略侧同理用 has_ 标志位而不是哨兵值。
+
+## 头文件整体归入本补丁
+
+它的声明被后面四个特性共用。按 hunk 切给各特性更「纯粹」，但那正是
+「19 个补丁全部干净应用、树却差两行」那次事故的成因形状：同一文件被多方改动，
+归属一旦出错就是静默丢失。整体归属换来的是可验证性。
+
+代价是本补丁与后续补丁之间的中间态不可编译（头文件声明先到、调用点后到）。
+补丁是批量应用后再构建，最终状态可编译；但这个性质值得写明。
+---
+ chrome/browser/BUILD.gn                       |   1 +
+ chrome/browser/chrome_browser_main.cc         |   6 +
+ chrome/browser/fingerbrowser/BUILD.gn         |  39 ++
+ .../fingerbrowser/fingerbrowser_policy.cc     | 459 ++++++++++++++++++
+ .../fingerbrowser/fingerbrowser_policy.h      |  90 ++++
+ .../fingerbrowser_policy_unittest.cc          | 128 +++++
+ chrome/common/chrome_switches.cc              |   3 +
+ chrome/common/chrome_switches.h               |   1 +
+ .../renderer_host/render_process_host_impl.cc |  24 +
+ .../fingerbrowser/fingerbrowser_fingerprint.h | 242 +++++++++
+ 10 files changed, 993 insertions(+)
+ create mode 100644 chrome/browser/fingerbrowser/BUILD.gn
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_policy.h
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc
+ create mode 100644 third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+
 diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
 index 0386b3db3c..c926d8185e 100644
 --- a/chrome/browser/BUILD.gn
@@ -25,7 +80,7 @@ index 1d9bfb1c1d..ffdaf9719b 100644
 @@ -1021,6 +1022,11 @@ int ChromeBrowserMainParts::ApplyFirstRunPrefs() {
  int ChromeBrowserMainParts::PreCreateThreadsImpl() {
    TRACE_EVENT0("startup", "ChromeBrowserMainParts::PreCreateThreadsImpl");
-
+ 
 +  if (!fingerbrowser::ApplyFingerBrowserPolicyFromCommandLine(
 +          base::CommandLine::ForCurrentProcess())) {
 +    return chrome::RESULT_CODE_UNSUPPORTED_PARAM;
@@ -81,10 +136,10 @@ index 0000000000..4d8d18b6e3
 +}
 diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
 new file mode 100644
-index 0000000000..d7e1fe4241
+index 0000000000..03b557f0a9
 --- /dev/null
 +++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,459 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -247,6 +302,13 @@ index 0000000000..d7e1fe4241
 +  policy.permission_defaults = *permission_defaults;
 +  policy.webrtc_ip_policy = *webrtc_ip_policy;
 +
++  // Brand sits at the policy root rather than under hardwareProfile: it
++  // describes the browser product, not the machine.
++  if (const std::string* brand = fingerprint_policy->FindString("brand");
++      brand && IsSafeDisplayString(*brand)) {
++    policy.brand = *brand;
++  }
++
 +  // Optional L2 hardware profile. Every field is optional and individually
 +  // validated; an invalid field is skipped (left unset) rather than failing
 +  // the whole policy, so compliant policies without this block are unaffected.
@@ -262,10 +324,35 @@ index 0000000000..d7e1fe4241
 +        gpu_renderer && IsSafeDisplayString(*gpu_renderer)) {
 +      policy.gpu_renderer = *gpu_renderer;
 +    }
++    if (const std::string* webgpu_vendor =
++            hardware_profile->FindString("webgpuVendor");
++        webgpu_vendor && IsSafeDisplayString(*webgpu_vendor)) {
++      policy.webgpu_vendor = *webgpu_vendor;
++    }
++    if (const std::string* webgpu_architecture =
++            hardware_profile->FindString("webgpuArchitecture");
++        webgpu_architecture && IsSafeDisplayString(*webgpu_architecture)) {
++      policy.webgpu_architecture = *webgpu_architecture;
++    }
++    if (const std::string* webgpu_device =
++            hardware_profile->FindString("webgpuDevice");
++        webgpu_device && IsSafeDisplayString(*webgpu_device)) {
++      policy.webgpu_device = *webgpu_device;
++    }
++    if (const std::string* webgpu_description =
++            hardware_profile->FindString("webgpuDescription");
++        webgpu_description && IsSafeDisplayString(*webgpu_description)) {
++      policy.webgpu_description = *webgpu_description;
++    }
 +    if (const std::string* platform =
 +            hardware_profile->FindString("platform");
 +        platform && IsSafeDisplayString(*platform)) {
 +      policy.platform = *platform;
++    }
++    if (const std::string* platform_version =
++            hardware_profile->FindString("platformVersion");
++        platform_version && IsSafeDisplayString(*platform_version)) {
++      policy.platform_version = *platform_version;
 +    }
 +    if (const std::optional<int> hardware_concurrency =
 +            hardware_profile->FindInt("hardwareConcurrency");
@@ -289,6 +376,34 @@ index 0000000000..d7e1fe4241
 +        audio_noise && *audio_noise > 0) {
 +      policy.audio_noise_seed = *audio_noise;
 +    }
++    if (const std::optional<int> screen_width =
++            hardware_profile->FindInt("screenWidth");
++        screen_width && IsValidWindowSide(*screen_width)) {
++      policy.screen_width = *screen_width;
++    }
++    if (const std::optional<int> screen_height =
++            hardware_profile->FindInt("screenHeight");
++        screen_height && IsValidWindowSide(*screen_height)) {
++      policy.screen_height = *screen_height;
++    }
++  }
++
++  // 地理位置：经纬度必须成对出现且在合法范围内，缺一不可（只给一半会造出
++  // 本初子午线/赤道上的假坐标，比不伪装更可疑）。
++  if (const base::Value::Dict* geo = fingerprint_policy->FindDict("geolocation")) {
++    const std::optional<double> lat = geo->FindDouble("latitude");
++    const std::optional<double> lon = geo->FindDouble("longitude");
++    if (lat && lon && *lat >= -90.0 && *lat <= 90.0 && *lon >= -180.0 &&
++        *lon <= 180.0) {
++      policy.has_geo = true;
++      policy.geo_latitude_e6 = static_cast<int>(*lat * 1e6);
++      policy.geo_longitude_e6 = static_cast<int>(*lon * 1e6);
++    }
++  }
++
++  if (const std::optional<bool> block =
++          fingerprint_policy->FindBool("blockCjkFonts")) {
++    policy.block_cjk_fonts = *block;
 +  }
 +
 +  return policy;
@@ -343,6 +458,17 @@ index 0000000000..d7e1fe4241
 +void ApplyFingerBrowserPolicy(const FingerBrowserPolicy& policy,
 +                              base::CommandLine* command_line) {
 +  CHECK(command_line);
++  // Marks this process as running under a FingerBrowser profile. Read by
++  // components/embedder_support/user_agent_utils.cc, which otherwise blanks
++  // every high-entropy Client Hint whenever --user-agent is present -- leaving
++  // a populated UA string and brand list next to an empty platform_version /
++  // uaFullVersion / fullVersionList. No real Chrome install reports that
++  // combination, and upstream's own comment warns that empty low-entropy hints
++  // trip web application firewalls.
++  command_line->AppendSwitch("fp-active");
++  if (!policy.brand.empty()) {
++    command_line->AppendSwitchASCII("fp-brand", policy.brand);
++  }
 +  command_line->AppendSwitchASCII(switches::kLang, policy.locale);
 +  command_line->AppendSwitchASCII(
 +      switches::kWindowSize,
@@ -352,7 +478,11 @@ index 0000000000..d7e1fe4241
 +    command_line->AppendSwitch(permissions::switches::kDenyPermissionPrompts);
 +  }
 +  if (policy.webrtc_ip_policy != "default") {
-+    command_line->AppendSwitchASCII(switches::kForceWebRtcIPHandlingPolicy,
++    // switches::kForceWebRtcIPHandlingPolicy is not consumed anywhere in this
++    // build, so passing it did nothing and WebRTC kept leaking the real IP.
++    // Send a dedicated fp switch that the peer-connection factory reads in the
++    // renderer instead.
++    command_line->AppendSwitchASCII("fp-webrtc-ip-policy",
 +                                    policy.webrtc_ip_policy);
 +  }
 +
@@ -365,8 +495,26 @@ index 0000000000..d7e1fe4241
 +  if (!policy.gpu_renderer.empty()) {
 +    command_line->AppendSwitchASCII("fp-gpu-renderer", policy.gpu_renderer);
 +  }
++  if (!policy.webgpu_vendor.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-vendor", policy.webgpu_vendor);
++  }
++  if (!policy.webgpu_architecture.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-architecture",
++                                    policy.webgpu_architecture);
++  }
++  if (!policy.webgpu_device.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-device", policy.webgpu_device);
++  }
++  if (!policy.webgpu_description.empty()) {
++    command_line->AppendSwitchASCII("fp-webgpu-description",
++                                    policy.webgpu_description);
++  }
 +  if (!policy.platform.empty()) {
 +    command_line->AppendSwitchASCII("fp-platform", policy.platform);
++  }
++  if (!policy.platform_version.empty()) {
++    command_line->AppendSwitchASCII("fp-platform-version",
++                                    policy.platform_version);
 +  }
 +  if (policy.hardware_concurrency > 0) {
 +    command_line->AppendSwitchASCII(
@@ -384,6 +532,51 @@ index 0000000000..d7e1fe4241
 +  if (policy.audio_noise_seed > 0) {
 +    command_line->AppendSwitchASCII(
 +        "fp-audio-noise", base::NumberToString(policy.audio_noise_seed));
++  }
++
++  // Timezone and Accept-Language must also reach the renderer. ApplyTimezone()
++  // below only adjusts this (browser) process: tzset() is POSIX-only and
++  // icu::TimeZone::adoptDefault() is per-process, while Intl/Date run in the
++  // renderer against its own ICU instance. Likewise --lang sets the UI locale,
++  // not the Accept-Language list that navigator.language reports.
++  command_line->AppendSwitchASCII("fp-timezone", policy.timezone);
++  command_line->AppendSwitchASCII("fp-accept-lang", policy.locale);
++
++  if (policy.screen_width > 0) {
++    command_line->AppendSwitchASCII("fp-screen-width",
++                                    base::NumberToString(policy.screen_width));
++  }
++  if (policy.screen_height > 0) {
++    command_line->AppendSwitchASCII("fp-screen-height",
++                                    base::NumberToString(policy.screen_height));
++  }
++  // 伪装了 screen.* 就必须一并伪装 DPR：宿主 4K@175% 时 DPR 报 1.75，而媒体查询
++  // 的 device-width = 物理宽 ÷ DPR ≈ 2195，与伪装成 1920 的 screen.width 对不上。
++  // 少这一项不是「少伪装一条」，是把伪装本身暴露出来。
++  //
++  // 客户端未指定时按 1.0 兜底：人格声称的是普通桌面屏，那种屏几乎总是 1；
++  // 而沿用宿主真实值必然与伪装后的 screen.* 矛盾。
++  if (policy.screen_width > 0 || policy.screen_height > 0) {
++    command_line->AppendSwitchASCII(
++        "fp-dpr-x1000",
++        base::NumberToString(policy.device_pixel_ratio_x1000 > 0
++                                 ? policy.device_pixel_ratio_x1000
++                                 : 1000));
++  }
++  // 触摸点数。0 是桌面人格最常见也最该传的值，所以用 has_ 标志判断是否下发，
++  // 不能用「值 > 0」——那会把「明确要求无触摸」读成「没配置」。
++  if (policy.has_max_touch_points) {
++    command_line->AppendSwitchASCII(
++        "fp-max-touch-points", base::NumberToString(policy.max_touch_points));
++  }
++  if (policy.has_geo) {
++    command_line->AppendSwitchASCII(
++        "fp-geo-lat-e6", base::NumberToString(policy.geo_latitude_e6));
++    command_line->AppendSwitchASCII(
++        "fp-geo-lon-e6", base::NumberToString(policy.geo_longitude_e6));
++  }
++  if (policy.block_cjk_fonts) {
++    command_line->AppendSwitch("fp-block-cjk-fonts");
 +  }
 +
 +  ApplyTimezone(policy.timezone);
@@ -408,10 +601,10 @@ index 0000000000..d7e1fe4241
 +}  // namespace fingerbrowser
 diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.h b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
 new file mode 100644
-index 0000000000..56583133e1
+index 0000000000..00334429df
 --- /dev/null
 +++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,90 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -447,13 +640,48 @@ index 0000000000..56583133e1
 +  // Optional L2 hardware profile (anti-detect). Empty/zero == not set, in
 +  // which case the renderer keeps the genuine value. Parsed from an optional
 +  // "hardwareProfile" dict inside "fingerprintPolicy".
++  // Product brand for the Client Hints brand list, e.g. "Google Chrome".
++  // Unbranded Chromium builds omit it entirely, leaving a list that never
++  // mentions the product the UA string claims to be.
++  std::string brand;
 +  std::string gpu_vendor;
 +  std::string gpu_renderer;
++  // WebGPU reports a different vocabulary than WebGL (lowercase "nvidia" /
++  // "ampere" rather than "Google Inc. (NVIDIA)"), so it needs its own values
++  // instead of reusing the WebGL strings.
++  std::string webgpu_vendor;
++  std::string webgpu_architecture;
++  std::string webgpu_device;
++  std::string webgpu_description;
 +  std::string platform;
 +  int hardware_concurrency = 0;
 +  int device_memory = 0;
 +  int canvas_noise_seed = 0;
 +  int audio_noise_seed = 0;
++
++  // screen.width/height。--window-size 只影响浏览器窗口，网站读到的仍是宿主
++  // 真实分辨率，必须单独伪装。
++  // Client Hints 的 platformVersion（Windows 上是 WinRT API Contract 版本，
++  // 如 "15.0.0"）。为空则保持宿主真实值 —— 合理取值取决于人格声称的 Windows
++  // 版本，内核无从判断，猜一个可能同样罕见。
++  std::string platform_version;
++  int screen_width = 0;
++  int screen_height = 0;
++  // devicePixelRatio × 1000（1000 = 1.0）。0 表示未配置，此时若伪装了 screen.*
++  // 会按 1.0 兜底——普通桌面屏几乎总是 1，而沿用宿主真实值必然与伪装后的
++  // screen.* 矛盾（宿主 4K@175% 时 DPR=1.75，媒体查询宽度算出 2195 而非 1920）。
++  int device_pixel_ratio_x1000 = 0;
++  // navigator.maxTouchPoints。0 是桌面人格的正确值，也是最常见的取值，故用单独
++  // 的标志位区分「配了 0」与「没配」——用值本身判断会把前者读成后者。
++  bool has_max_touch_points = false;
++  int max_touch_points = 0;
++  // 经纬度以 1e6 倍整数保存，0 表示未配置（用 has_geo 区分真实的 0 坐标）。
++  bool has_geo = false;
++  // Report CJK font families as unavailable (for a non-CJK persona whose host
++  // has Chinese/Japanese/Korean fonts installed).
++  bool block_cjk_fonts = false;
++  int geo_latitude_e6 = 0;
++  int geo_longitude_e6 = 0;
 +};
 +
 +std::optional<FingerBrowserPolicy> LoadFingerBrowserPolicy(
@@ -608,7 +836,7 @@ index b82d425ba1..4ed36676ca 100644
 @@ -313,6 +313,9 @@ const char kExtensionsInstallVerification[] = "extensions-install-verification";
  // be treated as not from the webstore when doing install verification.
  const char kExtensionsNotWebstore[] = "extensions-not-webstore";
-
+ 
 +// Path to the FingerBrowser custom-kernel policy file.
 +const char kFingerBrowserPolicy[] = "fingerbrowser-policy";
 +
@@ -628,10 +856,10 @@ index 2d73a5d2c8..19199a066f 100644
  #if BUILDFLAG(IS_CHROMEOS)
  extern const char kForceDevToolsAvailable[];
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
-index ddeef4098e..29eb7f86f6 100644
+index ddeef4098e..19f1f02884 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
 +++ b/content/browser/renderer_host/render_process_host_impl.cc
-@@ -3370,6 +3370,15 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+@@ -3370,6 +3370,30 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
    // Propagate the following switches to the renderer command line (along
    // with any associated values) if present in the browser command line.
    static const char* const kSwitchNames[] = {
@@ -639,217 +867,35 @@ index ddeef4098e..29eb7f86f6 100644
 +      // match the blink-side reader and the browser-side emitter.
 +      "fp-gpu-vendor",
 +      "fp-gpu-renderer",
++      "fp-brand",
++      "fp-webgpu-vendor",
++      "fp-webgpu-architecture",
++      "fp-webgpu-device",
++      "fp-webgpu-description",
 +      "fp-platform",
 +      "fp-hardware-concurrency",
 +      "fp-device-memory",
 +      "fp-canvas-noise",
 +      "fp-audio-noise",
++      "fp-timezone",
++      "fp-accept-lang",
++      "fp-screen-width",
++      "fp-screen-height",
++      "fp-dpr-x1000",
++      "fp-max-touch-points",
++      "fp-geo-lat-e6",
++      "fp-geo-lon-e6",
++      "fp-webrtc-ip-policy",
++      "fp-block-cjk-fonts",
        switches::kDisableInProcessStackTraces,
        sandbox::policy::switches::kDisableSeccompFilterSandbox,
        sandbox::policy::switches::kNoSandbox,
-diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
-index aafe16cde1..672cdaa9d3 100644
---- a/third_party/blink/renderer/core/frame/navigator.cc
-+++ b/third_party/blink/renderer/core/frame/navigator.cc
-@@ -27,6 +27,7 @@
- #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
- #include "third_party/blink/renderer/core/dom/document.h"
- #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
- #include "third_party/blink/renderer/core/frame/local_dom_window.h"
- #include "third_party/blink/renderer/core/frame/local_frame.h"
- #include "third_party/blink/renderer/core/frame/settings.h"
-@@ -58,6 +59,13 @@ String Navigator::vendorSub() const {
- }
-
- String Navigator::platform() const {
-+  // FingerBrowser L2: native platform override (takes precedence over the
-+  // devtools/settings override path below).
-+  const std::string fb_platform =
-+      fingerbrowser::SwitchValue(fingerbrowser::kPlatformSwitch);
-+  if (!fb_platform.empty()) {
-+    return String::FromUTF8(fb_platform);
-+  }
-   // TODO(955620): Consider changing devtools overrides to only allow overriding
-   // the platform with a frozen platform to distinguish between
-   // mobile and desktop when ReduceUserAgent is enabled.
-diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
-index f5c0db2d1b..6c2b964838 100644
---- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
-+++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
-@@ -5,10 +5,16 @@
- #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
-
- #include "base/system/sys_info.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
-
- namespace blink {
-
- unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
-+  const int spoofed =
-+      fingerbrowser::IntSwitch(fingerbrowser::kHardwareConcurrencySwitch);
-+  if (spoofed > 0) {
-+    return static_cast<unsigned>(spoofed);
-+  }
-   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
- }
-
-diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
-index 2876aad298..f49e3158fc 100644
---- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
-+++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
-@@ -10,10 +10,16 @@
- #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
- #include "third_party/blink/renderer/core/dom/document.h"
- #include "third_party/blink/renderer/core/frame/local_dom_window.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
-
- namespace blink {
-
- float NavigatorDeviceMemory::deviceMemory() const {
-+  const int spoofed =
-+      fingerbrowser::IntSwitch(fingerbrowser::kDeviceMemorySwitch);
-+  if (spoofed > 0) {
-+    return static_cast<float>(spoofed);
-+  }
-   return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
- }
-
-diff --git a/third_party/blink/renderer/core/frame/navigator_id.cc b/third_party/blink/renderer/core/frame/navigator_id.cc
-index 50a1727f8d..a2e51ae85b 100644
---- a/third_party/blink/renderer/core/frame/navigator_id.cc
-+++ b/third_party/blink/renderer/core/frame/navigator_id.cc
-@@ -34,6 +34,7 @@
- #include "base/feature_list.h"
- #include "build/build_config.h"
- #include "third_party/blink/public/common/features.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
- #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
-
- #if !BUILDFLAG(IS_MAC) && !BUILDFLAG(IS_WIN)
-@@ -59,6 +60,11 @@ String NavigatorID::appVersion() {
- }
-
- String NavigatorID::platform() const {
-+  const std::string spoofed =
-+      fingerbrowser::SwitchValue(fingerbrowser::kPlatformSwitch);
-+  if (!spoofed.empty()) {
-+    return String::FromUTF8(spoofed);
-+  }
- #if BUILDFLAG(IS_MAC)
-   // Match Safari and Mozilla on Mac x86.
-   return "MacIntel";
-diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-index 7626ccf7bd..41f98cae5c 100644
---- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-+++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -12,6 +12,7 @@
-
- #include "base/check_deref.h"
- #include "base/logging.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
- #include "base/memory/scoped_refptr.h"
- #include "base/metrics/histogram_functions.h"
- #include "base/metrics/histogram_macros.h"
-@@ -2491,6 +2492,18 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
-     }
-   }
-
-+  // FingerBrowser L2: deterministic readback noise (canvas fingerprint
-+  // defense). No-op unless a per-profile seed switch is present.
-+  if (const uint32_t fb_seed = fingerbrowser::CanvasSeed()) {
-+    SkPixmap fb_pixmap = image_data->GetSkPixmap();
-+    if (fb_pixmap.addr()) {
-+      fingerbrowser::PerturbPixels(
-+          static_cast<uint8_t*>(fb_pixmap.writable_addr()),
-+          fb_pixmap.computeByteSize(), fb_seed,
-+          fb_pixmap.info().bytesPerPixel());
-+    }
-+  }
-+
-   return image_data;
- }
-
-diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
-index 9aad422c44..859f302c86 100644
---- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
-+++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
-@@ -35,7 +35,10 @@
- #include "third_party/blink/renderer/core/frame/local_dom_window.h"
- #include "third_party/blink/renderer/modules/webaudio/audio_listener.h"
- #include "third_party/blink/renderer/modules/webaudio/deferred_task_handler.h"
-+#include "third_party/blink/renderer/core/typed_arrays/dom_typed_array.h"
-+#include "third_party/blink/renderer/modules/webaudio/audio_buffer.h"
- #include "third_party/blink/renderer/modules/webaudio/offline_audio_completion_event.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
- #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_node.h"
- #include "third_party/blink/renderer/platform/audio/audio_utilities.h"
- #include "third_party/blink/renderer/platform/bindings/exception_messages.h"
-@@ -370,6 +373,22 @@ void OfflineAudioContext::FireCompletionEvent() {
-       return;
-     }
-
-+    // FingerBrowser L2: deterministic noise on the offline-rendered result
-+    // (the audio-fingerprint vector that fingerprintjs/creepjs read). Safe
-+    // here: this is one-shot render output handed to JS, not live playback, so
-+    // AudioBuffer.getChannelData stays untouched/native. No-op unless a
-+    // per-profile seed switch is present.
-+    if (const uint32_t fb_audio_seed = fingerbrowser::AudioSeed()) {
-+      for (unsigned fb_ch = 0; fb_ch < rendered_buffer->numberOfChannels();
-+           ++fb_ch) {
-+        DOMFloat32Array* fb_data = rendered_buffer->getChannelData(fb_ch).Get();
-+        if (fb_data) {
-+          fingerbrowser::PerturbAudio(fb_data->Data(), fb_data->length(),
-+                                      fb_audio_seed + fb_ch);
-+        }
-+      }
-+    }
-+
-     // Call the offline rendering completion event listener and resolve the
-     // promise too.
-     DispatchEvent(*OfflineAudioCompletionEvent::Create(rendered_buffer));
-diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index aa89d49c0e..6e523e8819 100644
---- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-+++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -34,6 +34,7 @@
- #include "base/numerics/checked_math.h"
- #include "base/synchronization/lock.h"
- #include "base/task/single_thread_task_runner.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
- #include "build/build_config.h"
- #include "gpu/GLES2/gl2extchromium.h"
- #include "gpu/command_buffer/client/gles2_interface.h"
-@@ -3862,6 +3863,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
-       return ScriptValue::CreateNull(script_state->GetIsolate());
-     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
-       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
-+        const std::string fb_renderer =
-+            fingerbrowser::SwitchValue(fingerbrowser::kGpuRendererSwitch);
-+        if (!fb_renderer.empty()) {
-+          return WebGLAny(script_state, String::FromUTF8(fb_renderer));
-+        }
-         if (IdentifiabilityStudySettings::Get()->ShouldSampleType(
-                 blink::IdentifiableSurface::Type::kWebGLParameter)) {
-           RecordIdentifiableGLParameterDigest(
-@@ -3877,6 +3883,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
-       return ScriptValue::CreateNull(script_state->GetIsolate());
-     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
-       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
-+        const std::string fb_vendor =
-+            fingerbrowser::SwitchValue(fingerbrowser::kGpuVendorSwitch);
-+        if (!fb_vendor.empty()) {
-+          return WebGLAny(script_state, String::FromUTF8(fb_vendor));
-+        }
-         if (IdentifiabilityStudySettings::Get()->ShouldSampleType(
-                 blink::IdentifiableSurface::Type::kWebGLParameter)) {
-           RecordIdentifiableGLParameterDigest(
 diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
 new file mode 100644
-index 0000000000..35590e499c
+index 0000000000..e6e26c7592
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,242 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -888,6 +934,67 @@ index 0000000000..35590e499c
 +inline constexpr char kDeviceMemorySwitch[] = "fp-device-memory";
 +inline constexpr char kCanvasNoiseSwitch[] = "fp-canvas-noise";
 +inline constexpr char kAudioNoiseSwitch[] = "fp-audio-noise";
++// Renderer-side timezone / Accept-Language overrides. The browser process also
++// sets ICU's default zone and --lang, but those only affect the browser
++// process: Intl/Date and navigator.language are evaluated in the renderer,
++// which has its own ICU instance and reads Accept-Language, so the values have
++// to be propagated here explicitly.
++inline constexpr char kTimezoneSwitch[] = "fp-timezone";
++inline constexpr char kAcceptLangSwitch[] = "fp-accept-lang";
++// screen.* 与窗口尺寸是两回事：--window-size 只改浏览器窗口，网站读到的
++// screen.width/height 仍是宿主真实分辨率，两者不一致本身就是可检测特征。
++inline constexpr char kScreenWidthSwitch[] = "fp-screen-width";
++inline constexpr char kScreenHeightSwitch[] = "fp-screen-height";
++// devicePixelRatio。以 1000 倍整数传递（同经纬度，避免浮点字符串的本地化问题）：
++// 1000 = 1.0，1500 = 1.5。
++//
++// 不伪装它的后果不是「少伪装一项」，而是**制造矛盾**：宿主 4K + 175% 缩放时
++// DPR 报 1.75，而媒体查询的 device-width 是物理宽 ÷ DPR = 3840/1.75 ≈ 2195，
++// 与伪装成 1920 的 screen.width 对不上。检测方看到的不是一个普通用户，而是
++// 「有人动过手脚」——阳性证据，比单纯泄漏真实值严重。
++//
++// 实测该症状在本内核上确实出现（probe/run-124-audit.cjs：2195 vs 1920、DPR 1.75）。
++inline constexpr char kDevicePixelRatioX1000Switch[] = "fp-dpr-x1000";
++// navigator.maxTouchPoints。宿主带触摸屏时它是 10，而 ontouchstart 不存在、
++// pointer:coarse 为否——这三者本该同进同退，对不上同样是阳性证据。
++// 传 0 表示无触摸（桌面人格）。
++inline constexpr char kMaxTouchPointsSwitch[] = "fp-max-touch-points";
++inline constexpr char kDoNotTrackSwitch[] = "fp-do-not-track";
++// 经纬度以 1e6 倍整数传递（命令行开关只走整数解析，避免浮点字符串的本地化问题）。
++inline constexpr char kGeoLatitudeE6Switch[] = "fp-geo-lat-e6";
++inline constexpr char kGeoLongitudeE6Switch[] = "fp-geo-lon-e6";
++
++// WebRTC IP handling policy (e.g. "disable_non_proxied_udp"). This must be a
++// renderer switch, not just a pref: Chromium reads the policy from a renderer
++// preference (webrtc_ip_handling_policy) that is populated from the
++// kWebRTCIPHandlingPolicy pref, and the browser-process command line never
++// sets that pref -- so the renderer sees an empty string, falls back to
++// kDefault, and enable_nonproxied_udp stays true. The result is a STUN
++// reflexive candidate that leaks the host's real public IP even when HTTP
++// traffic exits through a proxy in another country. Reading this switch
++// directly in the peer-connection factory forces the policy regardless of the
++// pref plumbing.
++inline constexpr char kWebRtcIpPolicySwitch[] = "fp-webrtc-ip-policy";
++
++// When present, explicit page requests for CJK font families report as
++// unavailable. A non-CJK persona (en-US, de-DE, …) running on a machine with
++// Chinese/Japanese/Korean fonts installed leaks its true region through
++// measurement-based font enumeration (canvas measureText of "SomeFont, monospace"
++// differs from the fallback iff the font is installed). This only blocks the
++// explicit-family path (FontCache::CreateFontPlatformData); glyph rendering for
++// CJK text still works because it goes through the DirectWrite system fallback
++// (PlatformFallbackFontForCharacter), a different entry point.
++inline constexpr char kBlockCjkFontsSwitch[] = "fp-block-cjk-fonts";
++
++// WebGPU adapter identity. Separate from the WebGL switches because the two
++// APIs use different vocabularies: WebGL reports "Google Inc. (NVIDIA)" and an
++// ANGLE renderer string, while WebGPU reports lowercase tokens ("nvidia",
++// "ampere"). Spoofing only WebGL leaves the two APIs contradicting each other
++// within a single page, which is a stronger signal than not spoofing at all.
++inline constexpr char kWebGpuVendorSwitch[] = "fp-webgpu-vendor";
++inline constexpr char kWebGpuArchitectureSwitch[] = "fp-webgpu-architecture";
++inline constexpr char kWebGpuDeviceSwitch[] = "fp-webgpu-device";
++inline constexpr char kWebGpuDescriptionSwitch[] = "fp-webgpu-description";
 +
 +inline std::string SwitchValue(const char* name) {
 +  const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
@@ -900,6 +1007,13 @@ index 0000000000..35590e499c
 +  return (!value.empty() && base::StringToInt(value, &parsed)) ? parsed : 0;
 +}
 +
++// 用于合法值包含 0 的开关。此前所有整数开关都靠「值 > 0」判断是否接管，那对
++// screen 宽高、DPR 成立（0 无意义），但对 maxTouchPoints 不成立 —— 0 恰恰是
++// 桌面人格最该传的值，用 IntSwitch 判会把「明确要求无触摸」读成「没配置」。
++inline bool HasSwitch(const char* name) {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(name);
++}
++
 +inline uint32_t CanvasSeed() {
 +  return static_cast<uint32_t>(IntSwitch(kCanvasNoiseSwitch));
 +}
@@ -907,6 +1021,16 @@ index 0000000000..35590e499c
 +inline uint32_t AudioSeed() {
 +  return static_cast<uint32_t>(IntSwitch(kAudioNoiseSwitch));
 +}
++
++// Minimum canvas area (in pixels) to noise. Real fingerprinting reads rendered
++// content — text, gradients — from canvases well above this. Tiny canvases are
++// how noise detectors probe the readback path: CreepJS getPixelMods writes
++// known data to an 8x8 canvas via putImageData and flags any difference on
++// getImageData, and putImageData->getImageData is lossless on a real browser.
++// Gating on the SOURCE CANVAS size (not the read region) keeps that round-trip
++// lossless on small buffers while a small sub-read of a large canvas still gets
++// noised, preserving the coordinate consistency from the canvas-readback patch.
++inline constexpr int64_t kMinCanvasNoisePixels = 1024;
 +
 +// mulberry32 — small, fast, deterministic PRNG.
 +inline uint32_t NextRandom(uint32_t& state) {
@@ -919,23 +1043,68 @@ index 0000000000..35590e499c
 +
 +// Perturb ~3% of each color channel by +/-1, deterministically. Alpha (the 4th
 +// byte of each pixel) is left untouched so the change stays imperceptible.
-+inline void PerturbPixels(uint8_t* data,
-+                          size_t byte_length,
-+                          uint32_t seed,
-+                          int bytes_per_pixel) {
-+  if (!data || !seed || bytes_per_pixel < 3) {
++// Deterministic hash of (seed, x, y). Finalizer-style mixing so that adjacent
++// coordinates do not produce correlated output.
++inline uint32_t PixelHash(uint32_t seed, int32_t x, int32_t y) {
++  uint32_t h = seed;
++  h ^= static_cast<uint32_t>(x) * 0x9E3779B1u;
++  h = (h ^ (h >> 15)) * 0x85EBCA6Bu;
++  h ^= static_cast<uint32_t>(y) * 0xC2B2AE35u;
++  h = (h ^ (h >> 13)) * 0xC2B2AE35u;
++  return h ^ (h >> 16);
++}
++
++// Perturb a pixel block, keying the noise on each pixel's ABSOLUTE canvas
++// coordinate rather than on its offset within the returned buffer.
++//
++// This distinction is load-bearing. A buffer-offset-keyed stream gives the same
++// canvas pixel different noise depending on the shape of the read that returned
++// it, so getImageData(sx, sy, w, h) disagrees with getImageData(0, 0, W, H) for
++// the pixels they share. That breaks legitimate partial-readback image
++// processing (measured: 59 mismatched bytes over a 20x20 sub-read). Keying on
++// absolute coordinates makes every read of a given pixel agree, which is a
++// correctness requirement for the canvas API independent of any defense goal.
++inline void PerturbPixelsAt(uint8_t* data,
++                            size_t byte_length,
++                            uint32_t seed,
++                            int bytes_per_pixel,
++                            size_t row_bytes,
++                            int32_t width,
++                            int32_t height,
++                            int32_t origin_x,
++                            int32_t origin_y) {
++  if (!data || !seed || bytes_per_pixel < 3 || width <= 0 || height <= 0) {
 +    return;
 +  }
-+  uint32_t state = seed;
 +  const int color_channels = bytes_per_pixel >= 4 ? 3 : bytes_per_pixel;
-+  for (size_t i = 0; i + static_cast<size_t>(bytes_per_pixel) <= byte_length;
-+       i += static_cast<size_t>(bytes_per_pixel)) {
-+    for (int channel = 0; channel < color_channels; ++channel) {
-+      if ((NextRandom(state) & 0xFFu) < 8u) {  // ~3.1% of channels
-+        const int delta = (NextRandom(state) & 1u) ? 1 : -1;
-+        const int value = static_cast<int>(data[i + channel]) + delta;
-+        data[i + channel] =
-+            static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
++  for (int32_t row = 0; row < height; ++row) {
++    const size_t row_offset = static_cast<size_t>(row) * row_bytes;
++    if (row_offset >= byte_length) {
++      break;
++    }
++    for (int32_t col = 0; col < width; ++col) {
++      const size_t i =
++          row_offset + static_cast<size_t>(col) *
++                           static_cast<size_t>(bytes_per_pixel);
++      if (i + static_cast<size_t>(bytes_per_pixel) > byte_length) {
++        break;
++      }
++      // One hash per pixel, sliced into per-channel fields, rather than one
++      // hash per channel. Hashing each channel separately cost four PixelHash
++      // calls per pixel (~16 multiplies) and made getImageData 5-10x slower;
++      // on canvas-heavy pages that was enough to stall rendering outright.
++      // Small test canvases hid this -- the cost only shows at real sizes.
++      //
++      // Layout: bits 0-7, 8-15, 16-23 carry each channel's probability field,
++      // bits 24-26 carry its sign. 27 bits used of 32, no overlap.
++      const uint32_t h = PixelHash(seed, origin_x + col, origin_y + row);
++      for (int channel = 0; channel < color_channels; ++channel) {
++        if (((h >> (channel * 8)) & 0xFFu) < 8u) {  // ~3.1% of channels
++          const int delta = (h & (1u << (24 + channel))) ? 1 : -1;
++          const int value = static_cast<int>(data[i + channel]) + delta;
++          data[i + channel] =
++              static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
++        }
 +      }
 +    }
 +  }
@@ -947,10 +1116,20 @@ index 0000000000..35590e499c
 +  if (!data || !seed) {
 +    return;
 +  }
-+  uint32_t state = seed;
++  // Key the perturbation on each sample's VALUE, not its position. A
++  // position-sequential PRNG gave every sample an independent nudge, which
++  // destroyed the duplicate sample values a real render naturally has: measured
++  // unique-sample count jumped from ~4736/5000 to a maxed-out 5000/5000, a
++  // signature detectors read (CreepJS reports it as "unique"). Hashing the
++  // sample value means equal samples get equal noise and stay equal, so the
++  // duplicate structure is preserved while the fingerprint still shifts
++  // deterministically per profile.
 +  for (size_t i = 0; i < count; ++i) {
-+    const float unit =
-+        static_cast<float>(NextRandom(state) & 0xFFFFu) / 65535.0f - 0.5f;
++    uint32_t bits = 0;
++    static_assert(sizeof(bits) == sizeof(float), "float must be 32-bit");
++    __builtin_memcpy(&bits, &data[i], sizeof(bits));
++    const uint32_t h = PixelHash(seed, static_cast<int32_t>(bits), 0);
++    const float unit = static_cast<float>(h & 0xFFFFu) / 65535.0f - 0.5f;
 +    data[i] += unit * 2e-7f;
 +  }
 +}
@@ -959,70 +1138,6 @@ index 0000000000..35590e499c
 +}  // namespace blink
 +
 +#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERBROWSER_FINGERBROWSER_FINGERPRINT_H_
-diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
-index 16875cc89c..1f31faa63e 100644
---- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
-+++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
-@@ -36,12 +36,14 @@
+-- 
+2.52.0.windows.1
 
- #include "base/compiler_specific.h"
- #include "base/memory/ptr_util.h"
-+#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
- #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
- #include "third_party/blink/renderer/platform/image-encoders/image_encoder.h"
- #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
- #include "third_party/blink/renderer/platform/wtf/text/base64.h"
- #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
- #include "third_party/blink/renderer/platform/wtf/vector.h"
-+#include "third_party/skia/include/core/SkBitmap.h"
- #include "third_party/skia/include/core/SkImage.h"
- #include "third_party/skia/include/core/SkSurface.h"
- #include "third_party/skia/include/core/SkSwizzle.h"
-@@ -146,6 +148,24 @@ bool ImageDataBuffer::EncodeImageInternal(const ImageEncodingMimeType mime_type,
-                                           const SkPixmap& pixmap) const {
-   DCHECK(is_valid_);
-
-+  // FingerBrowser L2: deterministic canvas noise. toDataURL and toBlob both
-+  // funnel through here, so noising a copy here covers both while leaving the
-+  // source pixmap (and any other readers) untouched. No-op unless a per-profile
-+  // seed switch is present.
-+  SkBitmap fb_noised;
-+  SkPixmap fb_noised_pixmap;
-+  const SkPixmap* active_pixmap = &pixmap;
-+  if (const uint32_t fb_seed = fingerbrowser::CanvasSeed();
-+      fb_seed && pixmap.addr() && fb_noised.tryAllocPixels(pixmap.info()) &&
-+      pixmap.readPixels(fb_noised.pixmap()) &&
-+      fb_noised.peekPixels(&fb_noised_pixmap)) {
-+    fingerbrowser::PerturbPixels(
-+        static_cast<uint8_t*>(fb_noised_pixmap.writable_addr()),
-+        fb_noised_pixmap.computeByteSize(), fb_seed,
-+        fb_noised_pixmap.info().bytesPerPixel());
-+    active_pixmap = &fb_noised_pixmap;
-+  }
-+
-   if (mime_type == kMimeTypeJpeg) {
-     SkJpegEncoder::Options options;
-     options.fQuality = ImageEncoder::ComputeJpegQuality(quality);
-@@ -153,19 +173,19 @@ bool ImageDataBuffer::EncodeImageInternal(const ImageEncodingMimeType mime_type,
-     if (options.fQuality == 100) {
-       options.fDownsample = SkJpegEncoder::Downsample::k444;
-     }
--    return ImageEncoder::Encode(encoded_image, pixmap, options);
-+    return ImageEncoder::Encode(encoded_image, *active_pixmap, options);
-   }
-
-   if (mime_type == kMimeTypeWebp) {
-     SkWebpEncoder::Options options = ImageEncoder::ComputeWebpOptions(quality);
--    return ImageEncoder::Encode(encoded_image, pixmap, options);
-+    return ImageEncoder::Encode(encoded_image, *active_pixmap, options);
-   }
-
-   DCHECK_EQ(mime_type, kMimeTypePng);
-   SkPngEncoder::Options options;
-   options.fFilterFlags = SkPngEncoder::FilterFlag::kSub;
-   options.fZLibLevel = 3;
--  return ImageEncoder::Encode(encoded_image, pixmap, options);
-+  return ImageEncoder::Encode(encoded_image, *active_pixmap, options);
- }
-
- String ImageDataBuffer::ToDataURL(const ImageEncodingMimeType mime_type,

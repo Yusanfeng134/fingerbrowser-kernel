@@ -1,0 +1,318 @@
+From 4f206f425dafec0d40384d39b843284295d1c546 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 14:11:35 +0800
+Subject: [PATCH 10/12] =?UTF-8?q?fingerbrowser:=20=E5=B1=8F=E5=B9=95?=
+ =?UTF-8?q?=E3=80=81=E8=AE=BE=E5=A4=87=E5=83=8F=E7=B4=A0=E6=AF=94=E3=80=81?=
+ =?UTF-8?q?=E8=A7=A6=E6=91=B8=E7=82=B9=E6=95=B0=E3=80=81=E5=AA=92=E4=BD=93?=
+ =?UTF-8?q?=E6=9F=A5=E8=AF=A2=E4=B8=8E=E5=9C=B0=E7=90=86=E4=BD=8D=E7=BD=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+screen.* 、devicePixelRatio、navigator.maxTouchPoints、CSS 的 device-width /
+device-height 媒体查询，以及 geolocation 坐标。
+
+## 媒体查询与 screen.* 必须同源
+
+screen.* 的伪装在 Screen::width() getter 上，而 CSS 媒体查询走 ScreenInfo，
+两条路各说各话。实测宿主 4K@175% 时媒体查询报 2195（= 3840/1.75）而
+screen.width 报 1920 —— **一条 CSS 媒体查询即可拆穿**。故媒体查询复用同一个
+fp-screen-* 开关而不新开一个：屏幕尺寸只能有一处真相。
+
+## LayoutZoomFactor 已经含了设备缩放
+
+它等于「设备缩放 × 页面缩放」。第一版直接相乘等于把 1.75 又乘回去，实测 DPR
+仍是 1.75，改动看起来完全没生效。现改为除掉真实设备缩放、只保留页面缩放 ——
+用户按 Ctrl+= 时 DPR 本该跟着变，钉死成常数反而是新特征。
+
+## 地理位置走 FindDouble
+
+策略里下发的是十进制度数，改成 FindInt 会静默丢掉小数部分。这是个真实踩过的
+坑，同族的还有 devicePixelRatio。
+
+## 已知欠账：这两处此前从策略路径不可达
+
+ParsePolicyDict 不读 devicePixelRatio 与 maxTouchPoints，导致 fp-dpr-x1000 恒为
+兜底值、fp-max-touch-points 永不下发 —— 渲染侧代码是死的。151 已在其 0032 修复，
+124 的对应修复**不在本补丁内**，随后单独提交（它需要一次构建验证）。
+
+CSS 的 (pointer)/(any-pointer) 媒体特征目前也未伪装，与 maxTouchPoints 同族，
+记为待办。
+---
+ .../blink/renderer/core/css/media_values.cc   | 17 +++++++
+ .../renderer/core/events/navigator_events.cc  | 12 +++++
+ .../blink/renderer/core/frame/local_frame.cc  | 28 +++++++++++
+ .../blink/renderer/core/frame/screen.cc       | 32 +++++++++++++
+ .../modules/geolocation/geolocation.cc        | 48 +++++++++++++++++++
+ 5 files changed, 137 insertions(+)
+
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index 1b31621353..d5788d7280 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -27,6 +27,7 @@
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/preferences/preference_overrides.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/graphics/color_space_gamut.h"
+ #include "third_party/blink/renderer/platform/network/network_state_notifier.h"
+ #include "third_party/blink/renderer/platform/theme/web_theme_engine_helper.h"
+@@ -162,6 +163,16 @@ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+     device_width = static_cast<int>(
+         lroundf(device_width * screen_info.device_scale_factor));
+   }
++  // FingerBrowser：媒体查询的 device-width 必须与 screen.width 同源。
++  // screen.* 的伪装做在 Screen::width() 这个 getter 上，而媒体查询走 ScreenInfo，
++  // 两条路各说各话 —— 实测本内核在宿主 4K@175% 下这里报 2195、screen.width 报
++  // 1920，一条 CSS 媒体查询就能拆穿。复用同一个开关而不是新开一个：屏幕尺寸
++  // 只能有一处真相，两份规则迟早漂移，而漂移出来的又是矛盾。
++  if (const int fb_width =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      fb_width > 0) {
++    return fb_width;
++  }
+   return device_width;
+ }
+ 
+@@ -174,6 +185,12 @@ int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
+     device_height = static_cast<int>(
+         lroundf(device_height * screen_info.device_scale_factor));
+   }
++  // FingerBrowser：同 CalculateDeviceWidth，与 screen.height 同源。
++  if (const int fb_height =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      fb_height > 0) {
++    return fb_height;
++  }
+   return device_height;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/events/navigator_events.cc b/third_party/blink/renderer/core/events/navigator_events.cc
+index a57561775c..b83ba79178 100644
+--- a/third_party/blink/renderer/core/events/navigator_events.cc
++++ b/third_party/blink/renderer/core/events/navigator_events.cc
+@@ -34,10 +34,22 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ 
+ namespace blink {
+ 
+ int32_t NavigatorEvents::maxTouchPoints(Navigator& navigator) {
++  // FingerBrowser：宿主带触摸屏时这里报 10，而同一台机器上 ontouchstart 不存在、
++  // (pointer: coarse) 为否 —— 这三者本该同进同退。对不上不是「少伪装一项」，
++  // 是阳性证据：检测方看到的是有人动过手脚，而不是一个普通用户。
++  //
++  // 实测该症状在本内核上确实出现（probe/run-124-audit.cjs：10 / false / false）。
++  //
++  // 开关值 0 表示无触摸（桌面人格），也是最常见的取值，所以用「是否传了这个
++  // 开关」而不是「值是否大于 0」来判断是否接管。
++  if (fingerbrowser::HasSwitch(fingerbrowser::kMaxTouchPointsSwitch)) {
++    return fingerbrowser::IntSwitch(fingerbrowser::kMaxTouchPointsSwitch);
++  }
+   LocalDOMWindow* window = navigator.DomWindow();
+   return window ? window->GetFrame()->GetSettings()->GetMaxTouchPoints() : 0;
+ }
+diff --git a/third_party/blink/renderer/core/frame/local_frame.cc b/third_party/blink/renderer/core/frame/local_frame.cc
+index b89cc3f1dc..fd8b7f9c33 100644
+--- a/third_party/blink/renderer/core/frame/local_frame.cc
++++ b/third_party/blink/renderer/core/frame/local_frame.cc
+@@ -199,6 +199,7 @@
+ #include "third_party/blink/renderer/core/timing/dom_window_performance.h"
+ #include "third_party/blink/renderer/platform/back_forward_cache_utils.h"
+ #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/bindings/source_location.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
+ #include "third_party/blink/renderer/platform/blob/blob_data.h"
+@@ -1656,6 +1657,33 @@ double LocalFrame::DevicePixelRatio() const {
+   if (!page_)
+     return 0;
+ 
++  // FingerBrowser：devicePixelRatio。宿主 4K + 175% 缩放时这里是 1.75，而人格
++  // 声称的是一块 1920x1080 的普通桌面屏 —— 那种屏的 DPR 几乎总是 1。
++  //
++  // 放在这里而不是 LocalDOMWindow::devicePixelRatio()：媒体查询的
++  // MediaValues::CalculateDevicePixelRatio() 也调这个函数，改一处两边同时生效，
++  // 不会出现 window.devicePixelRatio 与 (resolution: Xdppx) 各说各话。
++  //
++  // PageZoomFactor() 在 zoom-for-DSF 下**已经含了设备缩放**（= 设备缩放 ×
++  // 页面缩放），直接相乘等于把 1.75 又乘回去。151 上第一版就是这么写的，实测
++  // DPR 仍是 1.75、改动看起来完全没生效。所以先把真实设备缩放除掉，只保留页面
++  // 缩放那一份：用户按 Ctrl+= 放大时 DPR 本来就该跟着变（真实 1x 屏在 110%
++  // 缩放下报 1.1），钉死成常数反而是个新特征。
++  //
++  // 注：151 上这个函数叫 LayoutZoomFactor()，本版本叫 PageZoomFactor()，语义
++  // 相同 —— 移植时不能按名字假定行为，这一点是核对过的。
++  if (const int fb_dpr_x1000 =
++          fingerbrowser::IntSwitch(fingerbrowser::kDevicePixelRatioX1000Switch);
++      fb_dpr_x1000 > 0) {
++    const float real_dsf =
++        page_->GetChromeClient()
++            .GetScreenInfo(const_cast<LocalFrame&>(*this))
++            .device_scale_factor;
++    const double page_zoom =
++        real_dsf > 0 ? PageZoomFactor() / real_dsf : PageZoomFactor();
++    return (fb_dpr_x1000 / 1000.0) * page_zoom;
++  }
++
+   double ratio = page_->InspectorDeviceScaleFactorOverride();
+   ratio *= PageZoomFactor();
+   return ratio;
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index f99c26b261..151e0cb393 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -28,7 +28,10 @@
+ 
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
++#include <algorithm>
++
+ #include "base/numerics/safe_conversions.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+@@ -97,13 +100,32 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
+   return true;
+ }
+ 
++namespace {
++
++// Windows 任务栏在 100% 缩放下约占 40px。screen.height 与 availHeight 完全相等
++// 反而不自然（等于宣称没有任务栏），指纹脚本会把这个差值本身当作特征，所以伪装
++// 时保留一个常见差值。
++constexpr int kFingerBrowserTaskbarHeight = 40;
++
++}  // namespace
++
+ int Screen::height() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).height();
+ }
+ 
+ int Screen::width() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).width();
+@@ -132,12 +154,22 @@ int Screen::availTop() const {
+ }
+ 
+ int Screen::availHeight() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenHeightSwitch);
++      spoofed > 0) {
++    return std::max(1, spoofed - kFingerBrowserTaskbarHeight);
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).height();
+ }
+ 
+ int Screen::availWidth() const {
++  if (const int spoofed =
++          fingerbrowser::IntSwitch(fingerbrowser::kScreenWidthSwitch);
++      spoofed > 0) {
++    return spoofed;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).width();
+diff --git a/third_party/blink/renderer/modules/geolocation/geolocation.cc b/third_party/blink/renderer/modules/geolocation/geolocation.cc
+index 1051a55224..6ff75dd097 100644
+--- a/third_party/blink/renderer/modules/geolocation/geolocation.cc
++++ b/third_party/blink/renderer/modules/geolocation/geolocation.cc
+@@ -28,7 +28,9 @@
+ #include "third_party/blink/renderer/modules/geolocation/geolocation.h"
+ 
+ #include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
+ #include "services/device/public/mojom/geoposition.mojom-blink.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/public/common/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/mojom/permissions_policy/permissions_policy.mojom-blink.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -69,6 +71,39 @@ Geoposition* CreateGeoposition(
+       coordinates, ConvertTimeToEpochTimeStamp(position.timestamp));
+ }
+ 
++// FingerBrowser L2：策略给定坐标时用它满足定位请求，完全不接触真实定位服务。
++// 返回 nullptr 表示未配置，走原生流程。
++Geoposition* CreateFingerBrowserGeoposition() {
++  const std::string lat =
++      fingerbrowser::SwitchValue(fingerbrowser::kGeoLatitudeE6Switch);
++  const std::string lon =
++      fingerbrowser::SwitchValue(fingerbrowser::kGeoLongitudeE6Switch);
++  if (lat.empty() || lon.empty()) {
++    return nullptr;
++  }
++  const double latitude =
++      fingerbrowser::IntSwitch(fingerbrowser::kGeoLatitudeE6Switch) / 1e6;
++  const double longitude =
++      fingerbrowser::IntSwitch(fingerbrowser::kGeoLongitudeE6Switch) / 1e6;
++  auto* coordinates = MakeGarbageCollected<GeolocationCoordinates>(
++      latitude, longitude,
++      /*provides_altitude=*/false, 0.0,
++      // 民用 GPS 的常见量级；给 0 反而不像真实设备。
++      /*accuracy=*/40.0,
++      /*provides_altitude_accuracy=*/false, 0.0,
++      /*provides_heading=*/false, 0.0,
++      /*provides_speed=*/false, 0.0);
++  return MakeGarbageCollected<Geoposition>(
++      coordinates, ConvertTimeToEpochTimeStamp(base::Time::Now()));
++}
++
++bool FingerBrowserGeolocationActive() {
++  return !fingerbrowser::SwitchValue(fingerbrowser::kGeoLatitudeE6Switch)
++              .empty() &&
++         !fingerbrowser::SwitchValue(fingerbrowser::kGeoLongitudeE6Switch)
++              .empty();
++}
++
+ GeolocationPositionError* CreatePositionError(
+     const device::mojom::blink::GeopositionError& error) {
+   GeolocationPositionError::ErrorCode error_code =
+@@ -232,6 +267,14 @@ int Geolocation::watchPosition(V8PositionCallback* success_callback,
+ }
+ 
+ void Geolocation::StartRequest(GeoNotifier* notifier) {
++  // FingerBrowser L2：策略指定坐标时直接满足请求。走 SetUseCachedPosition()
++  // 而不是同步回调，是为了复用既有的异步投递路径，保持规范要求的回调时序。
++  if (Geoposition* spoofed = CreateFingerBrowserGeoposition()) {
++    last_position_ = spoofed;
++    notifier->SetUseCachedPosition();
++    return;
++  }
++
+   RecordOriginTypeAccess();
+   String error_message;
+   if (!GetFrame()->GetSettings()->GetAllowGeolocationOnInsecureOrigins() &&
+@@ -445,6 +488,11 @@ void Geolocation::PositionChanged() {
+ }
+ 
+ void Geolocation::StartUpdating(GeoNotifier* notifier) {
++  // 伪装生效时绝不连真实定位服务。watchPosition 的首次回调已由 StartRequest
++  // 用伪装坐标满足，这里若放行，后续更新会带回宿主真实位置，把前面的伪装抵消掉。
++  if (FingerBrowserGeolocationActive()) {
++    return;
++  }
+   updating_ = true;
+   if (notifier->Options()->enableHighAccuracy() && !enable_high_accuracy_) {
+     enable_high_accuracy_ = true;
+-- 
+2.52.0.windows.1
+

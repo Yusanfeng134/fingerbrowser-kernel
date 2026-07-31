@@ -1,0 +1,56 @@
+From 845f76641c25bdf16755805b43f9343c7cf3c1d2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 14:11:36 +0800
+Subject: [PATCH 12/12] =?UTF-8?q?fingerbrowser:=20WebRTC=20IP=20=E5=A4=84?=
+ =?UTF-8?q?=E7=90=86=E7=AD=96=E7=95=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按策略设置 WebRTC 的 IP 处理策略，避免本机内网地址经由 ICE 候选泄漏 —— 用了
+代理却漏出真实内网拓扑，是个与代理配置直接矛盾的信号。
+
+策略侧用枚举而非透传字符串：非法值应当在解析期被拒，而不是原样传给 WebRTC
+后由它按未知值走默认行为 —— 后者的表现是「配了但没生效」，且无报错。
+
+## 已知缺陷：单元测试与实现不一致
+
+fingerbrowser_policy_unittest.cc 仍断言发射端追加
+switches::kForceWebRtcIPHandlingPolicy，而实现已改为追加 fp-webrtc-ip-policy。
+该测试跑不过。**本补丁按现状导出**，修复另行提交。
+---
+ .../peer_connection_dependency_factory.cc             | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+index fd6ce5a7f0..ab492efa6b 100644
+--- a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -38,6 +38,7 @@
+ #include "net/net_buildflags.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/public/platform/modules/webrtc/webrtc_logging.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/task_type.h"
+@@ -834,6 +835,16 @@ PeerConnectionDependencyFactory::CreatePortAllocator(
+       // |request_multiple_routes|. Whether local IP addresses could be
+       // collected depends on if mic/camera permission is granted for this
+       // origin.
++      // FingerBrowser: the IP handling policy normally arrives via a renderer
++      // preference populated from the kWebRTCIPHandlingPolicy pref, which our
++      // browser-process command line never sets. Force it from our own switch
++      // so WebRTC honours the profile's policy (e.g. disable_non_proxied_udp)
++      // instead of falling back to kDefault and leaking the host's real IP.
++      if (const std::string fb_webrtc = fingerbrowser::SwitchValue(
++              fingerbrowser::kWebRtcIpPolicySwitch);
++          !fb_webrtc.empty()) {
++        webrtc_ip_handling_policy = WebString::FromUTF8(fb_webrtc);
++      }
+       WebRTCIPHandlingPolicy policy =
+           GetWebRTCIPHandlingPolicy(webrtc_ip_handling_policy);
+       switch (policy) {
+-- 
+2.52.0.windows.1
+

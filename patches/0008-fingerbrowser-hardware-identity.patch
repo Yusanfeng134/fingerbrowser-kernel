@@ -1,0 +1,309 @@
+From 5fd95b40834032e519968838324f2558d30c1c9e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 14:11:32 +0800
+Subject: [PATCH 08/12] =?UTF-8?q?fingerbrowser:=20=E7=A1=AC=E4=BB=B6?=
+ =?UTF-8?q?=E8=BA=AB=E4=BB=BD=EF=BC=88platform=E3=80=81=E5=B9=B6=E5=8F=91?=
+ =?UTF-8?q?=E6=95=B0=E3=80=81=E5=86=85=E5=AD=98=E3=80=81GPU=E3=80=81WebGPU?=
+ =?UTF-8?q?=E3=80=81UA=20=E5=93=81=E7=89=8C=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+navigator.platform / navigator.userAgentData.platform、hardwareConcurrency、
+deviceMemory、WebGL 的 UNMASKED_VENDOR/RENDERER、WebGPU 适配器信息，以及 UA 里
+的 brands 列表与 platformVersion。
+
+## navigator.platform 有两个 getter
+
+core/frame/navigator.cc 与 core/frame/navigator_id.cc 各有一份，只改一处会造出
+两个 API 说法不一致 —— 那是矛盾，比不伪装更糟。两处都改。
+
+## platformVersion 是「未伪装」不是「矛盾」
+
+Windows 上它是 WinRT API Contract 版本，实测本机 19.0.0（Win11 24H2+）。罕见
+即高熵，所以要伪装；但它与其它字段之间不存在必然一致关系，漏了只是暴露真实
+值，不构成「有人动过手脚」的阳性证据。危害低一级，记在这里以免将来误判优先级。
+
+## WebGPU 的双分支
+
+151 上踩过：WebGPU 有两条分别产出适配器信息的代码路径，覆盖只写在其中一条时，
+另一条仍会漏出真实值，而 headless 下开 dev-features 会把 web 路径的泄漏掩盖掉。
+124 的形状与 151 不同，此处按 124 的实际分支写。
+---
+ .../embedder_support/user_agent_utils.cc      | 52 ++++++++++++++++++-
+ .../blink/renderer/core/frame/navigator.cc    |  8 +++
+ .../frame/navigator_concurrent_hardware.cc    |  6 +++
+ .../core/frame/navigator_device_memory.cc     |  6 +++
+ .../blink/renderer/core/frame/navigator_id.cc |  6 +++
+ .../webgl/webgl_rendering_context_base.cc     | 11 ++++
+ .../renderer/modules/webgpu/gpu_adapter.cc    | 38 ++++++++++++++
+ 7 files changed, 126 insertions(+), 1 deletion(-)
+
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 205d12a97c..1091ebf0c0 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -190,6 +190,28 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+ #if !BUILDFLAG(CHROMIUM_BRANDING)
+   brand = version_info::GetProductName();
+ #endif
++  // FingerBrowser: supply the product brand that an unbranded build lacks.
++  //
++  // Only branded builds set `brand` above, so a build from public Chromium
++  // source emits a two-entry list (GREASE + "Chromium") while real Chrome
++  // emits three (GREASE + "Chromium" + "Google Chrome"). A UA string claiming
++  // Chrome next to a brand list that never mentions it is a contradiction no
++  // real install produces.
++  //
++  // Setting `brand` here rather than rewriting the list afterwards is
++  // deliberate: GenerateBrandVersionList() below places the three entries in
++  // one of six permutations chosen by major version. Appending an entry
++  // post-hoc would leave the ordering fixed, and a brand list whose order
++  // never varies is itself a distinguishing signal.
++  {
++    const base::CommandLine* fb_cmd = base::CommandLine::ForCurrentProcess();
++    if (fb_cmd->HasSwitch("fp-active")) {
++      const std::string fb_brand = fb_cmd->GetSwitchValueASCII("fp-brand");
++      if (!fb_brand.empty()) {
++        brand = fb_brand;
++      }
++    }
++  }
+   std::optional<std::string> maybe_brand_override =
+       base::GetFieldTrialParamValueByFeature(features::kGreaseUACH,
+                                              "brand_override");
+@@ -483,11 +505,16 @@ blink::UserAgentMetadata GetUserAgentMetadata(const PrefService* pref_service,
+   // Notes: Sending low entropy hints with empty values may cause requests being
+   // blocked by web application firewall software, etc.
+   std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
+-  if (custom_ua.has_value()) {
++  if (custom_ua.has_value() &&
++      !base::CommandLine::ForCurrentProcess()->HasSwitch("fp-active")) {
+     return base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)
+                ? blink::UserAgentMetadata()
+                : metadata;
+   }
++  // Under a FingerBrowser profile we fall through instead of returning early.
++  // The declared UA describes the platform this build actually runs on, so the
++  // natively computed high-entropy hints already agree with it; blanking them
++  // would manufacture a self-contradictory identity rather than hide one.
+ 
+   if (only_low_entropy_ch) {
+     return metadata;
+@@ -509,6 +536,29 @@ blink::UserAgentMetadata GetUserAgentMetadata(const PrefService* pref_service,
+   metadata.platform_version =
+       base::StringPrintf("%d.%d.%d", major, minor, bugfix);
+ #endif
++
++  // FingerBrowser：Client Hints 的 platformVersion。
++  //
++  // Windows 上它是 WinRT Universal API Contract 版本，直接反映宿主的 Windows
++  // 发行版 —— 实测本机报 19.0.0（Win11 24H2+），而装机量最大的档位更低。一个
++  // 声称自己是普通美国 Windows 用户的人格报出罕见值，等于自带高熵标识。
++  //
++  // 这一项属于「未伪装」而非「矛盾」：UA 里的 Windows NT 自 Win11 起就冻结在
++  // 10.0，与 platformVersion 用不同编号是**正常**的，真实 Win11 机器就这么报。
++  // CreepJS 把二者并列成「UA Win10 vs CH Win11」并不成立，不要照抄那个结论。
++  //
++  // 写在 #if 之后而不是塞进 else 分支：先按平台算出默认值，再统一覆盖，避免把
++  // 平台分支复制一遍。
++  //
++  // 不设默认值、不自动推导：合理取值取决于人格声称的 Windows 版本，内核无从
++  // 判断。客户端不传就保持真实值 —— 与其猜一个可能同样罕见的数字，不如让配置方
++  // 负责。
++  if (const std::string fb_platform_version =
++          base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++              "fp-platform-version");
++      !fb_platform_version.empty()) {
++    metadata.platform_version = fb_platform_version;
++  }
+   metadata.architecture = content::GetCpuArchitecture();
+   metadata.bitness = content::GetCpuBitness();
+   metadata.wow64 = content::IsWoW64();
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index aafe16cde1..672cdaa9d3 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -27,6 +27,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+@@ -58,6 +59,13 @@ String Navigator::vendorSub() const {
+ }
+ 
+ String Navigator::platform() const {
++  // FingerBrowser L2: native platform override (takes precedence over the
++  // devtools/settings override path below).
++  const std::string fb_platform =
++      fingerbrowser::SwitchValue(fingerbrowser::kPlatformSwitch);
++  if (!fb_platform.empty()) {
++    return String::FromUTF8(fb_platform);
++  }
+   // TODO(955620): Consider changing devtools overrides to only allow overriding
+   // the platform with a frozen platform to distinguish between
+   // mobile and desktop when ReduceUserAgent is enabled.
+diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2d1b..6c2b964838 100644
+--- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -5,10 +5,16 @@
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ 
+ #include "base/system/sys_info.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ 
+ namespace blink {
+ 
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++  const int spoofed =
++      fingerbrowser::IntSwitch(fingerbrowser::kHardwareConcurrencySwitch);
++  if (spoofed > 0) {
++    return static_cast<unsigned>(spoofed);
++  }
+   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
+ }
+ 
+diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+index 2876aad298..f49e3158fc 100644
+--- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
++++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+@@ -10,10 +10,16 @@
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ 
+ namespace blink {
+ 
+ float NavigatorDeviceMemory::deviceMemory() const {
++  const int spoofed =
++      fingerbrowser::IntSwitch(fingerbrowser::kDeviceMemorySwitch);
++  if (spoofed > 0) {
++    return static_cast<float>(spoofed);
++  }
+   return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
+ }
+ 
+diff --git a/third_party/blink/renderer/core/frame/navigator_id.cc b/third_party/blink/renderer/core/frame/navigator_id.cc
+index 50a1727f8d..a2e51ae85b 100644
+--- a/third_party/blink/renderer/core/frame/navigator_id.cc
++++ b/third_party/blink/renderer/core/frame/navigator_id.cc
+@@ -34,6 +34,7 @@
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
+ #if !BUILDFLAG(IS_MAC) && !BUILDFLAG(IS_WIN)
+@@ -59,6 +60,11 @@ String NavigatorID::appVersion() {
+ }
+ 
+ String NavigatorID::platform() const {
++  const std::string spoofed =
++      fingerbrowser::SwitchValue(fingerbrowser::kPlatformSwitch);
++  if (!spoofed.empty()) {
++    return String::FromUTF8(spoofed);
++  }
+ #if BUILDFLAG(IS_MAC)
+   // Match Safari and Mozilla on Mac x86.
+   return "MacIntel";
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index aa89d49c0e..6e523e8819 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -34,6 +34,7 @@
+ #include "base/numerics/checked_math.h"
+ #include "base/synchronization/lock.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "build/build_config.h"
+ #include "gpu/GLES2/gl2extchromium.h"
+ #include "gpu/command_buffer/client/gles2_interface.h"
+@@ -3862,6 +3863,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        const std::string fb_renderer =
++            fingerbrowser::SwitchValue(fingerbrowser::kGpuRendererSwitch);
++        if (!fb_renderer.empty()) {
++          return WebGLAny(script_state, String::FromUTF8(fb_renderer));
++        }
+         if (IdentifiabilityStudySettings::Get()->ShouldSampleType(
+                 blink::IdentifiableSurface::Type::kWebGLParameter)) {
+           RecordIdentifiableGLParameterDigest(
+@@ -3877,6 +3883,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        const std::string fb_vendor =
++            fingerbrowser::SwitchValue(fingerbrowser::kGpuVendorSwitch);
++        if (!fb_vendor.empty()) {
++          return WebGLAny(script_state, String::FromUTF8(fb_vendor));
++        }
+         if (IdentifiabilityStudySettings::Get()->ShouldSampleType(
+                 blink::IdentifiableSurface::Type::kWebGLParameter)) {
+           RecordIdentifiableGLParameterDigest(
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+index 97be6ed099..9f5e796023 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+@@ -18,6 +18,7 @@
+ #include "third_party/blink/renderer/modules/webgpu/gpu_device.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_device_lost_info.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_supported_features.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_supported_limits.h"
+ #include "third_party/blink/renderer/modules/webgpu/string_utils.h"
+@@ -136,6 +137,43 @@ GPUAdapter::GPUAdapter(
+   }
+   description_ = properties.name;
+   driver_ = properties.driverDescription;
++
++  // FingerBrowser: override the adapter identity before anything reads it, so
++  // both requestAdapterInfo() branches and the `info` attribute stay in sync.
++  //
++  // Only the identity strings are overridden. limits and features still
++  // describe the real adapter, and deliberately so: a page that requests a
++  // feature we claimed but the hardware lacks would fail at device creation,
++  // turning a fingerprinting defense into a rendering bug. That leaves a
++  // residual inconsistency (a claimed Apple adapter still reporting
++  // texture-compression-bc, which Apple hardware never exposes), which the
++  // launcher should account for by choosing an identity in the same GPU family
++  // as the host rather than an arbitrary one.
++  {
++    const std::string fb_vendor =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuVendorSwitch);
++    if (!fb_vendor.empty()) {
++      vendor_ = String::FromUTF8(fb_vendor);
++    }
++    const std::string fb_arch =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuArchitectureSwitch);
++    if (!fb_arch.empty()) {
++      architecture_ = String::FromUTF8(fb_arch);
++    }
++    const std::string fb_device =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuDeviceSwitch);
++    if (!fb_device.empty()) {
++      device_ = String::FromUTF8(fb_device);
++    }
++    const std::string fb_desc =
++        fingerbrowser::SwitchValue(fingerbrowser::kWebGpuDescriptionSwitch);
++    if (!fb_desc.empty()) {
++      description_ = String::FromUTF8(fb_desc);
++      // The driver string names the real vendor too; clear it rather than
++      // leave "NVIDIA ..." next to a claimed Apple adapter.
++      driver_ = String();
++    }
++  }
+   for (size_t i = 0; i < memoryHeapProperties.heapCount; ++i) {
+     memory_heaps_.push_back(MakeGarbageCollected<GPUMemoryHeapInfo>(
+         memoryHeapProperties.heapInfo[i]));
+-- 
+2.52.0.windows.1
+
