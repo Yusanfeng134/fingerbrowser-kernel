@@ -1,0 +1,107 @@
+From 7ac22c582822be230a581f48fe08f48b19c76f7c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Fri, 31 Jul 2026 13:47:04 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E7=AD=96=E7=95=A5=E8=A7=A3?=
+ =?UTF-8?q?=E6=9E=90=E8=A1=A5=E4=B8=8A=20devicePixelRatio=20=E4=B8=8E=20ma?=
+ =?UTF-8?q?xTouchPoints=EF=BC=8C=E5=AE=83=E4=BB=AC=E6=AD=A4=E5=89=8D?=
+ =?UTF-8?q?=E4=B8=8D=E5=8F=AF=E8=BE=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+0026「消除四处指纹矛盾」验收通过了，但其中两处在生产路径上根本没生效：
+
+  fp-max-touch-points  永不下发 —— ParsePolicyDict 从不读 maxTouchPoints，
+                       has_max_touch_points 恒为 false，渲染侧覆盖是死代码。
+  fp-dpr-x1000         恒为 1000 —— 从不读 devicePixelRatio，永远走兜底。
+                       HiDPI 人格无法表达。
+
+发射端一直都在（fingerbrowser_policy.cc 内，条件判断写得很仔细），解析端一个键
+都没有。124 也一样。客户端不走直接下发，所以策略是唯一路径。
+
+## 它是怎么通过验收的
+
+probe/run-creepjs-audit.cjs **直接在命令行传开关**：
+
+    '--fp-dpr-x1000=1000', '--fp-max-touch-points=0'
+
+它验的是「开关传进去时渲染侧生效」，而生产路径是「策略 JSON → 解析 → 下发」。
+解析那一环从未被任何探针走到。又是同一个形状：通过条件被一个与被测属性无关的
+前提满足了。
+
+而且它选的值**与故障不可区分**：1000 正是坏路径的兜底值。即便它走了策略路径，
+这个值也照样通过。
+
+## 实测暴露的严重性比预估高
+
+新探针在本机测到基线 navigator.maxTouchPoints = **10** —— 这是台触摸屏机器。
+人格声称 Win32 桌面 1920x1080，而页面读到 10。这不是「未伪装」，是**矛盾**，
+危害高一级，且任何触摸屏笔记本上的客户都在漏。此前我判断「多数宿主是 0 所以
+无害」，是错的。
+
+## devicePixelRatio 必须 FindDouble
+
+DPR 现实取值几乎总是小数（1.25/1.5/1.75/2），JSON 的 1.5 在 base::Value 里是
+DOUBLE，FindInt 对 DOUBLE 返回 nullopt —— 客户端老实传了 1.5，内核静默当作没
+配置。与 geolocation 那条契约同一个坑。FindDouble 反过来对整数安全：
+GetIfDouble() 判的是 is_int() || is_double()（base/values.cc:243）。
+
+## 契约
+
+新增两个**可选**键，缺省时行为与此前完全一致，向后兼容：
+
+  fingerprintPolicy.hardwareProfile.devicePixelRatio  数值，[0.5, 4.0]
+  fingerprintPolicy.hardwareProfile.maxTouchPoints    整数，[0, 32]
+
+内核侧到此为止 —— 客户端不开始下发这两个字段，功能仍然不生效。
+
+配套 probe/run-policy-emit.cjs：先不带策略取基线、再带策略要求值确实变了，
+「什么都没发生」无法通过；基线值若恰好等于配置值则当场喊停而不是通过。
+修前红、修后绿，两次都跑过。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser/fingerbrowser_policy.cc     | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+index e3267198ed..e8faf75ccc 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy.cc
+@@ -244,6 +244,33 @@ std::optional<FingerBrowserPolicy> ParsePolicyDict(
+         screen_height && IsValidWindowSide(*screen_height)) {
+       policy.screen_height = *screen_height;
+     }
++
++    // devicePixelRatio。**必须 FindDouble，不能 FindInt。**
++    //
++    // DPR 的现实取值几乎总是小数（1.25 / 1.5 / 1.75 / 2），而 base::Value 把
++    // JSON 的 1.5 存成 DOUBLE，FindInt 对 DOUBLE 直接返回 nullopt —— 客户端
++    // 老老实实传了 1.5，内核**静默当作没配置**，回落到 1.0。与 geolocation
++    // 那条契约同一个坑（十进制度数走 FindDouble），那次也是这么发现的。
++    // FindDouble 反过来对整数是安全的：GetIfDouble() 判的是 is_int() ||
++    // is_double()（base/values.cc:243-246），传 2 也能取到。
++    //
++    // 范围 [0.5, 4.0]：低于 0.5 或高于 4 的 DPR 现实中不存在，本身就是信号。
++    if (const std::optional<double> dpr =
++            hardware_profile->FindDouble("devicePixelRatio");
++        dpr && *dpr >= 0.5 && *dpr <= 4.0) {
++      policy.device_pixel_ratio_x1000 = static_cast<int>(*dpr * 1000 + 0.5);
++    }
++
++    // maxTouchPoints。用 has_ 标志而不是「值 > 0」：0 是桌面人格最常见也最该
++    // 传的值，用 >0 判断会把「明确要求无触摸」读成「没配置」。
++    //
++    // 上限 32 照 Chromium 自身的触点上限量级取，防止一个荒谬的值本身成为信号。
++    if (const std::optional<int> mtp =
++            hardware_profile->FindInt("maxTouchPoints");
++        mtp && *mtp >= 0 && *mtp <= 32) {
++      policy.has_max_touch_points = true;
++      policy.max_touch_points = *mtp;
++    }
+   }
+ 
+   // 地理位置：经纬度必须成对出现且在合法范围内，缺一不可（只给一半会造出
+-- 
+2.52.0.windows.1
+

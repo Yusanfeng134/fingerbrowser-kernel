@@ -16,6 +16,7 @@
 | `run-copy-sanity.cjs` | 独立内核目录 | 验**行为**（WebGPU 可用等），不验「文件都在」|
 | `run-creepjs-audit.cjs` | 0026 指纹矛盾 | 区分「矛盾」与「未伪装」，危害不同级 |
 | `run-island-query.cjs` | 0029/0031 灵动岛传参 | 抠**源码里那行真表达式**求值，不重写一份副本 |
+| `run-policy-emit.cjs` | 0026 指纹矛盾（策略链路）| 先取基线再比，**「什么都没发生」无法通过** |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |
@@ -84,9 +85,27 @@ A 的东西去背书 B。
 这条不锁具体数值（ANGLE 升级会改），但将来某版本开始暴露厂商专属参数或扩展时它
 会响。
 
+## 怎么跑
+
+**必须在 `D:/chromium-work-151/probe/` 下跑**，`ws` 模块装在那里的 `node_modules`，
+而 node 按**脚本所在目录**解析 `require`，不是按 cwd —— 从别处 `node <路径>` 会报
+`MODULE_NOT_FOUND`，改 cwd 也没用。仓库里这份是版本控制副本，改完要复制过去：
+
+```
+cp probe/run-xxx.cjs /d/chromium-work-151/probe/ && cd /d/chromium-work-151/probe && node run-xxx.cjs
+```
+
+这个双副本本身是个隐患（两份会漂），但换成 npm 工程或改 NODE_PATH 都超出当前
+范围。记在这里，至少让下一个人知道有两份。
+
 ## 已知限制
 
 - 路径硬编码为 `D:/chromium-work-151` 与 `D:/yunbrowser-run`，换机器需改。
+- 除 `run-policy-emit.cjs` 外，**所有指纹探针都在命令行直传 `--fp-*` 开关**，
+  绕过了「策略 JSON → 解析 → 下发」这一环。0026 的两处失效就是这么逃掉的：
+  渲染侧被验了，解析侧从没被走到。`run-policy-emit.cjs` 只覆盖了
+  `devicePixelRatio` 与 `maxTouchPoints` 两个字段，**同一个洞在其余字段上很可能
+  还在**。
 - 地址栏、菜单启用状态是浏览器原生 UI，CDP 读不到，那几条只能人工确认。脚本里
   已标明哪些是程序验的、哪些不是 —— **不拿「脚本没报错」冒充通过**。
 - `run-creepjs-audit.cjs` 的 TTS 一项在无语音包的机器上无法判定，此时明确输出

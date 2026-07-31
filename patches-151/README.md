@@ -53,6 +53,7 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0029 | fingerbrowser-dynamic-island-webui | 灵动岛 | 灵动岛的 WebUI 页面本体，注册完成但无入口 |
 | 0030 | fingerbrowser-dynamic-island-toolbar-entry | 灵动岛 | 工具栏按钮 + 气泡 + `IDC_TOGGLE_DYNAMIC_ISLAND` + Ctrl+Shift+K（依赖 0029）|
 | 0031 | fingerbrowser-dynamic-island-query-in-fragment | 灵动岛 | 钉住 `?q=` 必须落在 `#` 之后（纯注释，依赖 0029）|
+| 0032 | fingerbrowser-policy-parse-dpr-touch | 指纹 | 策略解析补上 `devicePixelRatio` / `maxTouchPoints` —— 0026 的这两处此前不可达 |
 
 ### 0026 说明：矛盾 ≠ 未伪装
 
