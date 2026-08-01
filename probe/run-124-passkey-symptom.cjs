@@ -23,6 +23,24 @@
 // 只判「有没有拿到 credential」会把 HANG 和 REJECT 混为一谈，而这两者的危害
 // 与应对方式完全不同 —— 这正是本仓库反复记录的「通过条件与被测属性无关」的
 // 镜像：**失败条件与被测属性无关**。
+//
+// ── ⚠ 复测必须用全新标签页，不能 reload ────────────────────────────────
+//
+// reload **不取消**浏览器侧还挂着的 WebAuthn 请求。后续请求撞上「已有请求在
+// 处理中」被立刻拒绝，产生一个 1ms 的、精确的、看起来很可信的 REJECT —— 而它
+// 跟被测对象毫无关系。
+//
+// 这个假象真实误导过一次，两侧各踩一回：客户端据此报告「真实站点上是 1ms
+// NotAllowedError 而非挂起」，我据此把 patches/README 改成了「症状随条件变化」。
+// 用**从未发过 WebAuthn 的全新标签页**做 2x2 重测（真实 HTTPS 源 / localhost
+// × 有无认证器）后，无认证器的两格全部挂起 —— **症状只有一种**，原来的描述是
+// 对的。
+//
+// 本脚本每次测量都新起一个内核实例，因此天然干净；但**手工复现时极易踩到**，
+// 所以写在这里。
+//
+// 附带一个可能对定位成因有用的观察：连 publicKey.timeout 都不触发（设 20s，
+// 35s 后仍挂着）。不是「等到超时再失败」，是请求根本没进入那条会超时的路径。
 
 const http = require('http')
 const { spawn, execSync } = require('child_process')
@@ -164,12 +182,13 @@ const PAGE = `<!doctype html><meta charset=utf-8><title>wa</title><body>
     }
   }
   console.log('')
-  console.log('⚠ 症状随条件变化，本脚本测到的形态**不是唯一形态**。')
-  console.log('  本地实测（124/151、localhost、headless 与有窗口、三种 userVerification、')
-  console.log('  有无用户手势）一律 HANG 15-25s；客户端在真实环境（151、figma.com）测到的')
-  console.log('  是 REJECT 1ms NotAllowedError。四个候选成因逐一变更后仍挂，成因未查清。')
+  console.log('症状只有挂起一种。实测覆盖 124 与 151、headless 与有窗口、三种')
+  console.log('  userVerification、有无用户手势、真实 HTTPS 源与 localhost —— 全部挂起。')
+  console.log('  连 publicKey.timeout 都不触发（设 20s，35s 后仍挂着）：请求根本没有')
+  console.log('  进入那条会超时的路径。')
   console.log('')
-  console.log('  所以**不要拿「25 秒挂起」当作缺陷是否存在的依据** —— 按它去真实站点')
-  console.log('  复现会得到「没问题」。两种形态都是「无认证器时 WebAuthn 异常失败」，')
-  console.log('  修法相同。')
+  console.log('  ⚠ 复测时必须用**从未发过 WebAuthn 的全新标签页**，不能 reload。')
+  console.log('  reload 不取消浏览器侧还挂着的请求，后续请求会撞「已有请求在处理中」')
+  console.log('  而被立刻拒绝 —— 产生一个 1ms 的、精确的、看起来很可信的假读数。')
+  console.log('  这个假象真实误导过一次，两侧各踩一回。')
 })().catch((e) => { console.log('X ' + e.message); process.exit(1) })
