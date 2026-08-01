@@ -38,21 +38,36 @@ const KERNELS = [
 
 function fail(msg) { console.log('X ' + msg); process.exit(1) }
 
-// ── 内核侧：从 hardwareProfile 段里抠出 FindXxx("key") ───────────────────
+// ── 内核侧：抠出整个策略解析函数读的所有键 ─────────────────────────────
 function kernelKeys(file) {
   if (!fs.existsSync(file)) fail(`找不到内核策略源码：${file}`)
   const src = fs.readFileSync(file, 'utf8')
-  const i = src.indexOf('FindDict("hardwareProfile")')
-  if (i < 0) fail(`${file} 里找不到 hardwareProfile 段 —— 结构变了，抠取规则失效。`)
-
-  // 段落到下一个顶层 `  }` 为止。粗但够用；抠不到东西时下面的前提检查会喊。
-  const rest = src.slice(i)
-  const end = rest.search(/\n  \}\n/)
-  const seg = end > 0 ? rest.slice(0, end) : rest
+  // 覆盖**整个策略解析函数**，不只 hardwareProfile 段。
+  //
+  // 此前只查 hardwareProfile。**那个范围漏掉了真问题**：passkeyAuthenticator 在
+  // fingerprintPolicy 顶层，于是「内核读它、客户端从不发」一直没被发现 ——
+  // 151 的 passkey 功能因此在生产路径上从未激活，而它的探针是「通过」的：探针
+  // 用自己手写的策略 JSON，那份里有这个键。
+  //
+  // 教训不是「范围定小了」，是**「已知限制」写在输出里不等于它不会咬人**。
+  // 当时我确实明说了「只覆盖 hardwareProfile」，说明白了，然后照样被它咬。
+  // 能扩大覆盖就扩大，别指望下一个人读限制说明。
+  const i = src.indexOf('FindDict("fingerprintPolicy")')
+  if (i < 0) fail(`${file} 里找不到 fingerprintPolicy 段 —— 结构变了，抠取规则失效。`)
+  const j = src.indexOf('return policy;', i)
+  if (j < 0) fail(`${file} 里找不到解析函数结尾（return policy;），抠取规则失效。`)
+  const seg = src.slice(i, j)
 
   const keys = new Set()
-  for (const m of seg.matchAll(/Find(?:String|Int|Double|Bool)\("([^"]+)"\)/g)) {
+  for (const m of seg.matchAll(/Find(?:String|Int|Double|Bool|Dict|List)\("([^"]+)"\)/g)) {
     keys.add(m[1])
+  }
+  // 结构名不是数据字段：客户端「下发」的是它们的内容，不是这些名字本身。
+  // 留着会产生假阴性（客户端一定会提到 hardwareProfile，于是它永远「通过」），
+  // 也会产生假阳性（若某天客户端换了嵌套写法）。
+  for (const structural of ['fingerprintPolicy', 'hardwareProfile', 'windowSize',
+                            'geolocation']) {
+    keys.delete(structural)
   }
   return keys
 }
@@ -95,6 +110,23 @@ function clientMentions(dir, keys) {
   return { found, files }
 }
 
+// 客户端的权威键清单：从它的 buildPolicy 实际返回值导出，不是扫源码。
+// 拿不到时返回 null —— 调用方据此把结论降级，而不是当作「没有键」。
+function clientEmittedKeys() {
+  const repo = path.dirname(CLIENT_SRC)
+  const script = path.join(repo, 'scripts', 'dump-policy-keys.cjs')
+  if (!fs.existsSync(script)) return null
+  try {
+    const out = require('child_process').execSync(
+      `node "${script}" --json`, { cwd: repo, encoding: 'utf8', timeout: 120000 })
+    const j = JSON.parse(out)
+    const all = Object.values(j).filter(Array.isArray).flat()
+    return all.length ? new Set(all) : null
+  } catch (e) {
+    return null
+  }
+}
+
 if (!fs.existsSync(CLIENT_SRC)) {
   console.log(`X 找不到客户端源码：${CLIENT_SRC}`)
   console.log('  用 YUNLOGIN_SRC 环境变量指定，或在有客户端仓库的机器上跑。')
@@ -109,22 +141,53 @@ for (const k of KERNELS) {
   const kk = kernelKeys(k.policy)
 
   // 前提检查：抠不出键时必须喊，否则空集合与空集合的差也是空，"通过"。
-  if (kk.size === 0) fail(`内核 ${k.name} 抠不出任何 hardwareProfile 键 —— 抠取规则失效，不能继续。`)
+  if (kk.size === 0) fail(`内核 ${k.name} 抠不出任何策略键 —— 抠取规则失效，不能继续。`)
 
   const { found, files } = clientMentions(CLIENT_SRC, kk)
   if (files === 0) fail(`在 ${CLIENT_SRC} 下没扫到任何源码文件 —— 路径或后缀过滤有问题。`)
 
-  const missingInClient = [...kk].filter((x) => !found.has(x)).sort()
+  console.log(`内核 ${k.name}：读 ${kk.size} 个策略键，客户端扫了 ${files} 个文件`)
 
-  console.log(`内核 ${k.name}：读 ${kk.size} 个 hardwareProfile 键，客户端扫了 ${files} 个文件`)
-  if (missingInClient.length) {
+  // ── 三态，不是两态 ────────────────────────────────────────────────────
+  //
+  // grep 只能证明「这个标识符在客户端源码里出现过」，不能证明「它被写进了
+  // 下发的策略」。实际咬过：passkeyAuthenticator 出现在客户端的
+  // kernel-capabilities.ts 里（那是**能力声明**，读内核的 capabilities 清单），
+  // 于是 grep 命中、检查通过，而策略里从来没有这个字段 —— 151 的 passkey 功能
+  // 因此在生产路径上从未激活。
+  //
+  // 剥注释解决了「注释里提到」，解决不了「**在另一个语境里提到**」。
+  //
+  // 客户端的 `npm run policy:keys --json` 从 buildPolicy 的实际返回值取键，
+  // 是权威来源。但它目前只覆盖 hardwareProfile，所以：
+  //   权威通过  —— 在导出清单里，确定会下发
+  //   弱证据    —— 不在导出清单里，但源码里出现过。**可能只是碰巧提到**
+  //   缺失      —— 两者都没有
+  // 把「弱证据」单列出来而不是并进 OK，是这次修复的全部意义。
+  const authoritative = clientEmittedKeys()
+  const missing = [], weak = [], strong = []
+  for (const key of [...kk].sort()) {
+    if (authoritative && authoritative.has(key)) strong.push(key)
+    else if (found.has(key)) weak.push(key)
+    else missing.push(key)
+  }
+
+  if (missing.length) {
     bad++
-    console.log(`  X 内核读了、客户端从不发（${missingInClient.length} 个）：`)
-    for (const m of missingInClient) {
-      console.log(`      ${m}  → 策略字段恒为空，内核回落到宿主真值`)
+    console.log(`  X 内核读了、客户端从不发（${missing.length} 个）：`)
+    for (const m of missing) console.log(`      ${m}  → 策略字段恒为空，内核回落到宿主真值`)
+  }
+  if (authoritative) {
+    console.log(`  OK 权威确认会下发：${strong.length} 个`)
+    if (weak.length) {
+      console.log(`  ? 仅有弱证据（源码里出现过，但不在导出清单内）：${weak.length} 个`)
+      console.log(`      ${weak.join(' ')}`)
+      console.log('      这些**可能只是碰巧被提到**。要么让客户端把导出扩到整个策略，')
+      console.log('      要么逐个人工确认它确实被写进下发的策略。')
     }
   } else {
-    console.log('  OK 内核读的每个键，客户端源码里都有出现')
+    console.log(`  ? 拿不到客户端的权威键清单，全部 ${weak.length} 个只有 grep 弱证据。`)
+    console.log('      在客户端仓库可用时跑，结论才有力度。')
   }
   console.log('')
 }
@@ -204,6 +267,9 @@ console.log('')
 // 反方向（客户端发了、内核不读）这里查不了：需要客户端那侧导出它写出的键集合。
 // 明说而不是假装覆盖到了 —— 那正是本目录反复记录的假通过。
 console.log('注意：本脚本只查「内核读了、客户端不发」一个方向。')
+console.log('  覆盖范围已从 hardwareProfile 扩到整个策略解析函数 —— 上一版的范围')
+console.log('  恰好漏掉了 passkeyAuthenticator（它在 fingerprintPolicy 顶层），')
+console.log('  而那正是 151 的 passkey 功能从未在生产路径激活的原因。')
 console.log('  反方向（客户端发了、内核不读，即 maxTouchPoints 那次）需要客户端导出')
 console.log('  它实际写出的键集合，本脚本拿不到。目前靠人工对照客户端给的清单。')
 console.log('  也只比键名，不比类型与取值范围 —— 那些要靠 run-policy-emit.cjs。')
