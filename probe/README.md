@@ -19,6 +19,7 @@
 | `run-policy-emit.cjs` | 0026 指纹矛盾（策略链路）| 先取基线再比，**「什么都没发生」无法通过** |
 | `check-policy-contract.cjs` | 策略契约 | 比对**两侧之间那条缝**，没有哪一边的测试能覆盖它 |
 | `run-canvas-oob.cjs` | 124 越界读 | 判据分**三种**结局，「全非零」是测试构造错了、不是缺陷 |
+| `run-seed-passwords.cjs` | 0036 密码种子 | 判据是**伪类不是 `.value`** —— 后者在交互前被 Chromium 藏起来 |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |

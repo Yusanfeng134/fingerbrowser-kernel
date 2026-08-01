@@ -57,6 +57,7 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0033 | fingerbrowser-device-memory-legal-set | 指纹 | `deviceMemory` 合法集合按 151 实际钳位改为 `{2,4,8,16,32}`（124 不同，勿照搬）|
 | 0034 | fingerbrowser-fix-stale-webrtc-test | 测试 | 单元测试断言的是已停用的开关，一直红；**没人跑过它** |
 | 0035 | fingerbrowser-pointer-media-consistency | 指纹 | `(any-pointer: coarse)` 与 `maxTouchPoints` 同源（两个内核都有此缺口）|
+| 0036 | fingerbrowser-seed-passwords | 凭据 | `--fp-seed-passwords=stdin` 把密码种子导入 profile 密码库，之后由**原生**自动填充完成 |
 
 ### 0026 说明：矛盾 ≠ 未伪装
 
