@@ -18,6 +18,7 @@
 | `run-island-query.cjs` | 0029/0031 灵动岛传参 | 抠**源码里那行真表达式**求值，不重写一份副本 |
 | `run-policy-emit.cjs` | 0026 指纹矛盾（策略链路）| 先取基线再比，**「什么都没发生」无法通过** |
 | `check-policy-contract.cjs` | 策略契约 | 比对**两侧之间那条缝**，没有哪一边的测试能覆盖它 |
+| `run-canvas-oob.cjs` | 124 越界读 | 判据分**三种**结局，「全非零」是测试构造错了、不是缺陷 |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |

@@ -103,8 +103,9 @@ DEPS 子仓，主仓索引里没有它们的文件。拿主仓做树比对，这
    兜底值、`fp-max-touch-points` 永不下发，0010 里的渲染侧代码是死的。实测本机
    `navigator.maxTouchPoints` 漏出真值 10，而人格声称桌面 —— 这是**矛盾**不是
    未伪装。151 已在 0032 修复，124 的对应修复需要一次构建验证后单独提交。
-2. **canvas 越界读** —— 完全落在画布外的 `getImageData` 仍被施加扰动，返回非零
-   RGB + 零 alpha，没有任何原生浏览器会这样。151 在噪声块前就 return 了。
+2. ~~**canvas 越界读**~~ —— **已修**（124 树提交 `2676570511`），同样只有编译
+   验证、尚未导出补丁。缺陷实测复现过：256 个越界像素里 9 个有非零 RGB 而 alpha
+   全零。探针 `probe/run-canvas-oob.cjs` 红转绿两侧都验过。
 3. **单元测试跑不过** —— `fingerbrowser_policy_unittest.cc` 仍断言
    `switches::kForceWebRtcIPHandlingPolicy`，实现已改为 `fp-webrtc-ip-policy`。
 4. **缺 151 的 Accept-Language pref 修复** —— profile pref
