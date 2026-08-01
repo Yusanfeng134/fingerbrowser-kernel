@@ -41,19 +41,17 @@ const WORKDIR = 'D:/chromium-work-151/probe'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function ensureFieldClear(image) {
-  let n = 0
-  try {
-    const out = execSync(`tasklist /FI "IMAGENAME eq ${image}" /NH`, { encoding: 'utf8' })
-    const hay = out.toLowerCase(), needle = image.toLowerCase()
-    for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) n++
-  } catch (e) { return }
-  if (n === 0) return
-  if (process.env.PROBE_FORCE_KILL === '1') {
-    try { execSync(`taskkill /IM ${image} /F /T`, { stdio: 'ignore' }) } catch (e) {}
-    return
+  // 只清本探针自己的 profile，按 --user-data-dir 过滤，**不按镜像名**。
+  // 这台机器上客户端外壳、店铺环境、探针内核共用同一个可执行文件名，按名字杀
+  // 等于无差别清场 —— 已经造成两次实际破坏。见 probe-kill.cjs 的说明。
+  const { killProbeKernels, foreignKernelCount } = require('./probe-kill.cjs')
+  const killed = killProbeKernels(image)
+  if (killed.length) console.log(`  清掉本探针上次残留的 ${killed.length} 个进程`)
+  const foreign = foreignKernelCount(image)
+  if (foreign) {
+    console.log(`  注意：场上还有 ${foreign} 个非本探针的 ${image}（客户端在跑）——`)
+    console.log('  不影响本次测量（profile 隔离），但异常时值得先想到这一点。')
   }
-  console.log(`X 有 ${n} 个 ${image} 进程在跑。关掉后重跑，或 PROBE_FORCE_KILL=1 显式授权。`)
-  process.exit(1)
 }
 
 const EXPR = `JSON.stringify({

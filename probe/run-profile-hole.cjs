@@ -28,25 +28,17 @@ if (require('fs').existsSync('D:/yunbrowser-run/STALE')) {
 // 改为：发现有同名进程就拒绝运行并说明，确认无关时用 PROBE_FORCE_KILL=1 显式
 // 授权。保留了清残留的能力，但把「谁来决定杀」交还给人。
 function ensureFieldClear(image) {
-  const { execSync } = require('child_process')
-  let n = 0
-  try {
-    const out = execSync(`tasklist /FI "IMAGENAME eq ${image}" /NH`, { encoding: 'utf8' })
-    // 直接数镜像名出现次数，不按行切 —— 避开跨语言生成时的换行转义坑（就是它把
-    // 这一行写坏过一次）。
-    const hay = out.toLowerCase()
-    const needle = image.toLowerCase()
-    for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) n++
-  } catch (e) { return }
-  if (n === 0) return
-  if (process.env.PROBE_FORCE_KILL === '1') {
-    try { execSync(`taskkill /IM ${image} /F /T`, { stdio: 'ignore' }) } catch (e) {}
-    return
+  // 只清本探针自己的 profile，按 --user-data-dir 过滤，**不按镜像名**。
+  // 这台机器上客户端外壳、店铺环境、探针内核共用同一个可执行文件名，按名字杀
+  // 等于无差别清场 —— 已经造成两次实际破坏。见 probe-kill.cjs 的说明。
+  const { killProbeKernels, foreignKernelCount } = require('./probe-kill.cjs')
+  const killed = killProbeKernels(image)
+  if (killed.length) console.log(`  清掉本探针上次残留的 ${killed.length} 个进程`)
+  const foreign = foreignKernelCount(image)
+  if (foreign) {
+    console.log(`  注意：场上还有 ${foreign} 个非本探针的 ${image}（客户端在跑）——`)
+    console.log('  不影响本次测量（profile 隔离），但异常时值得先想到这一点。')
   }
-  console.log(`X 有 ${n} 个 ${image} 进程在跑 —— 可能是客户端正开着环境。`)
-  console.log('  探针不会替你杀：按镜像名杀分不清哪些是你的工作。')
-  console.log('  关掉后重跑；确认与你无关时用 PROBE_FORCE_KILL=1 显式授权。')
-  process.exit(1)
 }
 
 const { spawn, execSync } = require('child_process')

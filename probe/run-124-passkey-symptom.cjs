@@ -42,6 +42,20 @@
 // 附带一个可能对定位成因有用的观察：连 publicKey.timeout 都不触发（设 20s，
 // 35s 后仍挂着）。不是「等到超时再失败」，是请求根本没进入那条会超时的路径。
 
+function ensureFieldClear(image) {
+  // 只清本探针自己的 profile，按 --user-data-dir 过滤，**不按镜像名**。
+  // 这台机器上客户端外壳、店铺环境、探针内核共用同一个可执行文件名，按名字杀
+  // 等于无差别清场 —— 已经造成两次实际破坏。见 probe-kill.cjs 的说明。
+  const { killProbeKernels, foreignKernelCount } = require('./probe-kill.cjs')
+  const killed = killProbeKernels(image)
+  if (killed.length) console.log(`  清掉本探针上次残留的 ${killed.length} 个进程`)
+  const foreign = foreignKernelCount(image)
+  if (foreign) {
+    console.log(`  注意：场上还有 ${foreign} 个非本探针的 ${image}（客户端在跑）——`)
+    console.log('  不影响本次测量（profile 隔离），但异常时值得先想到这一点。')
+  }
+}
+
 const http = require('http')
 const { spawn, execSync } = require('child_process')
 const WebSocket = require('ws')
@@ -83,7 +97,7 @@ const PAGE = `<!doctype html><meta charset=utf-8><title>wa</title><body>
 </script></body>`
 
 ;(async () => {
-  try { execSync('taskkill /IM chrome.exe /F /T', { stdio: 'ignore' }) } catch (e) {}
+  ensureFieldClear('chrome.exe')
   await sleep(1200)
 
   const srv = http.createServer((req, res) => {

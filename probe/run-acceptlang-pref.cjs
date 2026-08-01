@@ -24,10 +24,24 @@
 // 两个内核都通过，这个缺陷完全不可见 —— 通过条件被一个与被测属性无关的前提
 // 满足了。
 
+function ensureFieldClear(image) {
+  // 只清本探针自己的 profile，按 --user-data-dir 过滤，**不按镜像名**。
+  // 这台机器上客户端外壳、店铺环境、探针内核共用同一个可执行文件名，按名字杀
+  // 等于无差别清场 —— 已经造成两次实际破坏。见 probe-kill.cjs 的说明。
+  const { killProbeKernels, foreignKernelCount } = require('./probe-kill.cjs')
+  const killed = killProbeKernels(image)
+  if (killed.length) console.log(`  清掉本探针上次残留的 ${killed.length} 个进程`)
+  const foreign = foreignKernelCount(image)
+  if (foreign) {
+    console.log(`  注意：场上还有 ${foreign} 个非本探针的 ${image}（客户端在跑）——`)
+    console.log('  不影响本次测量（profile 隔离），但异常时值得先想到这一点。')
+  }
+}
+
 const http=require('http'),{spawn,execSync}=require('child_process'),WebSocket=require('ws')
 const sleep=ms=>new Promise(r=>setTimeout(r,ms))
 async function run(kernel,image,reduce,port,cdp,tag){
- try{execSync(`taskkill /IM ${image} /F /T`,{stdio:'ignore'})}catch(e){}
+ ensureFieldClear(image)
  await sleep(1200)
  let hdr=null
  const srv=http.createServer((q,r)=>{ if(!hdr) hdr=q.headers['accept-language']||'(无)'
