@@ -164,7 +164,12 @@ const PAGE = `<!doctype html><meta charset=utf-8><title>wa</title><body>
     }
   }
   console.log('')
-  console.log('注意：本测量用的是 platform attachment 且**无策略**。真实场景下亚马逊')
-  console.log('  的风控页可能用不同参数（cross-platform、conditional UI、特定 RP）。')
-  console.log('  本脚本只否证/证实「无条件挂起」这一条，不代表覆盖了全部路径。')
+  console.log('⚠ 症状随条件变化，本脚本测到的形态**不是唯一形态**。')
+  console.log('  本地实测（124/151、localhost、headless 与有窗口、三种 userVerification、')
+  console.log('  有无用户手势）一律 HANG 15-25s；客户端在真实环境（151、figma.com）测到的')
+  console.log('  是 REJECT 1ms NotAllowedError。四个候选成因逐一变更后仍挂，成因未查清。')
+  console.log('')
+  console.log('  所以**不要拿「25 秒挂起」当作缺陷是否存在的依据** —— 按它去真实站点')
+  console.log('  复现会得到「没问题」。两种形态都是「无认证器时 WebAuthn 异常失败」，')
+  console.log('  修法相同。')
 })().catch((e) => { console.log('X ' + e.message); process.exit(1) })
