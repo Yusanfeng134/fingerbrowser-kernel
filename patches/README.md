@@ -109,10 +109,14 @@ DEPS 子仓，主仓索引里没有它们的文件。拿主仓做树比对，这
 3. ~~**单元测试跑不过**~~ —— **已修**（124 树提交 `7fc15193a9`）。这条是唯一
    端到端验完的：先实测确认它真的红，改后 4 个测试全绿，反例还用变异验过会红。
    **151 有完全相同的问题**（124 那份是抄过来的，坏断言一起抄了），已在 0034 修。
-4. **缺 151 的 Accept-Language pref 修复** —— profile pref
-   `language::prefs::kAcceptLanguages` 仍持有宿主 locale，直接读它的消费者
-   （尤其 ReduceAcceptLanguage 委托）可能把宿主 locale 盖回线上。
-5. **CSS `(pointer)` / `(any-pointer)` 未伪装** —— 与 maxTouchPoints 同族，半边工程。
+4. ~~**缺 151 的 Accept-Language pref 修复**~~ —— **已修**（124 树提交
+   `73d1e9357c`）。实测确认过缺陷：开启 ReduceAcceptLanguage 时线上头发 `zh-CN`
+   而 JS 报 `en-US` —— **JS 通过 ≠ 线上通过**。探针
+   `probe/run-acceptlang-pref.cjs` 同时抓两处。
+5. ~~**CSS `(pointer)` / `(any-pointer)` 未伪装**~~ —— **已修**（同上提交）。
+   **此前归类有误：这不是 124 独有，151 同样缺**，已在 0035 一并修并端到端
+   验过红转绿。原描述把 `ontouchstart` 也列进「三者本该同进同退」，实测它在
+   `=0` 时本来就正确 —— **清单里混进假项会让人怀疑正确的代码**。
 6. **`fp-do-not-track` / `fp-brand` 有声明无消费者** —— 惰性死开关。
 7. ~~**`gpu_adapter.cc` 的注释引用了 151 才有的 `info` 属性**~~ —— **已修**
    （124 树提交 `fbebbbccdb`），代码本身是对的、只有注释错。

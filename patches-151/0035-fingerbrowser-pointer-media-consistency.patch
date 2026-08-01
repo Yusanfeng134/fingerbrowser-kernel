@@ -1,0 +1,101 @@
+From 38c07ed343038c442f6daf24fb4855812d959a21 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Sat, 1 Aug 2026 13:36:38 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20(any-pointer:=20coarse)=20?=
+ =?UTF-8?q?=E5=BF=85=E9=A1=BB=E4=B8=8E=20navigator.maxTouchPoints=20?=
+ =?UTF-8?q?=E5=90=8C=E6=BA=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+实测（本机为触屏笔记本，同步目录 14:29 构建）：
+
+  基线（不传开关）        maxTouchPoints=10  any-pointer:coarse=true
+  fp-max-touch-points=0   maxTouchPoints=0   any-pointer:coarse=**true**
+
+人格声称 0 个触点，而一条媒体查询说有粗指针可用。真实无触屏桌面报 false ——
+这是**矛盾**不是「未伪装」：它证明的不是有没有触屏，是有人动过手脚。
+
+修后：
+
+  fp-max-touch-points=0   any-pointer:coarse=false   （基线 true，确实变了）
+  fp-max-touch-points=5   any-pointer:coarse=true    （反向不翻车）
+  any-pointer:fine        未被改动
+
+复用 fp-max-touch-points 而不新开开关：触摸能力只能有一处真相。只在 ==0 时移除
+coarse、>0 时补上，不动 fine —— 宿主有鼠标与人格声称的触摸能力无关。
+
+这个缺口 124 与 151 都有，此前被记成 124 独有。两侧代码块字节相同（从 124 原样
+取出，非手抄）。
+
+探针 probe/run-touch-consistency.cjs，带前提检查：宿主若本来就没有触屏，
+「伪装成 0 之后 coarse 是 false」什么都证明不了，此时明确报「本机测不了这条」
+而不是通过。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../blink/renderer/core/css/media_values.cc   | 42 +++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index ef5e18df8e..04dc53700d 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -370,12 +370,54 @@ mojom::blink::PointerType MediaValues::CalculatePrimaryPointerType(
+     LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // FingerBrowser：与 navigator.maxTouchPoints 同源。声称 0 个触点的人格，
++  // 主指针必须是精细指针（鼠标）；沿用宿主值会在触屏笔记本上报 coarse。
++  if (fingerbrowser::HasSwitch(fingerbrowser::kMaxTouchPointsSwitch) &&
++      fingerbrowser::IntSwitch(fingerbrowser::kMaxTouchPointsSwitch) == 0) {
++    return mojom::blink::PointerType::kPointerFineType;
++  }
+   return frame->GetSettings()->GetPrimaryPointerType();
+ }
+ 
+ int MediaValues::CalculateAvailablePointerTypes(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++
++  // FingerBrowser：`(any-pointer: coarse)` 必须与 navigator.maxTouchPoints 一致。
++  //
++  // 实测（本机为触屏笔记本）伪装 maxTouchPoints=0 之后：
++  //     navigator.maxTouchPoints  0      ← 已伪装
++  //     any-pointer: coarse       true   ← 仍是宿主值
++  // 人格声称没有触摸，而一条媒体查询说有粗指针可用。真实无触屏桌面报 false ——
++  // 这是**矛盾**，不是「未伪装」：它证明的不是有没有触屏，是有人动过手脚。
++  //
++  // 复用 fp-max-touch-points 而不新开开关：触摸能力只能有一处真相。新开一个
++  // 就会造出「两个开关说法不一」这种更难查的形态 —— 0026 在屏幕尺寸上踩过。
++  //
++  // 只在 ==0 时移除 coarse、在 >0 时补上 coarse，**不动 fine**：宿主有鼠标这件
++  // 事与人格声称的触摸能力无关，改它没有依据。
++  //
++  // ontouchstart 与 TouchEvent 不在此处理，也不需要：实测 =0 时
++  // ontouchstart=false 本来就是对的。README 曾把它列进「三者本该同进同退」，
++  // 那是把一个本就正确的项也算成了问题。
++  if (fingerbrowser::HasSwitch(fingerbrowser::kMaxTouchPointsSwitch)) {
++    int types = frame->GetSettings()->GetAvailablePointerTypes();
++    const int coarse =
++        static_cast<int>(mojom::blink::PointerType::kPointerCoarseType);
++    const int fine =
++        static_cast<int>(mojom::blink::PointerType::kPointerFineType);
++    if (fingerbrowser::IntSwitch(fingerbrowser::kMaxTouchPointsSwitch) == 0) {
++      types &= ~coarse;
++      // 移光了就没有任何指针类型，那本身是个异常值（真实桌面总有鼠标）。
++      if (types == 0) {
++        types = fine;
++      }
++    } else {
++      types |= coarse;
++    }
++    return types;
++  }
++
+   return frame->GetSettings()->GetAvailablePointerTypes();
+ }
+ 
+-- 
+2.52.0.windows.1
+
