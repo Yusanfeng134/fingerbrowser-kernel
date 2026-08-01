@@ -1,0 +1,75 @@
+From 8643cf735524b2102c226f520c8c08d27ed61777 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Sat, 1 Aug 2026 12:20:24 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20=E4=BF=AE=E5=8D=95=E5=85=83?=
+ =?UTF-8?q?=E6=B5=8B=E8=AF=95=E6=96=AD=E8=A8=80=E7=9A=84=E6=98=AF=E5=B7=B2?=
+ =?UTF-8?q?=E5=81=9C=E7=94=A8=E7=9A=84=E5=BC=80=E5=85=B3=EF=BC=8C=E5=B9=B6?=
+ =?UTF-8?q?=E5=8A=A0=E4=B8=80=E6=9D=A1=E5=8F=8D=E4=BE=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fingerbrowser_policy_unittest.cc:124 断言实现会追加
+switches::kForceWebRtcIPHandlingPolicy，而实现早已改成 fp-webrtc-ip-policy ——
+那个旧开关在本构建里没有任何消费者，传了等于没传。
+
+## 这条测试一直是红的，而 33 个补丁都写着「验证通过」
+
+实测：
+
+  fingerbrowser_policy_unittest.cc(124): error: Expected equality of these values:
+    "disable_non_proxied_udp"
+    command_line->GetSwitchValueASCII(switches::kForceWebRtcIPHandlingPolicy)
+      Which is: ""
+  1 test failed
+
+没人跑过它。补丁集的验证一直是靠 probe/ 下的端到端脚本，而这个单元测试目标
+（fingerbrowser_policy_unittests）不在任何常规流程里 —— **一个没人跑的测试和
+没有测试的区别，只在于前者会让人以为有覆盖**。
+
+发现路径值得记：先在 124 上修同一条（124 那份是从 151 抄的，缺陷一起抄了），
+然后回头查 151 才发现同样红。**抄代码时缺陷跟着走，抄测试时坏断言也跟着走。**
+
+## 不只是改开关名
+
+只把断言换成新开关不够：那样即使实现把两个都追加，测试照样通过。而「两个都发」
+是个真实会发生的实现（改的人保守起见留着旧的），代价是一个无用负担，还会让下
+一个人以为它在起作用。加 EXPECT_FALSE 锁住「已经停用它」这个决定本身。
+
+反例本身在 124 上用变异验过会红（注入「两个都追加」→ 第 135 行当场失败）。
+151 这份是同一形状，未单独再验一次变异。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../fingerbrowser_policy_unittest.cc              | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc b/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc
+index 00555a13c3..2e4b4a3ae6 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_policy_unittest.cc
+@@ -120,8 +120,19 @@ TEST(FingerBrowserPolicyTest, AppliesPolicyToCommandLine) {
+   EXPECT_TRUE(command_line->HasSwitch(
+       permissions::switches::kDenyPermissionPrompts));
+   EXPECT_EQ("disable_non_proxied_udp",
+-            command_line->GetSwitchValueASCII(
+-                switches::kForceWebRtcIPHandlingPolicy));
++            command_line->GetSwitchValueASCII("fp-webrtc-ip-policy"));
++
++  // 反例：旧开关必须**不再**出现。
++  //
++  // switches::kForceWebRtcIPHandlingPolicy 在本构建里没有任何消费者 —— 传了等于
++  // 没传，WebRTC 照旧漏真实 IP。实现改为下发 fp-webrtc-ip-policy 由渲染侧的
++  // peer-connection 工厂读取。
++  //
++  // 只断言新开关是不够的：那样即使实现把两个都追加（旧的那个纯属无用负担，
++  // 还会让人以为它在起作用），测试照样通过。**这条断言锁的是「已经停用它」这个
++  // 决定本身**，而不只是「新的那个在」。
++  EXPECT_FALSE(command_line->HasSwitch(
++      switches::kForceWebRtcIPHandlingPolicy));
+ }
+ 
+ }  // namespace
+-- 
+2.52.0.windows.1
+

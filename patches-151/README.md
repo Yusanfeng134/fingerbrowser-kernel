@@ -55,6 +55,7 @@ for p in patches-151/0*.patch; do git apply "$p"; done
 | 0031 | fingerbrowser-dynamic-island-query-in-fragment | 灵动岛 | 钉住 `?q=` 必须落在 `#` 之后（纯注释，依赖 0029）|
 | 0032 | fingerbrowser-policy-parse-dpr-touch | 指纹 | 策略解析补上 `devicePixelRatio` / `maxTouchPoints` —— 0026 的这两处此前不可达 |
 | 0033 | fingerbrowser-device-memory-legal-set | 指纹 | `deviceMemory` 合法集合按 151 实际钳位改为 `{2,4,8,16,32}`（124 不同，勿照搬）|
+| 0034 | fingerbrowser-fix-stale-webrtc-test | 测试 | 单元测试断言的是已停用的开关，一直红；**没人跑过它** |
 
 ### 0026 说明：矛盾 ≠ 未伪装
 

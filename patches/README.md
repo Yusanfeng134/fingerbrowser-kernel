@@ -106,8 +106,9 @@ DEPS 子仓，主仓索引里没有它们的文件。拿主仓做树比对，这
 2. ~~**canvas 越界读**~~ —— **已修**（124 树提交 `2676570511`），同样只有编译
    验证、尚未导出补丁。缺陷实测复现过：256 个越界像素里 9 个有非零 RGB 而 alpha
    全零。探针 `probe/run-canvas-oob.cjs` 红转绿两侧都验过。
-3. **单元测试跑不过** —— `fingerbrowser_policy_unittest.cc` 仍断言
-   `switches::kForceWebRtcIPHandlingPolicy`，实现已改为 `fp-webrtc-ip-policy`。
+3. ~~**单元测试跑不过**~~ —— **已修**（124 树提交 `7fc15193a9`）。这条是唯一
+   端到端验完的：先实测确认它真的红，改后 4 个测试全绿，反例还用变异验过会红。
+   **151 有完全相同的问题**（124 那份是抄过来的，坏断言一起抄了），已在 0034 修。
 4. **缺 151 的 Accept-Language pref 修复** —— profile pref
    `language::prefs::kAcceptLanguages` 仍持有宿主 locale，直接读它的消费者
    （尤其 ReduceAcceptLanguage 委托）可能把宿主 locale 盖回线上。
