@@ -24,6 +24,7 @@
 | `run-policy-sweep.cjs` | 全部指纹字段 | 走**策略路径**逐字段比对；基线与配置值相同时标「不可判别」而非通过 |
 | `run-cjk-fonts.cjs` | 0026 CJK 字体屏蔽 | 两条**反向**断言：枚举看不到，但渲染仍正常 |
 | `run-webrtc-ip.cjs` | webrtcIpPolicy | 基线**必须先漏**，否则「没漏」是假通过 |
+| `run-geolocation.cjs` | 0038 地理位置一致性 | 改动落在共用收口上，**反例比正例重要** |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |
@@ -116,10 +117,12 @@ cp probe/run-xxx.cjs /d/chromium-work-151/probe/ && cd /d/chromium-work-151/prob
   这一环 —— 0026 的两处失效就是这么逃掉的。**`run-policy-sweep.cjs` 已把这条路
   补上**：走完整策略路径逐字段比对，14 个可判别字段全部通过，并因此抓到了
   UA-CH `platform` 未伪装造成的三方矛盾（0037）。
-  仍未覆盖：`canvasNoise` / `audioNoise`（是种子不是可读值）、`permissionDefaults`
-  / `windowSize` / `geolocation`（效果不在 navigator 上，各需自己的场景）。
+  仍未覆盖：`canvasNoise` / `audioNoise`（是种子不是可读值）、`windowSize`、
+  `permissionDefaults`（它下发 `--deny-permission-prompts`，只在弹窗出现时自动
+  拒绝、不写内容设置；而 headless 本来就自动拒绝弹窗，所以 ask 与 deny 在
+  headless 下**不可区分** —— 要验它得有头，属人工项）。
   `blockCjkFonts` 由 `run-cjk-fonts.cjs` 覆盖，`webrtcIpPolicy` 由
-  `run-webrtc-ip.cjs` 覆盖。
+  `run-webrtc-ip.cjs` 覆盖，`geolocation` 由 `run-geolocation.cjs` 覆盖。
 - 地址栏、菜单启用状态是浏览器原生 UI，CDP 读不到，那几条只能人工确认。脚本里
   已标明哪些是程序验的、哪些不是 —— **不拿「脚本没报错」冒充通过**。
 - `run-creepjs-audit.cjs` 的 TTS 一项在无语音包的机器上无法判定，此时明确输出
