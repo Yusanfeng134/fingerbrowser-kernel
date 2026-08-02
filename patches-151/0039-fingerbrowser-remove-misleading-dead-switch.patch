@@ -1,0 +1,82 @@
+From 0a2d4685ff1f05e10f01d6d5acdc2b0f1046da49 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Sun, 2 Aug 2026 15:06:06 +0800
+Subject: [PATCH] =?UTF-8?q?=E6=B8=85=E7=90=86=E4=B8=A4=E5=A4=84=E8=AF=AF?=
+ =?UTF-8?q?=E5=AF=BC=E6=80=A7=E4=BB=A3=E7=A0=81=EF=BC=9A=E6=AD=BB=E5=B8=B8?=
+ =?UTF-8?q?=E9=87=8F=20kDoNotTrackSwitch=E3=80=81=E8=AF=B4=E9=94=99?=
+ =?UTF-8?q?=E8=87=AA=E5=B7=B1=E6=9C=BA=E5=88=B6=E7=9A=84=E6=B3=A8=E9=87=8A?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+一次 fp-* 开关三方契约审计（策略下发 / 渲染进程转发白名单 / blink 消费）没有找到
+真缺口，七条疑似全部被反驳 —— 我怀疑的那些「缺口」都是在错误的进程里找读取点：
+fp-active / fp-shell / fp-passkey / fp-brand / fp-platform-version 都是浏览器侧
+消费（UA-CH metadata 走 mojo 下发，WebAuthn 的认证器选择全在浏览器进程），按设计
+就不进转发白名单。
+
+但反驳过程掉出两处真问题，都是「误导下一个人」而非功能缺陷：
+
+1. kDoNotTrackSwitch = "fp-do-not-track" 是死常量：全树只有那一行声明，既不下发
+   也无人读，策略结构体里压根没有 DNT 字段。删掉不是因为它没用，而是因为它指向
+   错误的做法 —— DNT 走的是 pref 通路，`DNT: 1` 请求头由浏览器进程按
+   RendererPreferences 添加。谁按这个渲染侧开关把它接上，就会得到
+   navigator.doNotTrack === "1" 而请求头不带 DNT：JS 说一套、线上做另一套，正是
+   那种阳性矛盾。理由留在原地，免得下次有人用同样的方式再加回来。
+
+2. authenticator_environment.cc 的注释称 fp-passkey「propagated to renderers
+   alongside the other fp-* switches」—— 它从未被转发，也不需要转发（第 36 行读的
+   是浏览器进程自己的 ForCurrentProcess()）。注释误述了自身机制。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ content/browser/webauth/authenticator_environment.cc | 12 ++++++++++--
+ .../fingerbrowser/fingerbrowser_fingerprint.h        |  9 ++++++++-
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/content/browser/webauth/authenticator_environment.cc b/content/browser/webauth/authenticator_environment.cc
+index 172bce0790..a4b2df26d9 100644
+--- a/content/browser/webauth/authenticator_environment.cc
++++ b/content/browser/webauth/authenticator_environment.cc
+@@ -28,8 +28,16 @@ namespace {
+ 
+ // FingerBrowser: enables the per-environment software passkey authenticator.
+ // Emitted by chrome/browser/fingerbrowser/fingerbrowser_policy.cc from the
+-// profile's policy file, and propagated to renderers alongside the other fp-*
+-// switches.
++// profile's policy file.
++//
++// Unlike the fp-* switches that feed JS-visible getters, this one is NOT in the
++// renderer propagation list in render_process_host_impl.cc, and must not be
++// added to it: authenticator discovery and selection happen entirely in the
++// browser process, so the read below is ForCurrentProcess() on the same process
++// that ApplyFingerBrowserPolicy wrote to. Blink's navigator.credentials only
++// forwards the request over blink::mojom::Authenticator and would have no use
++// for the switch. (An earlier version of this comment claimed the switch was
++// propagated to renderers -- it never was, and does not need to be.)
+ constexpr char kFingerBrowserPasskeySwitch[] = "fp-passkey";
+ 
+ bool FingerBrowserPasskeyEnabled() {
+diff --git a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+index 6c2e4f12ec..44441f08de 100644
+--- a/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
++++ b/third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h
+@@ -67,7 +67,14 @@ inline constexpr char kDevicePixelRatioX1000Switch[] = "fp-dpr-x1000";
+ // pointer:coarse 为否——这三者本该同进同退，对不上同样是阳性证据。
+ // 传 0 表示无触摸（桌面人格）。
+ inline constexpr char kMaxTouchPointsSwitch[] = "fp-max-touch-points";
+-inline constexpr char kDoNotTrackSwitch[] = "fp-do-not-track";
++// 这里曾有一个 kDoNotTrackSwitch = "fp-do-not-track"。它从未被下发、也从未被读取
++// ——全树只有那一行声明。删掉不是因为它没用，而是因为**它指向错误的做法**：
++// DNT 走的是 pref 通路（renderer_preferences_util.cc 把 prefs::kEnableDoNotTrack
++// 填进 RendererPreferences），navigator.doNotTrack 由 local_frame_client_impl 读
++// 该字段，而 `DNT: 1` 请求头是**浏览器进程**在 browser_initiated_resource_request.cc
++// 里按同一字段加的。谁要是按一个渲染侧开关把它接上，就会得到
++// navigator.doNotTrack === "1" 而请求头不带 DNT ——JS 说一套、线上做另一套，
++// 正是那种阳性矛盾。将来做 DNT 请设 pref，不要在这里加开关。
+ // 经纬度以 1e6 倍整数传递（命令行开关只走整数解析，避免浮点字符串的本地化问题）。
+ inline constexpr char kGeoLatitudeE6Switch[] = "fp-geo-lat-e6";
+ inline constexpr char kGeoLongitudeE6Switch[] = "fp-geo-lon-e6";
+-- 
+2.52.0.windows.1
+
