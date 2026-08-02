@@ -1,0 +1,109 @@
+From f933425b02ec6aee95118cd8e91c0b0fbf0c000a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Sun, 2 Aug 2026 13:46:29 +0800
+Subject: [PATCH] =?UTF-8?q?fingerbrowser:=20UA-CH=20=E7=9A=84=20platform?=
+ =?UTF-8?q?=20=E4=B8=8E=20navigator.platform=20=E5=90=8C=E6=BA=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+## 全量策略扫描抓到的，不是猜的
+
+probe/run-policy-sweep.cjs 走「策略 JSON → 解析 → 下发 → 页面」这条完整路径，
+逐一比对内核读的 27 个字段。人格配 MacIntel 时实测：
+
+    navigator.platform     MacIntel   已伪装
+    UA-CH platform         Windows    宿主真值
+    UA-CH platformVersion  14.5.0     已伪装成 macOS 版本
+
+于是 **UA-CH 自己内部就不自洽**：声称 Windows，却报一个 Windows 不存在的版本号
+（那套契约编号是 10/14/15/19，没有三段式的 14.5.0）。再加上 navigator.platform
+说 MacIntel —— 读三个字段即可断定这个浏览器被改过。
+
+## 这条推翻了我自己写在代码里的一句话
+
+GetPlatformVersion() 上方的注释写着「这一项属于**未伪装**而非矛盾」。那句在
+**只**伪装 platformVersion 时成立；一旦人格跨平台就不成立。
+
+**「某项是未伪装还是矛盾」不是它的固有属性，取决于它旁边那些项被伪装成什么。**
+已把这句写进新注释 —— 原来那句留着会让下一个人以为这里已经想清楚了。
+
+## 映射而不是透传
+
+从已有的 fp-platform 派生，不新开开关（0026 定下的「同一属性只能有一处真相」）。
+
+但两套词汇不同：navigator.platform 用 NavigatorID 值（Win32/MacIntel/
+Linux x86_64），UA-CH 用展示名（Windows/macOS/Linux）。**直接透传会让 CH 报出
+"MacIntel" 这种真实浏览器从不出现的值** —— 那是换一种方式暴露，不是修复。
+
+认不出的值不猜，落回原生分支：透传一个 CH 词汇表里没有的字符串，比保持宿主
+真值更容易被识别。
+
+## 验证
+
+扫描复跑：Windows -> macOS，可判别的 14 项全部通过。
+
+写断言时我把期望值写成了 MacIntel —— 正是实现里刻意避免的那种透传。改对了。
+**在同一处同时想清楚实现和判据，不等于两边会一致。**
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../embedder_support/user_agent_utils.cc      | 42 +++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index c220516f39..0a41f062d4 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -647,6 +647,48 @@ std::string GetPlatformVersion() {
+ }
+ 
+ std::string GetPlatformForUAMetadata() {
++  // FingerBrowser：Client Hints 的 platform，与 navigator.platform 同源。
++  //
++  // 不伪装这一项的后果**不是「未伪装」，是矛盾**，而且是三方的。实测（全量策略
++  // 扫描 probe/run-policy-sweep.cjs，人格配 MacIntel）：
++  //
++  //     navigator.platform     MacIntel   ← 已伪装
++  //     UA-CH platform         Windows    ← 宿主真值
++  //     UA-CH platformVersion  14.5.0     ← 已伪装成 macOS 版本
++  //
++  // 于是 UA-CH **自己内部就不自洽**：声称 Windows，却报一个 Windows 不存在的
++  // 版本号（那套契约编号是 10/14/15/19）。再加上 navigator.platform 说 MacIntel，
++  // 读三个字段就能断定这个浏览器被改过。
++  //
++  // 注意 GetPlatformVersion() 上方那段注释说 platformVersion「属于未伪装而非
++  // 矛盾」—— 那句在**只**伪装 platformVersion 时成立，一旦人格跨平台就不成立。
++  // 「某项是未伪装还是矛盾」不是它的固有属性，取决于它旁边那些项被伪装成什么。
++  //
++  // 从已有的 fp-platform 派生，不新开开关：同一属性只能有一处真相（0026 在屏幕
++  // 尺寸上定下的规则）。navigator.platform 用的是 NavigatorID 那套值
++  // （Win32 / MacIntel / Linux x86_64），而 UA-CH 用的是展示名
++  // （Windows / macOS / Linux），两套词汇不同，这里做映射而不是直接透传 ——
++  // 直接透传会让 CH 报出 "MacIntel" 这种真实浏览器从不出现的值。
++  {
++    const std::string fb_platform =
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            "fp-platform");
++    if (!fb_platform.empty()) {
++      if (fb_platform == "Win32" || fb_platform == "Win64") {
++        return "Windows";
++      }
++      if (fb_platform == "MacIntel" || fb_platform == "MacPPC" ||
++          fb_platform == "Mac68K") {
++        return "macOS";
++      }
++      if (fb_platform.starts_with("Linux")) {
++        return "Linux";
++      }
++      // 认不出的值**不猜**：透传一个 CH 词汇表里没有的字符串，比保持宿主真值
++      // 更容易被识别。落回下面的原生分支。
++    }
++  }
++
+ #if BUILDFLAG(IS_ANDROID)
+   if (base::android::device_info::is_desktop() ||
+       base::android::device_info::is_xr()) {
+-- 
+2.52.0.windows.1
+

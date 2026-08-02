@@ -21,6 +21,7 @@
 | `run-canvas-oob.cjs` | 124 越界读 | 判据分**三种**结局，「全非零」是测试构造错了、不是缺陷 |
 | `run-seed-passwords.cjs` | 0036 密码种子 | 判据是**伪类不是 `.value`** —— 后者在交互前被 Chromium 藏起来 |
 | `run-seed-errors.cjs` | 0036 错误路径 | 逐条断言**具体的 reason**；成功路径反向断言无多余 error 行 |
+| `run-policy-sweep.cjs` | 全部指纹字段 | 走**策略路径**逐字段比对；基线与配置值相同时标「不可判别」而非通过 |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |
@@ -105,11 +106,13 @@ cp probe/run-xxx.cjs /d/chromium-work-151/probe/ && cd /d/chromium-work-151/prob
 ## 已知限制
 
 - 路径硬编码为 `D:/chromium-work-151` 与 `D:/yunbrowser-run`，换机器需改。
-- 除 `run-policy-emit.cjs` 外，**所有指纹探针都在命令行直传 `--fp-*` 开关**，
-  绕过了「策略 JSON → 解析 → 下发」这一环。0026 的两处失效就是这么逃掉的：
-  渲染侧被验了，解析侧从没被走到。`run-policy-emit.cjs` 只覆盖了
-  `devicePixelRatio` 与 `maxTouchPoints` 两个字段，**同一个洞在其余字段上很可能
-  还在**。
+- 大多数指纹探针在命令行直传 `--fp-*` 开关，绕过「策略 JSON → 解析 → 下发」
+  这一环 —— 0026 的两处失效就是这么逃掉的。**`run-policy-sweep.cjs` 已把这条路
+  补上**：走完整策略路径逐字段比对，14 个可判别字段全部通过，并因此抓到了
+  UA-CH `platform` 未伪装造成的三方矛盾（0037）。
+  仍未覆盖：`canvasNoise` / `audioNoise`（是种子不是可读值）、`permissionDefaults`
+  / `webrtcIpPolicy` / `blockCjkFonts` / `windowSize` / `geolocation`（效果不在
+  navigator 上，各需自己的场景）。脚本里逐条列出，不假装验过。
 - 地址栏、菜单启用状态是浏览器原生 UI，CDP 读不到，那几条只能人工确认。脚本里
   已标明哪些是程序验的、哪些不是 —— **不拿「脚本没报错」冒充通过**。
 - `run-creepjs-audit.cjs` 的 TTS 一项在无语音包的机器上无法判定，此时明确输出
