@@ -23,6 +23,7 @@
 | `run-seed-errors.cjs` | 0036 错误路径 | 逐条断言**具体的 reason**；成功路径反向断言无多余 error 行 |
 | `run-policy-sweep.cjs` | 全部指纹字段 | 走**策略路径**逐字段比对；基线与配置值相同时标「不可判别」而非通过 |
 | `run-cjk-fonts.cjs` | 0026 CJK 字体屏蔽 | 两条**反向**断言：枚举看不到，但渲染仍正常 |
+| `run-webrtc-ip.cjs` | webrtcIpPolicy | 基线**必须先漏**，否则「没漏」是假通过 |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |
@@ -116,9 +117,9 @@ cp probe/run-xxx.cjs /d/chromium-work-151/probe/ && cd /d/chromium-work-151/prob
   补上**：走完整策略路径逐字段比对，14 个可判别字段全部通过，并因此抓到了
   UA-CH `platform` 未伪装造成的三方矛盾（0037）。
   仍未覆盖：`canvasNoise` / `audioNoise`（是种子不是可读值）、`permissionDefaults`
-  / `webrtcIpPolicy` / `windowSize` / `geolocation`（效果不在 navigator 上，各需
-  自己的场景）。脚本里逐条列出，不假装验过。
-  `blockCjkFonts` 已由 `run-cjk-fonts.cjs` 单独覆盖。
+  / `windowSize` / `geolocation`（效果不在 navigator 上，各需自己的场景）。
+  `blockCjkFonts` 由 `run-cjk-fonts.cjs` 覆盖，`webrtcIpPolicy` 由
+  `run-webrtc-ip.cjs` 覆盖。
 - 地址栏、菜单启用状态是浏览器原生 UI，CDP 读不到，那几条只能人工确认。脚本里
   已标明哪些是程序验的、哪些不是 —— **不拿「脚本没报错」冒充通过**。
 - `run-creepjs-audit.cjs` 的 TTS 一项在无语音包的机器上无法判定，此时明确输出
