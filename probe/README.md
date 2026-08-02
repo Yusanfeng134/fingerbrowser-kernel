@@ -22,6 +22,7 @@
 | `run-seed-passwords.cjs` | 0036 密码种子 | 判据是**伪类不是 `.value`** —— 后者在交互前被 Chromium 藏起来 |
 | `run-seed-errors.cjs` | 0036 错误路径 | 逐条断言**具体的 reason**；成功路径反向断言无多余 error 行 |
 | `run-policy-sweep.cjs` | 全部指纹字段 | 走**策略路径**逐字段比对；基线与配置值相同时标「不可判别」而非通过 |
+| `run-cjk-fonts.cjs` | 0026 CJK 字体屏蔽 | 两条**反向**断言：枚举看不到，但渲染仍正常 |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
 | `run-p0-passkey.cjs` / `run-p1-persistence.cjs` | 0008 passkey | 凭据跨重启存活、跨环境隔离 |
@@ -37,6 +38,10 @@
 - 白名单没有反例可测时，「链接都能打开」与「白名单形同虚设」表现完全一致
 - 固定标签清理：复现失败时「只剩一个标签」与真的修好长得一模一样
 - `getVoices()` 首次返回空数组，被当成「没有 CJK 语音」——稳定的假阳性
+- `document.fonts.check('12px "X"')` **恒返回 true**，连不存在的字族也是 —— 它检的
+  是「字体规范能否解析」，不是字体是否存在。拿它当判据等于用了个恒真的东西
+- 量**中文**宽度判断字体是否生效：CJK 全角等宽，换任何字体宽度都不变（实测三个
+  字族全是 256）—— 一个恒定值，两个方向都通不过也都说明不了问题
 
 所以：**只验「能做到」不够，必须同时验「不该做到的做不到」**。
 
@@ -111,8 +116,9 @@ cp probe/run-xxx.cjs /d/chromium-work-151/probe/ && cd /d/chromium-work-151/prob
   补上**：走完整策略路径逐字段比对，14 个可判别字段全部通过，并因此抓到了
   UA-CH `platform` 未伪装造成的三方矛盾（0037）。
   仍未覆盖：`canvasNoise` / `audioNoise`（是种子不是可读值）、`permissionDefaults`
-  / `webrtcIpPolicy` / `blockCjkFonts` / `windowSize` / `geolocation`（效果不在
-  navigator 上，各需自己的场景）。脚本里逐条列出，不假装验过。
+  / `webrtcIpPolicy` / `windowSize` / `geolocation`（效果不在 navigator 上，各需
+  自己的场景）。脚本里逐条列出，不假装验过。
+  `blockCjkFonts` 已由 `run-cjk-fonts.cjs` 单独覆盖。
 - 地址栏、菜单启用状态是浏览器原生 UI，CDP 读不到，那几条只能人工确认。脚本里
   已标明哪些是程序验的、哪些不是 —— **不拿「脚本没报错」冒充通过**。
 - `run-creepjs-audit.cjs` 的 TTS 一项在无语音包的机器上无法判定，此时明确输出
