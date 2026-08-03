@@ -25,6 +25,7 @@
 | `run-policy-sweep.cjs` | 全部指纹字段 | 走**策略路径**逐字段比对；基线与配置值相同时标「不可判别」而非通过 |
 | `run-cjk-fonts.cjs` | 0026 CJK 字体屏蔽 | 两条**反向**断言：枚举看不到，但渲染仍正常 |
 | `run-webrtc-ip.cjs` | webrtcIpPolicy | 基线**必须先漏**，否则「没漏」是假通过 |
+| `run-devtools-auth.cjs` | 0040 DevTools 令牌 | 直连 WS 绕过路径 —— 真实客户端测试抓不到它 |
 | `run-geolocation.cjs` | 0038 地理位置一致性 | 改动落在共用收口上，**反例比正例重要** |
 | `run-webgl-params.cjs` | （无补丁，见下）| 断言**不变量**而非具体数值 |
 | `check-aumid.ps1` | 0024 AUMID 前缀 | **反例**：两 profile 的 AUMID 必须不同 |
@@ -74,6 +75,24 @@ WebAuthn 的认证器选择全在浏览器进程）。所以脚本带一张 `BRO
 kDoNotTrackSwitch」的注释就把那个死常量伪装成「有人在读」，R1 永远不会响，
 检查器给出假绿 —— 而「删掉真实读取点、留一句注释提到它」是完全可能发生的改法。
 这个洞是在做端到端回验时暴露的：脚本报了 R2 而不是预期的 R1。
+
+## `run-devtools-auth.cjs`：真实客户端测试抓不到头号漏洞
+
+DevTools 的 HTTP 路由与 WebSocket 升级在 Chromium 里是不同的代码路径，而**真正
+授予控制权的是 WS** —— `/json/list` 被拒之后，攻击者仍可直连
+`ws://127.0.0.1:<port>/devtools/browser/<guid>`，那个 guid 就写在
+`DevToolsActivePort` 第二行。HTTP 全锁上、WS 没锁 = 完全没锁。
+
+这不是理论担忧，是量出来的。临时拆掉 WS 那半网关重新构建后，18 条断言里
+**15 条照样通过**，只有 3 条直连 WS 的变红。其中：
+
+> 「Playwright 不带令牌连不上」这个**反例**在 WS 完全敞开时仍然通过。
+
+因为 `connectOverCDP` 先打 HTTP `/json/version` 拿 WS 地址，那步被 403 挡住就走不
+到 WS。也就是说**用最真实的客户端做的那个测试，恰恰是抓不到头号漏洞的那个** ——
+它比 curl 更真实，却在这条上更瞎。只有手写的、直连 guid 的 WS 请求才有判别力。
+
+记在这里是因为下一个人多半会觉得「都用真 Playwright 验过了还要什么」。
 
 ## `STALE` 检查
 

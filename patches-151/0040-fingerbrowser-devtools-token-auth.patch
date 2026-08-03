@@ -1,0 +1,719 @@
+From 3be8d12c31f6d0a2e8ec6508d2782294cb17f138 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Mon, 3 Aug 2026 20:14:44 +0800
+Subject: [PATCH] =?UTF-8?q?DevTools=20=E7=AB=AF=E7=82=B9=E4=BB=A4=E7=89=8C?=
+ =?UTF-8?q?=E9=89=B4=E6=9D=83=EF=BC=9AHTTP=20=E4=B8=8E=20WS=20=E4=B8=A4?=
+ =?UTF-8?q?=E6=9D=A1=E8=B7=AF=E5=BE=84=E9=83=BD=E6=A0=A1=E9=AA=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+--remote-debugging-port 开的端口连上之后不需要任何凭据，就能读 cookie、导出
+storage、注入脚本。随机端口挡不住 —— 端口号写在 profile 的 DevToolsActivePort 里。
+上游已有的两条保护都针对「从网页来的攻击」：Host 头校验挡 DNS rebinding，
+--remote-allow-origins 校验 WS 的 Origin，而本机脚本压根不发 Origin。没有一条针对
+同机的另一个进程。
+
+把这个特性的价值说准：同用户的进程本来就能直接读 profile 的 cookie 库（DPAPI 绑
+用户），对它令牌只是纵深防御。真正的价值在另一头 —— 回环 TCP 不认 Windows ACL，
+而文件系统认。不同用户账户的进程、或受限沙箱里的进程，读不了 profile 目录却连得上
+那个端口。令牌把这个端口拉回到和文件系统同一条边界上。（上游在 Android 上解过同一
+个问题，靠 unix socket 的对端凭据；Windows 上没有那条路。）
+
+网关设三态而不是布尔：远程调试服务器在 PreMainMessageLoopRunImpl 里创建，而令牌在
+线程池上读（不能在 UI 线程同步读 —— 客户端若在写之前崩了，EOF 永不到达，启动会
+永久挂死）。中间那段窗口设为「全拒」，既不挂启动也不留裸端口。客户端连太早会拿到
+403 需要重试，那是重试不是失守。
+
+--fp-devtools-auth=stdin 是独立开关而不是从 payload 推断：能不能推断出「有令牌要
+来」这件事，必须在读任何字节之前就知道，否则等看到 JSON 里有没有 devtoolsToken 时，
+端口早就裸着开过一段了。
+
+stdin 只能读一次，所以令牌和密码种子必须共用一次读取，否则两个读者抢同一批字节、
+其中一个静默读到空。新增 fingerbrowser_stdin_config 统一负责，密码种子模块改为消费
+它的结果。
+
+判别力是实测出来的，不是推断：临时拆掉 WS 那半网关重新构建后，18 条断言里
+**15 条照样通过**，只有 3 条直连 WS 的变红。其中最要紧的一条 ——「Playwright 不带
+令牌连不上」这个反例在 WS 完全敞开时仍然通过，因为 connectOverCDP 先打 HTTP
+/json/version 拿 WS 地址，那步被 403 挡住就走不到 WS。也就是说**用真实客户端做的
+测试恰恰抓不到头号漏洞**，只有直连 ws://.../devtools/browser/<guid>（guid 取自
+DevToolsActivePort 第二行，正是交办书描述的攻击路径）才抓得到。
+
+交办：constraints/21-kernel-devtools-auth.md
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ chrome/browser/chrome_browser_main.cc         |  14 ++
+ chrome/browser/fingerbrowser/BUILD.gn         |   4 +
+ .../fingerbrowser_seed_passwords.cc           |  35 ++--
+ .../fingerbrowser_stdin_config.cc             | 150 ++++++++++++++++++
+ .../fingerbrowser_stdin_config.h              |  57 +++++++
+ content/browser/BUILD.gn                      |   1 +
+ content/browser/devtools/devtools_auth.cc     |  82 ++++++++++
+ .../browser/devtools/devtools_http_handler.cc |  53 +++++++
+ content/public/browser/BUILD.gn               |   1 +
+ content/public/browser/devtools_auth.h        |  90 +++++++++++
+ 10 files changed, 464 insertions(+), 23 deletions(-)
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_stdin_config.cc
+ create mode 100644 chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h
+ create mode 100644 content/browser/devtools/devtools_auth.cc
+ create mode 100644 content/public/browser/devtools_auth.h
+
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 5b0fc59e86..dc94ff44aa 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -67,6 +67,7 @@
+ #include "chrome/browser/profiles/profiles_state.h"
+ #include "chrome/browser/fingerbrowser/fingerbrowser_policy.h"
+ #include "chrome/browser/fingerbrowser/fingerbrowser_seed_passwords.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h"
+ #include "chrome/browser/profiling_host/chrome_browser_main_extra_parts_profiling.h"
+ #include "chrome/browser/segmentation_platform/chrome_browser_main_extra_parts_segmentation_platform.h"
+ #include "chrome/browser/sessions/chrome_serialized_navigation_driver.h"
+@@ -1221,6 +1222,19 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+     return CHROME_RESULT_CODE_UNSUPPORTED_PARAM;
+   }
+ 
++  // FingerBrowser: start the one and only read of stdin here, and -- if the
++  // command line asked for it -- shut the DevTools gate before it can serve
++  // anyone.
++  //
++  // The position matters and is not interchangeable with PostProfileInit, where
++  // the password seeding used to read stdin: the remote debugging server is
++  // created much later in PreMainMessageLoopRunImpl (see
++  // CreateDevToolsProtocolHandler below), but PostProfileInit is *also* in that
++  // function, so seeding-time is not reliably before server-start-time. Closing
++  // the gate here removes the ordering question entirely rather than reasoning
++  // about which of the two wins.
++  fingerbrowser::StartStdinConfigRead();
++
+   if (startup_data_->chrome_feature_list_creator()->actual_locale().empty()) {
+     ShowMissingLocaleMessageBox();
+     return CHROME_RESULT_CODE_MISSING_DATA;
+diff --git a/chrome/browser/fingerbrowser/BUILD.gn b/chrome/browser/fingerbrowser/BUILD.gn
+index e9f455c4c6..82e8b09e92 100644
+--- a/chrome/browser/fingerbrowser/BUILD.gn
++++ b/chrome/browser/fingerbrowser/BUILD.gn
+@@ -8,6 +8,8 @@ source_set("fingerbrowser") {
+     "fingerbrowser_policy.h",
+     "fingerbrowser_seed_passwords.cc",
+     "fingerbrowser_seed_passwords.h",
++    "fingerbrowser_stdin_config.cc",
++    "fingerbrowser_stdin_config.h",
+   ]
+ 
+   deps = [
+@@ -16,6 +18,8 @@ source_set("fingerbrowser") {
+     "//components/password_manager/core/browser",
+     "//components/password_manager/core/browser:password_form",
+     "//components/permissions",
++    # stdin_config 把 DevTools 令牌交给 content::SetDevToolsAuthToken。
++    "//content/public/browser",
+     "//content/public/common",
+     "//net",
+     "//third_party/icu",
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_seed_passwords.cc b/chrome/browser/fingerbrowser/fingerbrowser_seed_passwords.cc
+index 7079987d3b..201e0bc99c 100644
+--- a/chrome/browser/fingerbrowser/fingerbrowser_seed_passwords.cc
++++ b/chrome/browser/fingerbrowser/fingerbrowser_seed_passwords.cc
+@@ -21,6 +21,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/thread_pool.h"
+ #include "base/values.h"
++#include "chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h"
+ #include "chrome/browser/password_manager/factories/profile_password_store_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/password_manager/core/browser/password_manager_util.h"
+@@ -37,9 +38,6 @@ namespace {
+ constexpr char kSeedPasswordsSwitch[] = "fp-seed-passwords";
+ constexpr char kStdinValue[] = "stdin";
+ 
+-// 种子是一次性的、条目数是店铺凭据量级。设上限只为拒绝畸形输入，不是性能考虑。
+-constexpr size_t kMaxSeedBytes = 1024 * 1024;
+-
+ // 一条待导入的凭据。**只在内存里存在**，读完即随对象析构。
+ struct SeedEntry {
+   std::string signon_realm;
+@@ -54,19 +52,12 @@ struct SeedParseResult {
+   int rejected = 0;  // 格式不合法 / origin 解析失败
+ };
+ 
+-// 在阻塞序列上读 stdin。**不在 UI 线程读**：客户端若在写之前崩了，EOF 永不到达，
+-// 在 UI 线程读就是启动永久挂住。放到线程池里，最坏情况只是这一个任务挂着，浏览器
+-// 照常可用（自动填充不生效，而 §6 的计数行不会出现——两者一起构成可诊断的现象）。
+-std::string ReadSeedFromStdinBlocking() {
+-  std::string raw;
+-  if (!base::ReadStreamToStringWithMaxSize(stdin, kMaxSeedBytes, &raw)) {
+-    // 超限或读失败。不打印内容，也不打印长度。
+-    fprintf(stderr, "[fp-seed-passwords] error=stdin_read_failed\n");
+-    fflush(stderr);
+-    return std::string();
+-  }
+-  return raw;
+-}
++// stdin 不再由本模块读 —— DevTools 令牌与密码种子共用同一份 payload，而
++// **stdin 只能读一次**。两个读者会抢同一批字节，其中一个静默读到空。读取与
++// 令牌提取统一在 fingerbrowser_stdin_config 里做，本模块只取走结果。
++//
++// 那边的读仍在阻塞序列上（不在 UI 线程），理由不变：客户端若在写之前崩了，
++// EOF 永不到达，在 UI 线程读就是启动永久挂住。
+ 
+ SeedParseResult ParseSeed(const std::string& raw) {
+   SeedParseResult result;
+@@ -229,7 +220,7 @@ class SeedImporter : public password_manager::PasswordStoreConsumer {
+   base::WeakPtrFactory<SeedImporter> weak_factory_{this};
+ };
+ 
+-void OnSeedRead(base::WeakPtr<Profile> profile, const std::string& raw) {
++void OnSeedRead(base::WeakPtr<Profile> profile, std::string raw) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   if (!profile) {
+     return;  // profile 已经没了；什么都不做。
+@@ -264,12 +255,10 @@ void MaybeSeedPasswords(Profile* profile) {
+     return;
+   }
+ 
+-  base::ThreadPool::PostTaskAndReplyWithResult(
+-      FROM_HERE,
+-      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
+-       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+-      base::BindOnce(&ReadSeedFromStdinBlocking),
+-      base::BindOnce(&OnSeedRead, profile->GetWeakPtr()));
++  // 读取已在 PreCreateThreads 阶段发起（比这里早得多，因为 DevTools 令牌必须赶在
++  // 远程调试服务器启动之前就位）。这里只取走结果：已就绪就立刻回调，未就绪就登记
++  // 等待。
++  TakeStdinPayload(base::BindOnce(&OnSeedRead, profile->GetWeakPtr()));
+ }
+ 
+ }  // namespace fingerbrowser
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_stdin_config.cc b/chrome/browser/fingerbrowser/fingerbrowser_stdin_config.cc
+new file mode 100644
+index 0000000000..835f2fa1fe
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_stdin_config.cc
+@@ -0,0 +1,150 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h"
++
++#include <stdio.h>
++
++#include <optional>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/no_destructor.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/devtools_auth.h"
++
++namespace fingerbrowser {
++
++namespace {
++
++constexpr char kSeedPasswordsSwitch[] = "fp-seed-passwords";
++constexpr char kDevToolsAuthSwitch[] = "fp-devtools-auth";
++constexpr char kStdinValue[] = "stdin";
++
++// One-off payload sized for shop credentials. The cap exists to reject
++// malformed input, not for performance.
++constexpr size_t kMaxStdinBytes = 1024 * 1024;
++
++enum class ReadState { kNotRequested, kPending, kDone };
++
++struct StdinConfig {
++  ReadState state = ReadState::kNotRequested;
++  std::string payload;
++  base::OnceCallback<void(std::string)> waiter;
++};
++
++StdinConfig& GetConfig() {
++  static base::NoDestructor<StdinConfig> config;
++  return *config;
++}
++
++bool WantsStdin(const char* switch_name) {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++             switch_name) == kStdinValue;
++}
++
++// Runs on a blocking sequence.
++std::string ReadStdinBlocking() {
++  std::string raw;
++  if (!base::ReadStreamToStringWithMaxSize(stdin, kMaxStdinBytes, &raw)) {
++    // Neither the content nor its length is printed.
++    fprintf(stderr, "[fp-stdin-config] error=stdin_read_failed\n");
++    fflush(stderr);
++    return std::string();
++  }
++  return raw;
++}
++
++// Pull just the token out and give it to content. The rest of the payload is
++// left alone for the password seeder to consume later.
++void ApplyDevToolsToken(const std::string& raw) {
++  if (!WantsStdin(kDevToolsAuthSwitch)) {
++    return;
++  }
++  // Every failure below leaves the gate at kPending, i.e. DevTools stays shut.
++  // That is the intended direction: a browser that was told to require a token
++  // and did not get one must not fall back to serving everyone.
++  std::optional<base::DictValue> root =
++      base::JSONReader::ReadDict(raw, base::JSON_PARSE_RFC);
++  if (!root) {
++    fprintf(stderr, "[fp-devtools-auth] error=not_json_object\n");
++    fflush(stderr);
++    return;
++  }
++  const std::string* token = root->FindString("devtoolsToken");
++  if (!token || token->empty()) {
++    // An empty token is not "a token that is the empty string" -- an absent
++    // header would compare equal to it and every request would pass. Treated
++    // as missing.
++    fprintf(stderr, "[fp-devtools-auth] error=no_token\n");
++    fflush(stderr);
++    return;
++  }
++  content::SetDevToolsAuthToken(*token);
++  // Deliberately no success line. Printing one would turn "is this browser
++  // guarded?" into something observable from the outside.
++}
++
++void OnStdinRead(std::string raw) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  ApplyDevToolsToken(raw);
++
++  StdinConfig& config = GetConfig();
++  config.state = ReadState::kDone;
++  if (config.waiter) {
++    std::move(config.waiter).Run(std::move(raw));
++    return;
++  }
++  config.payload = std::move(raw);
++}
++
++}  // namespace
++
++void StartStdinConfigRead() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++
++  const bool wants_auth = WantsStdin(kDevToolsAuthSwitch);
++  const bool wants_seed = WantsStdin(kSeedPasswordsSwitch);
++
++  // Close the gate before anything is read. See the header for why this cannot
++  // wait until the payload has been parsed.
++  if (wants_auth) {
++    content::RequireDevToolsAuth();
++  }
++  if (!wants_auth && !wants_seed) {
++    return;
++  }
++
++  GetConfig().state = ReadState::kPending;
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&ReadStdinBlocking), base::BindOnce(&OnStdinRead));
++}
++
++void TakeStdinPayload(base::OnceCallback<void(std::string)> callback) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  StdinConfig& config = GetConfig();
++  switch (config.state) {
++    case ReadState::kNotRequested:
++      // Answer definitively rather than leaving the caller hanging.
++      std::move(callback).Run(std::string());
++      return;
++    case ReadState::kPending:
++      config.waiter = std::move(callback);
++      return;
++    case ReadState::kDone:
++      std::move(callback).Run(std::move(config.payload));
++      config.payload.clear();
++      return;
++  }
++}
++
++}  // namespace fingerbrowser
+diff --git a/chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h b/chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h
+new file mode 100644
+index 0000000000..4b2642f613
+--- /dev/null
++++ b/chrome/browser/fingerbrowser/fingerbrowser_stdin_config.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_STDIN_CONFIG_H_
++#define CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_STDIN_CONFIG_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++
++namespace fingerbrowser {
++
++// FingerBrowser: the single read of stdin.
++//
++// Two features are fed by the same channel -- the DevTools authentication token
++// and the seeded passwords -- and this module exists because **stdin can only be
++// read once**. Two independent readers would race for the same bytes and one of
++// them would silently get nothing. So there is exactly one read, here, and the
++// parsed pieces are handed to whoever needs them.
++//
++// Expected payload (a single JSON object):
++//
++//   { "version": 1,
++//     "devtoolsToken": "<hex>",         // optional
++//     "entries": [ { "origin": …, "username": …, "password": … } ] }  // optional
++//
++// Nothing here is written to disk, logged, or placed on the command line. The
++// command line in particular is readable by every process on the machine, which
++// is precisely the attacker this token defends against.
++
++// Call once, early -- from PreCreateThreads, before the remote debugging server
++// can start. Two things happen:
++//
++//   1. If --fp-devtools-auth=stdin was passed, the DevTools gate is immediately
++//      moved to "required but not yet loaded", which refuses everything. This
++//      must happen *before* any bytes are read: whether a token is coming can
++//      only be declared up front, never inferred from the payload, because by
++//      the time the JSON is parsed the port would already have been open and
++//      unguarded.
++//   2. The actual read is posted to a blocking thread pool sequence. It is not
++//      read synchronously on the UI thread: if the client dies before writing,
++//      EOF never arrives and startup would hang forever. Refusing during the
++//      gap is the answer to that, not blocking.
++void StartStdinConfigRead();
++
++// Hand the raw payload to a consumer once it has been read. Invoked immediately
++// if the read already finished. The payload is moved out and the internal copy
++// cleared, so the credentials do not outlive their single use.
++//
++// Called with an empty string when no stdin channel was requested at all, so
++// consumers get a definite answer rather than waiting forever.
++void TakeStdinPayload(base::OnceCallback<void(std::string)> callback);
++
++}  // namespace fingerbrowser
++
++#endif  // CHROME_BROWSER_FINGERBROWSER_FINGERBROWSER_STDIN_CONFIG_H_
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 65dacbb75b..7176a17f60 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -899,6 +899,7 @@ source_set("browser") {
+     "devtools/devtools_background_services_context_impl.cc",
+     "devtools/devtools_background_services_context_impl.h",
+     "devtools/devtools_device_request_prompt_info.h",
++    "devtools/devtools_auth.cc",
+     "devtools/devtools_http_handler.cc",
+     "devtools/devtools_http_handler.h",
+     "devtools/devtools_instrumentation.cc",
+diff --git a/content/browser/devtools/devtools_auth.cc b/content/browser/devtools/devtools_auth.cc
+new file mode 100644
+index 0000000000..c53b6bc36c
+--- /dev/null
++++ b/content/browser/devtools/devtools_auth.cc
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/public/browser/devtools_auth.h"
++
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "crypto/secure_util.h"
++
++namespace content {
++
++const char kDevToolsAuthHeader[] = "x-fp-devtools-token";
++
++namespace {
++
++struct AuthConfig {
++  base::Lock lock;
++  DevToolsAuthState state GUARDED_BY(lock) = DevToolsAuthState::kNotRequested;
++  std::string token GUARDED_BY(lock);
++};
++
++AuthConfig& GetConfig() {
++  static base::NoDestructor<AuthConfig> config;
++  return *config;
++}
++
++}  // namespace
++
++void RequireDevToolsAuth() {
++  AuthConfig& config = GetConfig();
++  base::AutoLock guard(config.lock);
++  // Only ever tightens. A second call cannot walk an already-loaded token back
++  // to kPending.
++  if (config.state == DevToolsAuthState::kNotRequested) {
++    config.state = DevToolsAuthState::kPending;
++  }
++}
++
++void SetDevToolsAuthToken(std::string token) {
++  AuthConfig& config = GetConfig();
++  base::AutoLock guard(config.lock);
++  if (token.empty()) {
++    // Treat empty as "still not configured", never as "the token is the empty
++    // string". Otherwise a request with no header at all would compare equal
++    // and every check would pass -- the failure mode looks identical to working
++    // authentication from the outside.
++    return;
++  }
++  config.token = std::move(token);
++  config.state = DevToolsAuthState::kConfigured;
++}
++
++DevToolsAuthState GetDevToolsAuthState() {
++  AuthConfig& config = GetConfig();
++  base::AutoLock guard(config.lock);
++  return config.state;
++}
++
++bool DevToolsAuthAllows(std::string_view presented) {
++  AuthConfig& config = GetConfig();
++  base::AutoLock guard(config.lock);
++  switch (config.state) {
++    case DevToolsAuthState::kNotRequested:
++      return true;
++    case DevToolsAuthState::kPending:
++      return false;
++    case DevToolsAuthState::kConfigured:
++      break;
++  }
++  // Length is not secret (it is fixed by our own client), but SecureMemEqual
++  // requires equal sizes, so check first.
++  if (presented.size() != config.token.size()) {
++    return false;
++  }
++  return crypto::SecureMemEqual(base::as_byte_span(presented),
++                                base::as_byte_span(config.token));
++}
++
++}  // namespace content
+diff --git a/content/browser/devtools/devtools_http_handler.cc b/content/browser/devtools/devtools_http_handler.cc
+index fbfe1abebb..83f0f5c56d 100644
+--- a/content/browser/devtools/devtools_http_handler.cc
++++ b/content/browser/devtools/devtools_http_handler.cc
+@@ -40,6 +40,7 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/content_browser_client.h"
++#include "content/public/browser/devtools_auth.h"
+ #include "content/public/browser/devtools_external_agent_proxy_delegate.h"
+ #include "content/public/browser/devtools_frontend_host.h"
+ #include "content/public/browser/devtools_manager_delegate.h"
+@@ -126,6 +127,19 @@ bool RequestIsSafeToServe(const net::HttpServerRequestInfo& info) {
+   return url.HostIsIPAddress() || net::IsLocalHostname(url.GetHost());
+ }
+ 
++// FingerBrowser: token check, applied to both the plain HTTP routes and the
++// WebSocket upgrade. This is a *separate* gate from RequestIsSafeToServe on
++// purpose -- that one blocks DNS rebinding, this one blocks another process on
++// the same machine. They stack, neither replaces the other.
++//
++// No path is exempt, including the discovery page and /devtools/* frontend
++// resources. Exempting "harmless" routes is how /json/version/ (note the
++// trailing slash Playwright actually sends) ends up being the one that decides
++// whether the whole scheme works.
++bool RequestIsAuthorized(const net::HttpServerRequestInfo& info) {
++  return DevToolsAuthAllows(info.GetHeaderValue(kDevToolsAuthHeader));
++}
++
+ // Returns the (incorrectly named, for historical reasons) WebKit version, in
+ // the form "major.minor (@chromium_git_revision)".
+ std::string GetWebKitVersion() {
+@@ -155,6 +169,8 @@ class ServerWrapper : net::HttpServer::Delegate {
+                std::string_view mime_type);
+   void Send404(int connection_id);
+   void Send500(int connection_id, const std::string& message);
++  // FingerBrowser: 403，响应体为空 —— 见实现处注释。
++  void SendUnauthorized(int connection_id);
+   void Close(int connection_id);
+ 
+   ~ServerWrapper() override {}
+@@ -224,6 +240,20 @@ void ServerWrapper::Send500(int connection_id,
+                    kDevtoolsHttpHandlerTrafficAnnotation);
+ }
+ 
++// FingerBrowser: 403 with a body that says nothing. Distinguishing "no token"
++// from "wrong token" tells a prober whether it has the right header name and
++// whether authentication is even on -- and it buys a legitimate client nothing,
++// because a legitimate client always has the token.
++//
++// The same response is returned while the gate is kPending, so "not ready yet"
++// and "you are not allowed" are also indistinguishable from outside.
++void ServerWrapper::SendUnauthorized(int connection_id) {
++  net::HttpServerResponseInfo response(net::HTTP_FORBIDDEN);
++  response.SetBody(std::string(), "text/plain");
++  server_->SendResponse(connection_id, response,
++                        kDevtoolsHttpHandlerTrafficAnnotation);
++}
++
+ void ServerWrapper::Close(int connection_id) {
+   server_->Close(connection_id);
+ }
+@@ -466,6 +496,13 @@ void ServerWrapper::OnHttpRequest(int connection_id,
+     return;
+   }
+ 
++  // FingerBrowser: see the twin check in OnWebSocketRequest below. Locking one
++  // and not the other locks nothing.
++  if (!RequestIsAuthorized(info)) {
++    SendUnauthorized(connection_id);
++    return;
++  }
++
+   server_->SetSendBufferSize(connection_id, kSendBufferSizeForDevTools);
+ 
+   if (base::StartsWith(info.path, "/json", base::CompareCase::SENSITIVE)) {
+@@ -521,6 +558,22 @@ void ServerWrapper::OnWebSocketRequest(
+     return;
+   }
+ 
++  // FingerBrowser: this is the half that actually matters. Locking every /json
++  // route and leaving this one open protects nothing -- an attacker who is
++  // refused by /json/list can still connect straight to
++  // ws://127.0.0.1:<port>/devtools/browser/<guid>, and that guid is written in
++  // plain text on the second line of DevToolsActivePort. The WebSocket *is* the
++  // control channel; the HTTP routes are only discovery.
++  //
++  // Rejecting here, before the task is posted to the UI thread, means the
++  // upgrade never happens -- AcceptWebSocket is only ever reached from
++  // DevToolsHttpHandler::OnWebSocketRequest, which is what we are declining to
++  // schedule.
++  if (!RequestIsAuthorized(request)) {
++    SendUnauthorized(connection_id);
++    return;
++  }
++
+   GetUIThreadTaskRunner({})->PostTask(
+       FROM_HERE, base::BindOnce(&DevToolsHttpHandler::OnWebSocketRequest,
+                                 handler_, connection_id, request));
+diff --git a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
+index 99c99d6ab2..f7c47687a8 100644
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -141,6 +141,7 @@ source_set("browser_sources") {
+     "desktop_streams_registry.h",
+     "device_service.h",
+     "devtools_agent_host.h",
++    "devtools_auth.h",
+     "devtools_agent_host_client.cc",
+     "devtools_agent_host_client.h",
+     "devtools_agent_host_client_channel.h",
+diff --git a/content/public/browser/devtools_auth.h b/content/public/browser/devtools_auth.h
+new file mode 100644
+index 0000000000..d54033646f
+--- /dev/null
++++ b/content/public/browser/devtools_auth.h
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_DEVTOOLS_AUTH_H_
++#define CONTENT_PUBLIC_BROWSER_DEVTOOLS_AUTH_H_
++
++#include <string>
++#include <string_view>
++
++#include "content/common/content_export.h"
++
++namespace content {
++
++// FingerBrowser: header-token authentication for the remote debugging endpoint.
++//
++// The port opened by --remote-debugging-port grants *complete* control of the
++// profile to anyone who can connect: read cookies, export storage, inject
++// script, download files. A random port does not help -- the number is written
++// to DevToolsActivePort in the profile directory, and scanning 1024-65535 takes
++// seconds.
++//
++// The two protections upstream already has both target a different attacker:
++//   - Host header validation blocks DNS rebinding (a remote page resolving a
++//     name to 127.0.0.1). A local process just sends Host: 127.0.0.1:<port>.
++//   - --remote-allow-origins validates the WebSocket Origin header, i.e. it
++//     blocks connections initiated by a *page*. A local script sends no Origin
++//     at all and sails through.
++//
++// Neither covers "another process on this machine", which is the threat here.
++// Note what this is really worth: a process running as the *same user* can
++// already read the profile's cookie database directly (DPAPI keys are bound to
++// the user account), so against that attacker the token is defence in depth.
++// The real gain is that loopback TCP has no user isolation while the filesystem
++// does -- a different user account, or a sandboxed process, can reach the port
++// but cannot read the profile directory. The token puts the port back on the
++// same boundary as the files.
++//
++// The token deliberately does NOT arrive on the command line: the whole process
++// list is world-readable, and this credential is worth more than any single
++// password. It comes in over stdin (see chrome/browser/fingerbrowser).
++
++// Gate state. The middle one is the reason this is an enum rather than a bool.
++enum class DevToolsAuthState {
++  // No authentication was requested. Behaviour is exactly as upstream --
++  // existing --remote-debugging-port workflows are untouched.
++  kNotRequested,
++  // Authentication was requested but the token has not arrived yet. Everything
++  // is refused.
++  //
++  // This state exists because of an ordering problem that has no comfortable
++  // solution: the remote debugging server starts in PreMainMessageLoopRunImpl,
++  // while the token is read from stdin on a blocking thread pool sequence (it
++  // cannot be read synchronously on the UI thread -- if the client dies before
++  // writing, EOF never arrives and startup would hang forever). So there is a
++  // window where the port exists and the token does not.
++  //
++  // Refusing during that window is the only answer that neither hangs startup
++  // nor leaves the port bare. A client that connects too early gets 403 and
++  // must retry; that is a retry, not a breach.
++  kPending,
++  // Token loaded. Requests must present a matching header.
++  kConfigured,
++};
++
++// Called before the remote debugging server can possibly start, when the
++// command line asks for stdin-delivered authentication. Flips the gate to
++// kPending so the window described above is closed rather than open.
++CONTENT_EXPORT void RequireDevToolsAuth();
++
++// Called once when the token has been read. An empty token is rejected and
++// leaves the gate at kPending: an empty string compares equal to a missing
++// header, which would look like "authentication passes" while being no
++// authentication at all.
++CONTENT_EXPORT void SetDevToolsAuthToken(std::string token);
++
++CONTENT_EXPORT DevToolsAuthState GetDevToolsAuthState();
++
++// True when the request may proceed. `presented` is the raw header value, empty
++// when the header is absent. Constant-time comparison; a local attacker timing
++// this is not realistic, but the guarantee costs nothing.
++CONTENT_EXPORT bool DevToolsAuthAllows(std::string_view presented);
++
++// The header clients must send. Lower case because net::HttpServer lower-cases
++// header names while parsing, so this is also the lookup key.
++CONTENT_EXPORT extern const char kDevToolsAuthHeader[];
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_DEVTOOLS_AUTH_H_
+-- 
+2.52.0.windows.1
+
