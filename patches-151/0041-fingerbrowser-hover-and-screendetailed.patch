@@ -1,0 +1,150 @@
+From 91990724da314fde46751049d1ec0a10d6ed4f9f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=8E=8B=E7=8E=89=E6=9E=AB?= <wangyufeng@example.com>
+Date: Thu, 6 Aug 2026 13:50:37 +0800
+Subject: [PATCH] =?UTF-8?q?=E8=A1=A5=E4=B8=8A=E4=B8=A4=E5=A4=84=E7=AC=AC?=
+ =?UTF-8?q?=E4=BA=8C=E8=AF=BB=E7=82=B9=EF=BC=9Ahover=20=E4=B8=8E=20pointer?=
+ =?UTF-8?q?=20=E5=90=8C=E6=BA=90=E3=80=81ScreenDetailed=20=E7=9A=84=20DPR?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+这两条是拿云登线上内核的缺陷清单**反过来自查我们自己**时发现的。交叉自查判「我们
+已修」，对抗性核验把两条都推翻了 —— 主路径确实修好了，漏的都是第二读点。这类错判
+代价最高：它让人放心，然后不去看。
+
+两条都不是「还没做」，是**我们自己的补丁造出来的新矛盾**：上游 Chrome 里这两组信号
+本来一致，是我们把它们劈开的。
+
+1. hover 没跟 pointer 收进同一个开关（补丁 0035 只改了 pointer）。触屏笔记本上伪装
+   maxTouchPoints=0 之后页面看到 (pointer:fine)+(hover:none)，而
+   ui/base/pointer/pointer_device_win.cc:57-67 里 FINE 与 HOVER 是同一分支一起设的，
+   tablet 分支返回 {coarse,none} —— fine-without-hover 在真实 Windows 上**不可达**。
+   修一个矛盾换来一个更强的：原来只是「声称无触摸却报 coarse」，现在是「一台物理上
+   不存在的设备」。
+
+2. ScreenDetailed::devicePixelRatio() 未打补丁，而 ScreenDetailed 继承 Screen 且
+   width/height 没 override。结果是**同一个对象内部自相矛盾**：sd.width=1920（伪装）、
+   sd.devicePixelRatio=1.75（宿主）、window.devicePixelRatio=1（伪装）。
+   返回的是不含页面缩放的裸值：上游这两个 API 本来就不等价，照抄 window 那份会造出
+   「屏幕 DPR 跟着 Ctrl+= 变」这个真机没有的新矛盾 —— 用一个矛盾换另一个。
+
+探针 run-hover-screendetailed.cjs 12 条断言全绿。判据是**真机不可达的组合不出现**，
+不是「hover 变了」—— 后者一个把 hover 恒设成 none 的实现也能通过。
+
+探针第一版把 DPR 伪装成 1.0，而 headless 宿主的 DSF 恰好就是 1，「已伪装」这个断言
+恒真。探针自己的前提检查把它挡了下来，改成 2.0 才有判别力。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../blink/renderer/core/css/media_values.cc   | 43 +++++++++++++++++++
+ .../modules/screen_details/screen_detailed.cc | 26 +++++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index 04dc53700d..39f3db295b 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -425,6 +425,27 @@ mojom::blink::HoverType MediaValues::CalculatePrimaryHoverType(
+     LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // FingerBrowser：hover 必须与 pointer 同源，否则上面那两个函数会造出一个
++  // **真实硬件上不存在的组合**。
++  //
++  // 起因是 0035 只收了 pointer 的口。在触屏笔记本这类宿主上伪装
++  // maxTouchPoints=0 之后：
++  //     (pointer: fine)   true   ← 0035 强制的
++  //     (hover: none)     true   ← 仍是宿主值
++  // 而 ui/base/pointer/pointer_device_win.cc:57-67 里 FINE 与 HOVER 是在同一个
++  // 分支里一起设的（有鼠标 -> fine + hover），tablet 分支返回 {coarse, none}。
++  // 也就是说 fine-without-hover 在真实 Windows 上**不可达**。
++  //
++  // 于是修复本身造出了比原缺陷更强的信号：原来只是「声称无触摸却报 coarse」
++  // （矛盾），现在变成「一个物理上不存在的设备」。上游 Chrome 里这两者本来
++  // 一致，是我们的补丁把它们劈开的。
++  //
++  // 与 pointer 严格对称：只在 ==0 时接管 primary，>0 时不动（宿主有没有鼠标
++  // 与人格声称的触摸能力无关）。
++  if (fingerbrowser::HasSwitch(fingerbrowser::kMaxTouchPointsSwitch) &&
++      fingerbrowser::IntSwitch(fingerbrowser::kMaxTouchPointsSwitch) == 0) {
++    return mojom::blink::HoverType::kHoverHoverType;
++  }
+   return frame->GetSettings()->GetPrimaryHoverType();
+ }
+ 
+@@ -438,6 +459,28 @@ MediaValues::CalculateOutputDeviceUpdateAbilityType(LocalFrame* frame) {
+ int MediaValues::CalculateAvailableHoverTypes(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // FingerBrowser：与 CalculateAvailablePointerTypes 同形。见上面 hover 那段
++  // 关于「fine-without-hover 真机不可达」的说明。
++  //
++  // ==0：人格声称无触摸，移掉 none（它只可能来自触摸源）。全移光了就补 hover
++  //      —— 真实桌面总有鼠标，一个 hover 类型都没有本身就是异常值。
++  // >0 ：人格声称有触摸，补上 none。触屏笔记本上 available 本来就是 hover|none
++  //      两个都有，所以**不移除 hover**（宿主有没有鼠标与触摸能力无关）。
++  if (fingerbrowser::HasSwitch(fingerbrowser::kMaxTouchPointsSwitch)) {
++    int types = frame->GetSettings()->GetAvailableHoverTypes();
++    const int none = static_cast<int>(mojom::blink::HoverType::kHoverNone);
++    const int hover =
++        static_cast<int>(mojom::blink::HoverType::kHoverHoverType);
++    if (fingerbrowser::IntSwitch(fingerbrowser::kMaxTouchPointsSwitch) == 0) {
++      types &= ~none;
++      if (types == 0) {
++        types = hover;
++      }
++    } else {
++      types |= none;
++    }
++    return types;
++  }
+   return frame->GetSettings()->GetAvailableHoverTypes();
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/screen_details/screen_detailed.cc b/third_party/blink/renderer/modules/screen_details/screen_detailed.cc
+index 490cda3600..e7a3b3b623 100644
+--- a/third_party/blink/renderer/modules/screen_details/screen_detailed.cc
++++ b/third_party/blink/renderer/modules/screen_details/screen_detailed.cc
+@@ -11,6 +11,7 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
++#include "third_party/blink/renderer/platform/fingerbrowser/fingerbrowser_fingerprint.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_statics.h"
+ #include "third_party/skia/include/core/SkColorSpace.h"
+@@ -128,6 +129,31 @@ bool ScreenDetailed::isInternal() const {
+ float ScreenDetailed::devicePixelRatio() const {
+   if (!DomWindow())
+     return 0.f;
++  // FingerBrowser：这是 Window Management API 里最后一个漏出宿主真实设备缩放的
++  // 读点，而它比「未伪装」更糟 —— **同一个对象内部自相矛盾**。
++  //
++  // ScreenDetailed 继承 Screen（screen_detailed.h / .idl），width/height/
++  // availWidth/availHeight 都没 override，走的是 screen.cc 里被伪装的那份。
++  // 于是不打这个补丁的话，页面拿到的是：
++  //     sd.currentScreen.width             1920    ← 伪装
++  //     sd.currentScreen.devicePixelRatio  1.75    ← 宿主真值
++  //     window.devicePixelRatio            1       ← 伪装
++  // 上游 Chrome 里后两者在 100% 缩放下是相等的，是我们的 DPR 补丁把它们劈开的
++  // ——自造矛盾，属阳性证据。
++  //
++  // 返回的是**不含页面缩放**的裸值，这一点必须与 LocalFrame::DevicePixelRatio
++  // 区别对待：上游这两个 API 本来就不等价，window.devicePixelRatio 含页面缩放
++  // （zoom-for-DSF 下 LayoutZoomFactor = 设备缩放 × 页面缩放），而屏幕自身的
++  // DPR 不随用户按 Ctrl+= 变化。照抄 window 那份会造出「屏幕 DPR 跟着页面缩放
++  // 走」这个真实硬件永远不会有的新矛盾 —— 用一个矛盾换另一个矛盾。
++  //
++  // 权限门（window_screen_details.cc 要求 WINDOW_MANAGEMENT 已授权）只是缓解：
++  // 被动脚本读不到，但站点一旦获授权就直接读到。
++  if (const int fb_dpr_x1000 =
++          fingerbrowser::IntSwitch(fingerbrowser::kDevicePixelRatioX1000Switch);
++      fb_dpr_x1000 > 0) {
++    return fb_dpr_x1000 / 1000.0f;
++  }
+   return GetScreenInfo().device_scale_factor;
+ }
+ 
+-- 
+2.52.0.windows.1
+
